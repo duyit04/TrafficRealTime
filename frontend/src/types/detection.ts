@@ -33,6 +33,10 @@ export interface VehicleStats {
   classes_out: Record<string, number>;
   counting_mode: 'all' | 'direction';
   fps: number;
+  fps_capture: number;
+  fps_inference: number;
+  fps_sent: number;
+  avg_inference_ms: number;
   frame_count: number;
   stream_active: boolean;
   model_loaded: boolean;
@@ -94,6 +98,9 @@ export interface Settings {
   counting_mode?: 'all' | 'direction';
   congestion_threshold?: number;
   congestion_duration?: number;
+  jpeg_quality?: number;   // 30–95
+  max_width?: number;      // 0 = no resize, otherwise max frame width in px
+  skip_frames?: number;    // 0 = no skip, N = run inference every N+1 frames
 }
 
 export interface SuccessResponse {

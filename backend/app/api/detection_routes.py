@@ -67,6 +67,9 @@ async def get_settings():
         "counting_mode": stream_service._counter.mode,
         "congestion_threshold": cong.threshold,
         "congestion_duration": cong.stable_duration,
+        "jpeg_quality": stream_service.jpeg_quality,
+        "max_width": stream_service.max_width,
+        "skip_frames": stream_service.skip_frames,
     }
 
 
@@ -80,5 +83,8 @@ async def update_settings(body: SettingsUpdate):
         counting_mode=body.counting_mode,
         congestion_threshold=body.congestion_threshold,
         congestion_duration=body.congestion_duration,
+        jpeg_quality=body.jpeg_quality,
+        max_width=body.max_width,
+        skip_frames=body.skip_frames,
     )
     return SuccessResponse(success=True, message="Settings updated")

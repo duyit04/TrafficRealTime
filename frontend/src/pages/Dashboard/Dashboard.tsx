@@ -27,60 +27,26 @@ const CAMERA_PRESETS = [
   { id: 'cam-2701', label: 'Camera 27 – Đường vòng',   location: 'KCN DD', url: 'rtsp://hctech:Admin@789@kcndd.cameraddns.net:554/Streaming/channels/2701' },
 ] as const;
 
-/** Hai camera cùng tuyến (501 · 601) — chỉ lane đang Connect có AI; lane kèm là preview (tùy chọn « Xem song song »). */
-const SAME_ROAD_TWINS = (['cam-501', 'cam-601'] as const)
-  .map((id) => CAMERA_PRESETS.find((c) => c.id === id))
-  .filter((c): c is (typeof CAMERA_PRESETS)[number] => c != null)
-  .map(({ label, url }) => ({ label, url }));
-
-function getTwinSiblingForUrl(trimmed: string): { label: string; url: string } | null {
-  if (!SAME_ROAD_TWINS.some((t) => t.url === trimmed)) return null;
-  return SAME_ROAD_TWINS.find((t) => t.url !== trimmed) ?? null;
-}
-
 /** Hai nhãn cạnh cột đèn: màn 1 = preset luồng chính, màn 2 = camera cặp hoặc mô tả chia ROI. */
 function phaseRoadTitlesFromPrimaryUrl(primaryUrl: string): [string, string] {
   const u = primaryUrl.trim();
   const preset = CAMERA_PRESETS.find((c) => c.url === u);
-  const sib = getTwinSiblingForUrl(u);
   const line1 =
-    preset?.label ?? (u ? 'Màn 1 — luồng đang kết nối' : 'Màn 1 — chưa chọn camera');
-  const line2 = sib
-    ? sib.label
-    : 'Màn 2 — cùng camera (phía dưới vạch đếm)';
+    preset?.label ?? (u ? 'Camera 1 — luồng đang kết nối' : 'Camera 1 — chưa chọn camera');
+  const line2 = 'Camera 2 — chưa chọn camera';
   return [line1, line2];
 }
 
 const MAX_EXTRA_PREVIEW_COLS = 4;
-
-/** Thứ tự: lane kèm (501↔601) trước, sau đó các preset khác chưa dùng. */
-function buildExtraPreviewSlots(trimmedPrimary: string, extraCount: number): { label: string; url: string }[] {
-  const p = trimmedPrimary.trim();
-  if (!p || extraCount <= 0) return [];
-  const used = new Set<string>([p]);
-  const out: { label: string; url: string }[] = [];
-
-  const sib = getTwinSiblingForUrl(p);
-  if (sib && !used.has(sib.url) && out.length < extraCount) {
-    out.push({ label: sib.label, url: sib.url });
-    used.add(sib.url);
-  }
-  while (out.length < extraCount) {
-    const cand = CAMERA_PRESETS.find((c) => !used.has(c.url));
-    if (!cand) break;
-    out.push({ label: cand.label, url: cand.url });
-    used.add(cand.url);
-  }
-  return out;
-}
 
 // ── Toast helper ──────────────────────────────────────────────────────────────
 let toastId = 0;
 
 export function Dashboard() {
   const {
-    currentFrame, detections, stats, wsConnected,
+    currentFrame, detections, stats, wsConnected, usingFallback,
     companionFrame, companionDetections, companionFps,
+    extraLive,
     startStream, stopStream, reloadStats, setRoi, clearRoi, resetCount, updateSettings,
   } = useDetection();
 
@@ -105,6 +71,12 @@ export function Dashboard() {
   const [deviceInfo, setDeviceInfo] = useState<DeviceInfo>({ cuda_available: false, device_name: null });
   /** Số màn preview RTSP thêm cạnh luồng chính (0 = chỉ một màn LIVE). */
   const [extraPreviewCount, setExtraPreviewCount] = useState(0);
+  /** URL camera gán thủ công cho từng màn phụ (index 0 = màn 2). Rỗng = auto. */
+  const [extraPreviewUrls, setExtraPreviewUrls] = useState<string[]>([]);
+  /** Khi khác null: đang gán camera cho màn phụ (0 = màn 2). */
+  const [assignExtraIndex, setAssignExtraIndex] = useState<number | null>(null);
+  /** URL đang chọn trong chế độ gán camera (không ảnh hưởng streamUrl của Camera 1). */
+  const [assignPickedUrl, setAssignPickedUrl] = useState('');
   /** Gán RTSP cho panel đèn giao thông (màn 1 / màn 2). Rỗng = chưa chọn. */
   const [tlSelectedUrls, setTlSelectedUrls] = useState<[string, string]>(['', '']);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -116,16 +88,32 @@ export function Dashboard() {
     (): [string, string] => phaseRoadTitlesFromPrimaryUrl(trimmedStream),
     [trimmedStream],
   );
-  const maxExtraPreviews = useMemo(
-    () => Math.min(MAX_EXTRA_PREVIEW_COLS, buildExtraPreviewSlots(trimmedStream, 99).length),
-    [trimmedStream],
+  const maxExtraPreviews = MAX_EXTRA_PREVIEW_COLS;
+  const cameraOptions = useMemo(
+    () => CAMERA_PRESETS.map(({ label, url }) => ({ label, url })),
+    [],
   );
-  const previewSlots = useMemo(
-    () => buildExtraPreviewSlots(trimmedStream, extraPreviewCount),
-    [trimmedStream, extraPreviewCount],
-  );
+  const primaryCameraLabel = useMemo(() => {
+    const u = trimmedStream.trim();
+    if (!u) return '';
+    return cameraOptions.find((c) => c.url === u)?.label ?? u;
+  }, [cameraOptions, trimmedStream]);
+  const previewSlots = useMemo(() => {
+    const used = new Set<string>([trimmedStream.trim()]);
+    const out: { label: string; url: string }[] = [];
+
+    for (let i = 0; i < extraPreviewCount; i++) {
+      const picked = (extraPreviewUrls[i] ?? '').trim();
+      let url = '';
+      if (picked && !used.has(picked)) url = picked;
+      if (!url) break;
+      used.add(url);
+      const opt = cameraOptions.find((c) => c.url === url);
+      out.push({ label: opt?.label ?? url, url });
+    }
+    return out;
+  }, [trimmedStream, extraPreviewCount, extraPreviewUrls, cameraOptions]);
   const multiView = previewSlots.length > 0;
-  const primarySiblingUrl = useMemo(() => getTwinSiblingForUrl(trimmedStream)?.url ?? '', [trimmedStream]);
 
   const previewGridClass = useMemo(() => {
     const n = 1 + previewSlots.length;
@@ -143,6 +131,15 @@ export function Dashboard() {
   useEffect(() => {
     setExtraPreviewCount((c) => Math.min(c, maxExtraPreviews));
   }, [maxExtraPreviews]);
+
+  // Keep manual assignments array in sync with count
+  useEffect(() => {
+    setExtraPreviewUrls((prev) => {
+      const next = prev.slice(0, extraPreviewCount);
+      while (next.length < extraPreviewCount) next.push('');
+      return next;
+    });
+  }, [extraPreviewCount]);
 
   // Merge live stats from backend with local settings for UI
   const statsForView = {
@@ -186,6 +183,48 @@ export function Dashboard() {
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4000);
   }, []);
 
+  const openAssignFor = useCallback((idx: number) => {
+    setAssignExtraIndex(idx);
+    setAssignPickedUrl('');
+    setCameraOpen(true);
+  }, []);
+
+  const assignToExtra = useCallback(async (idx: number, urlRaw: string) => {
+    const picked = (urlRaw || '').trim();
+    if (!picked) return;
+
+    setExtraPreviewCount((c) => Math.max(c, idx + 1));
+    setExtraPreviewUrls((prev) => {
+      const next = prev.slice();
+      while (next.length < idx + 1) next.push('');
+      next[idx] = picked;
+      return next;
+    });
+
+    if (idx === 0 && streamOn && trimmedStream) {
+      try {
+        await startStream(trimmedStream, { companionUrl: picked });
+        addToast('Camera 2 đã bật LIVE', 'success');
+      } catch {
+        addToast('Đã gán Camera 2 nhưng không bật được LIVE.', 'error');
+      }
+    } else if ((idx === 1 || idx === 2) && picked) {
+      const slot = idx + 1; // idx 1=>slot2 (màn3), idx 2=>slot3 (màn4)
+      try {
+        await streamApi.startExtra(slot, picked);
+        addToast(`Camera ${idx + 2} đã bật LIVE`, 'success');
+      } catch {
+        addToast(`Không bật được LIVE cho Camera ${idx + 2}`, 'error');
+      }
+    } else {
+      addToast(`Đã gán Camera ${idx + 2}`, 'info');
+    }
+
+    setCameraOpen(false);
+    setAssignExtraIndex(null);
+    setAssignPickedUrl('');
+  }, [addToast, startStream, streamOn, trimmedStream]);
+
   // Load models list
   const reloadModels = useCallback(() => {
     modelApi.list().then(setModels).catch(() => {});
@@ -214,8 +253,7 @@ export function Dashboard() {
     }
     setConnecting(true);
     try {
-      const sib = getTwinSiblingForUrl(url);
-      await startStream(url, sib ? { companionUrl: sib.url } : undefined);
+      await startStream(url);
       setStreamOn(true);
       addToast('Stream dang ket noi...', 'info');
       const deadline = Date.now() + 25000;
@@ -344,7 +382,7 @@ export function Dashboard() {
   };
 
   return (
-    <div className="flex flex-col min-h-screen bg-bg-base font-sans">
+    <div className="flex flex-col h-screen overflow-hidden bg-bg-base font-sans">
 
       {/* ── Header ─────────────────────────────────────────────────────────── */}
       <header className="flex items-center gap-3 px-5 min-h-14 py-2 bg-white border-b border-slate-200 shadow-sm shrink-0 z-50">
@@ -363,12 +401,33 @@ export function Dashboard() {
           </div>
         </div>
 
-        {/* Right: FPS + frame */}
+        {/* Right: FPS + frame + WS status */}
         <div className="flex items-center gap-3 text-[11px] text-slate-500 shrink-0">
           <span className="text-2xl font-bold text-accent tabular-nums">{stats.fps.toFixed(1)}</span>
           <span>FPS</span>
           <span>·</span>
           <span>Frame {stats.frame_count.toLocaleString()}</span>
+          {streamOn && (
+            <>
+              <span>·</span>
+              {usingFallback ? (
+                <span className="flex items-center gap-1 text-amber-600 font-semibold" title="WebSocket không khả dụng, đang dùng HTTP polling (FPS thấp hơn)">
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                  Polling
+                </span>
+              ) : wsConnected ? (
+                <span className="flex items-center gap-1 text-emerald-600 font-semibold" title="Kết nối WebSocket đang hoạt động">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                  WebSocket
+                </span>
+              ) : (
+                <span className="flex items-center gap-1 text-slate-400" title="Đang kết nối WebSocket...">
+                  <span className="w-1.5 h-1.5 rounded-full bg-slate-400 animate-pulse" />
+                  Connecting...
+                </span>
+              )}
+            </>
+          )}
         </div>
       </header>
 
@@ -381,13 +440,71 @@ export function Dashboard() {
 
           {/* Video panel — 1 màn chính; mỗi lần « Mở rộng » thêm một cột preview */}
           <div className="flex flex-col flex-1 min-w-0 p-3 gap-2 min-h-0">
+            {/* Multi-view controls */}
+            {streamOn ? (
+              <div className="flex items-center justify-between gap-2 px-0.5">
+                <div className="text-[10px] font-bold uppercase tracking-wide text-slate-600">
+                  Hiển thị: {1 + previewSlots.length} camera
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => setExtraPreviewCount(0)}
+                    disabled={extraPreviewCount === 0}
+                    className="h-7 px-2 rounded-lg border border-slate-200 text-[11px] font-semibold text-slate-600 bg-white hover:bg-slate-50 disabled:opacity-40"
+                    title="Về 1 camera"
+                  >
+                    1 camera
+                  </button>
+                  <div className="inline-flex rounded-lg border border-slate-200 overflow-hidden bg-white">
+                    <button
+                      type="button"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => setExtraPreviewCount((c) => Math.max(0, c - 1))}
+                      disabled={!trimmedStream || extraPreviewCount <= 0}
+                      className="h-7 w-8 inline-flex items-center justify-center text-slate-700 hover:bg-slate-50 disabled:opacity-40"
+                      title="Giảm camera"
+                      aria-label="Giảm camera"
+                    >
+                      −
+                    </button>
+                    <div className="h-7 w-10 inline-flex items-center justify-center text-[11px] font-bold text-slate-700 border-x border-slate-200">
+                      +{previewSlots.length}
+                    </div>
+                    <button
+                      type="button"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => {
+                        const idx = previewSlots.length;
+                        if (idx >= maxExtraPreviews) return;
+                        openAssignFor(idx);
+                      }}
+                      disabled={!trimmedStream || extraPreviewCount >= maxExtraPreviews}
+                      className="h-7 w-8 inline-flex items-center justify-center text-slate-700 hover:bg-slate-50 disabled:opacity-40"
+                      title={!trimmedStream ? 'Chưa có URL camera chính' : 'Thêm camera'}
+                      aria-label="Thêm camera"
+                    >
+                      +
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
+            {/* Chọn camera màn phụ: dùng chung modal Camera/Stream */}
             <div className={`gap-3 flex-1 min-h-0 min-w-0 grid ${previewGridClass} items-stretch`}>
               <div className="flex flex-col min-h-0 min-w-0 gap-1.5">
                 {multiView ? (
                   <div className="flex items-center justify-between px-0.5 shrink-0 gap-2">
-                    <span className="text-[10px] font-bold uppercase tracking-wide text-slate-600">
-                      Màn 1 — LIVE + AI
-                    </span>
+                    <div className="min-w-0">
+                      <div className="text-[10px] font-bold uppercase tracking-wide text-slate-600">Camera 1</div>
+                      {primaryCameraLabel ? (
+                        <div className="text-[10px] text-slate-500 truncate" title={primaryCameraLabel}>
+                          {primaryCameraLabel}
+                        </div>
+                      ) : null}
+                    </div>
                   </div>
                 ) : null}
                 <div className="relative overflow-hidden flex-1 min-h-0">
@@ -396,6 +513,7 @@ export function Dashboard() {
                     detections={detections}
                     stats={statsForView}
                     showLine={countingEnabled}
+                    onEmptyClick={() => setCameraOpen(true)}
                   />
                   <RoiCanvasOverlay
                     points={roiPoints}
@@ -431,23 +549,63 @@ export function Dashboard() {
               {previewSlots.map((slot, i) => (
                 <div key={slot.url} className="flex flex-col flex-1 min-h-0 min-w-0 gap-1.5">
                   <div className="flex items-center justify-between px-0.5 shrink-0 gap-2">
-                    <span className="text-[10px] font-bold uppercase tracking-wide text-slate-600">
-                      Màn {i + 2} — {slot.url === primarySiblingUrl ? 'LIVE (lane kèm)' : 'preview'}
-                    </span>
+                    {(() => {
+                      const manualPicked = (extraPreviewUrls[i] ?? '').trim();
+                      const isManual = manualPicked.length > 0 && manualPicked === slot.url;
+                      const isManualLive2 = isManual && i === 0; // màn 2 có thể chạy companion LIVE
+                      const extraSlot = i === 1 ? 2 : i === 2 ? 3 : 0;
+                      const isExtraLive = extraSlot > 0 && Boolean(extraLive?.[extraSlot]?.frame);
+                      return (
+                    <div className="min-w-0">
+                      <div className="text-[10px] font-bold uppercase tracking-wide text-slate-600">
+                        Camera {i + 2}
+                      </div>
+                      <div className="text-[10px] text-slate-500 truncate" title={slot.label}>
+                        {slot.label}
+                      </div>
+                    </div>
+                      );
+                    })()}
                   </div>
-                  {slot.url === primarySiblingUrl ? (
+                  {(() => {
+                    const manualPicked = (extraPreviewUrls[i] ?? '').trim();
+                    const isManual = manualPicked.length > 0 && manualPicked === slot.url;
+                    const isManualLive2 = isManual && i === 0;
+                    const extraSlot = i === 1 ? 2 : i === 2 ? 3 : 0;
+                    const live = extraSlot > 0 ? extraLive?.[extraSlot] : null;
+                    if (isManualLive2) {
+                      return (
                     <div className="relative overflow-hidden flex-1 min-h-0">
                       <VideoPlayer
                         frame={companionFrame}
                         detections={companionDetections}
                         stats={statsForView}
                         showLine={false}
+                        onEmptyClick={() => { setAssignExtraIndex(0); setCameraOpen(true); }}
                       />
                       <div className="mt-1 flex items-center gap-2">
-                        <TbBadge color="text-amber-700" label={`Lane kèm: ${companionFps.toFixed(1)} FPS`} />
+                        <TbBadge color="text-emerald-700" label={`LIVE: ${companionFps.toFixed(1)} FPS`} />
                       </div>
                     </div>
-                  ) : (
+                      );
+                    }
+                    if (live && live.frame) {
+                      return (
+                    <div className="relative overflow-hidden flex-1 min-h-0">
+                      <VideoPlayer
+                        frame={live.frame}
+                        detections={live.dets}
+                        stats={statsForView}
+                        showLine={false}
+                        onEmptyClick={() => { setAssignExtraIndex(i); setCameraOpen(true); }}
+                      />
+                      <div className="mt-1 flex items-center gap-2">
+                        <TbBadge color="text-emerald-700" label={`LIVE: ${(live.fps ?? 0).toFixed(1)} FPS`} />
+                      </div>
+                    </div>
+                      );
+                    }
+                    return (
                     <div className="overflow-hidden flex-1 min-h-0">
                       <TwinSiblingPanel
                         url={slot.url}
@@ -459,7 +617,8 @@ export function Dashboard() {
                         thumbMaxWidth={previewThumbWidth}
                       />
                     </div>
-                  )}
+                    );
+                  })()}
                 </div>
               ))}
             </div>
@@ -468,7 +627,8 @@ export function Dashboard() {
           {/* Stats + Traffic Light panel (right sidebar) */}
           <aside className="w-64 shrink-0 border-l border-slate-200 overflow-y-auto p-3 bg-white flex flex-col gap-3">
             <TrafficLightPanel
-              cameraOptions={CAMERA_PRESETS.map(({ label, url }) => ({ label, url }))}
+              activeUrls={[trimmedStream, ...previewSlots.map((s) => s.url)].filter(Boolean)}
+              cameraOptions={cameraOptions}
               selectedUrls={tlSelectedUrls}
               onSelectUrl={(idx, url) =>
                 setTlSelectedUrls((prev) => (idx === 0 ? [url, prev[1]] : [prev[0], url]))
@@ -576,7 +736,7 @@ export function Dashboard() {
           <button
             type="button"
             className="absolute inset-0 bg-slate-900/35"
-            onClick={() => setCameraOpen(false)}
+            onClick={() => { setCameraOpen(false); setAssignExtraIndex(null); }}
             aria-label="Đóng"
           />
           <div className="absolute inset-0 flex items-start justify-center p-4 pt-16">
@@ -584,11 +744,17 @@ export function Dashboard() {
               <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-slate-100">
                 <div className="min-w-0">
                   <div className="text-sm font-extrabold text-slate-800 truncate">📡 Camera / Stream</div>
-                  <div className="text-[11px] text-slate-500 truncate">Chọn camera preset hoặc nhập RTSP/video → Connect.</div>
+                  {assignExtraIndex != null ? (
+                    <div className="text-[11px] text-slate-500 truncate">
+                      Đang chọn cho <span className="font-semibold text-slate-700">Camera {assignExtraIndex + 2}</span> — double-click để gán camera.
+                    </div>
+                  ) : (
+                    <div className="text-[11px] text-slate-500 truncate">Chọn camera preset hoặc nhập RTSP/video → Connect.</div>
+                  )}
                 </div>
                 <button
                   type="button"
-                  onClick={() => setCameraOpen(false)}
+                  onClick={() => { setCameraOpen(false); setAssignExtraIndex(null); }}
                   className="shrink-0 px-3 py-1.5 rounded-lg border border-slate-300 text-xs font-semibold text-slate-700 hover:bg-slate-50"
                 >
                   Đóng
@@ -598,11 +764,20 @@ export function Dashboard() {
               <div className="p-4 overflow-auto space-y-4">
                 <CameraWall
                   cameras={CAMERA_PRESETS}
-                  selectedUrl={streamUrl}
-                  activeUrl={streamUrl}
-                  onSelect={setStreamUrl}
+                  selectedUrl={assignExtraIndex != null ? assignPickedUrl : streamUrl}
+                  activeUrl={trimmedStream}
+                  onSelect={(url) => {
+                    if (assignExtraIndex != null) setAssignPickedUrl(url);
+                    else setStreamUrl(url);
+                  }}
                   onConnect={async (url) => {
                     if (!url.trim()) return;
+                    // Assign mode: gán camera cho màn phụ, không connect stream chính
+                    if (assignExtraIndex != null) {
+                      await assignToExtra(assignExtraIndex, url);
+                      return;
+                    }
+
                     setStreamUrl(url);
                     setConnecting(true);
                     try {
@@ -612,8 +787,7 @@ export function Dashboard() {
                         await new Promise(r => setTimeout(r, 500));
                       }
                       const turl = url.trim();
-                      const sib = getTwinSiblingForUrl(turl);
-                      await startStream(turl, sib ? { companionUrl: sib.url } : undefined);
+                      await startStream(turl);
                       setStreamOn(true);
                       addToast(`Dang ket noi: ${turl.split('/').pop()}`, 'info');
                       const deadline = Date.now() + 25000;
@@ -639,19 +813,29 @@ export function Dashboard() {
                   <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold">Hoặc nhập URL thủ công</p>
                   <input
                     type="text"
-                    value={streamUrl}
-                    onChange={(e) => setStreamUrl(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && handleConnect()}
+                    value={assignExtraIndex != null ? assignPickedUrl : streamUrl}
+                    onChange={(e) => {
+                      if (assignExtraIndex != null) setAssignPickedUrl(e.target.value);
+                      else setStreamUrl(e.target.value);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key !== 'Enter') return;
+                      if (assignExtraIndex != null) assignToExtra(assignExtraIndex, assignPickedUrl);
+                      else handleConnect();
+                    }}
                     placeholder="rtsp://... hoặc C:/path/video.mp4"
                     className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800 placeholder-slate-400 outline-none focus:border-accent focus:ring-1 focus:ring-accent/30 transition-colors"
                   />
                   <div className="flex gap-2">
                     <button
-                      onClick={handleConnect}
+                      onClick={() => {
+                        if (assignExtraIndex != null) assignToExtra(assignExtraIndex, assignPickedUrl);
+                        else handleConnect();
+                      }}
                       disabled={connecting || streamOn}
                       className="flex-1 py-2 text-xs font-bold rounded-lg bg-accent text-white disabled:opacity-40 hover:bg-blue-700 transition-all"
                     >
-                      {connecting ? 'Connecting...' : '▶ Connect'}
+                      {connecting ? 'Connecting...' : assignExtraIndex != null ? '➕ Thêm màn' : '▶ Connect'}
                     </button>
                     <button
                       onClick={handleDisconnect}
@@ -666,7 +850,7 @@ export function Dashboard() {
                 {trimmedStream ? (
                   <p className="text-[10px] text-slate-500 leading-snug">
                     <span className="font-semibold text-slate-600">Mở rộng thêm màn</span> dưới khung video để thêm từng
-                    ô preview RTSP (lane kèm 501/601 trước, sau đó các preset khác). Thu gọn từng màn một.
+                    màn, rồi chọn camera trong danh sách. Thu gọn từng màn một.
                   </p>
                 ) : null}
               </div>

@@ -28,6 +28,33 @@ async def start_stream(body: StreamStartRequest):
     return SuccessResponse(success=True, message="Stream đang kết nối (YouTube có thể mất vài giây)...")
 
 
+@router.post("/extra/start", response_model=SuccessResponse, status_code=202)
+async def start_extra_stream(
+    slot: Annotated[int, Query(description="Extra slot id (2=screen3, 3=screen4)", ge=2, le=3)],
+    url: Annotated[str, Query(description="RTSP or video URL")],
+):
+    stream_service.start_extra(slot, url)
+    return SuccessResponse(success=True, message=f"Extra stream {slot} starting...")
+
+
+@router.post("/extra/stop", response_model=SuccessResponse)
+async def stop_extra_stream(
+    slot: Annotated[int, Query(description="Extra slot id", ge=2, le=3)],
+):
+    stream_service.stop_extra(slot)
+    return SuccessResponse(success=True, message=f"Extra stream {slot} stopped")
+
+
+@router.get("/extra/frame")
+async def extra_frame(
+    slot: Annotated[int, Query(description="Extra slot id", ge=2, le=3)],
+):
+    payload = stream_service.get_extra_latest(slot)
+    if payload is None:
+        return {"slot": slot, "frame": None, "detections": [], "fps": 0.0, "stream_active": False}
+    return payload
+
+
 @router.post("/stop", response_model=SuccessResponse)
 async def stop_stream():
     """Stop the active stream."""

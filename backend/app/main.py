@@ -4,6 +4,7 @@ Traffic Monitor – YOLOv8 Vehicle Detection & Counting API
 """
 
 from __future__ import annotations
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -12,13 +13,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.core.logger import logger
 from app.api import model_routes, stream_routes, detection_routes, traffic_light_routes
+from app.api.ws_routes import router as ws_router
 from app.services.model_service import model_service
+from app.services.stream_service import stream_service
 from app.ml.tracker import get_tracker
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("═══ Traffic Monitor API starting on :%d ═══", settings.PORT)
+
+    # Store the running event loop so StreamService worker thread can broadcast via WebSocket
+    stream_service.set_event_loop(asyncio.get_event_loop())
     logger.info("Docs: http://localhost:%d/docs", settings.PORT)
 
     # Validate tracker type at startup
@@ -87,6 +93,7 @@ app.include_router(model_routes.router)
 app.include_router(stream_routes.router)
 app.include_router(detection_routes.router)
 app.include_router(traffic_light_routes.router)
+app.include_router(ws_router)
 
 
 # ── Health check ──────────────────────────────────────────────────────────────

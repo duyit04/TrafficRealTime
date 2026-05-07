@@ -27,6 +27,14 @@ interface Props {
   onConnect: (url: string) => void;
   streamOn: boolean;
   connecting: boolean;
+  /** Compact mode for embedded pickers (e.g. traffic-light RTSP modal) */
+  variant?: 'default' | 'compact';
+  /** Hide header row (title + auto-refresh) */
+  showHeader?: boolean;
+  /** Hide bottom hint text */
+  showHint?: boolean;
+  /** Grid columns */
+  columns?: 1 | 2 | 3;
 }
 
 const REFRESH_INTERVAL = 8000; // ms between thumbnail refreshes
@@ -37,7 +45,19 @@ async function fetchThumbnail(url: string): Promise<{ ok: boolean; frame: string
   return res.json();
 }
 
-export function CameraWall({ cameras, selectedUrl, activeUrl, onSelect, onConnect, streamOn, connecting }: Props) {
+export function CameraWall({
+  cameras,
+  selectedUrl,
+  activeUrl,
+  onSelect,
+  onConnect,
+  streamOn,
+  connecting,
+  variant = 'default',
+  showHeader = true,
+  showHint = true,
+  columns = 2,
+}: Props) {
   const [tiles, setTiles] = useState<Record<string, TileState>>(() =>
     Object.fromEntries(cameras.map((c) => [c.id, { frame: null, loading: true, error: null, lastUpdated: 0 }]))
   );
@@ -67,14 +87,16 @@ export function CameraWall({ cameras, selectedUrl, activeUrl, onSelect, onConnec
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex items-center justify-between">
-        <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold">
-          Camera presets — {cameras.length} cameras
-        </p>
-        <span className="text-[10px] text-slate-400">auto-refresh 8s</span>
-      </div>
+      {showHeader ? (
+        <div className="flex items-center justify-between">
+          <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold">
+            Camera presets — {cameras.length} cameras
+          </p>
+          <span className="text-[10px] text-slate-400">auto-refresh 8s</span>
+        </div>
+      ) : null}
 
-      <div className="grid grid-cols-2 gap-2">
+      <div className={`grid gap-2 ${columns === 1 ? 'grid-cols-1' : columns === 3 ? 'grid-cols-3' : 'grid-cols-2'}`}>
         {cameras.map((cam) => {
           const tile = tiles[cam.id];
           const isSelected = selectedUrl === cam.url;
@@ -143,7 +165,7 @@ export function CameraWall({ cameras, selectedUrl, activeUrl, onSelect, onConnec
               </div>
 
               {/* Label bar */}
-              <div className={`px-2 py-1.5 flex items-center gap-1.5 ${
+              <div className={`${variant === 'compact' ? 'px-2 py-1' : 'px-2 py-1.5'} flex items-center gap-1.5 ${
                 isActive ? 'bg-green-50' : isSelected ? 'bg-blue-50' : 'bg-white'
               }`}>
                 <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
@@ -166,9 +188,11 @@ export function CameraWall({ cameras, selectedUrl, activeUrl, onSelect, onConnec
       </div>
 
       {/* Connect hint */}
-      <p className="text-[10px] text-slate-400 text-center">
-        Click để chọn · Double-click để kết nối ngay
-      </p>
+      {showHint ? (
+        <p className="text-[10px] text-slate-400 text-center">
+          Click để chọn · Double-click để kết nối ngay
+        </p>
+      ) : null}
     </div>
   );
 }

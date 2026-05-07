@@ -38,6 +38,28 @@ class Settings(BaseSettings):
 
     # Companion RTSP (second panel) — lightweight inference FPS cap
     COMPANION_MAX_FPS: int = 12
+    # Whether to run YOLO inference on companion stream
+    COMPANION_DETECT_ENABLED: bool = True
+
+    # Extra live streams (screens 3/4) — FPS cap
+    EXTRA_MAX_FPS: int = 12
+
+    # ── Stream output quality ──────────────────────────────────────────────────
+    # JPEG quality for encoded frames sent to frontend (30–95). Lower = smaller payload = higher FPS.
+    STREAM_JPEG_QUALITY: int = 75
+    # Resize frame width before JPEG encode (0 = no resize). E.g. 960 halves a 1920px stream.
+    STREAM_MAX_WIDTH: int = 0
+    # Skip N frames between YOLO inferences (0 = run every frame).
+    # E.g. skip_frames=2 → inference on frame 1, skip 2&3, inference on 4, ...
+    # Skipped frames reuse last detections but still get encoded and sent → smoother video.
+    INFERENCE_SKIP_FRAMES: int = 0
+    # RTSP buffer flush: grab this many extra frames before retrieve() to get freshest frame.
+    RTSP_FLUSH_FRAMES: int = 2
+
+    # ── YOLO inference size ────────────────────────────────────────────────────
+    # Input image size for YOLO inference. Valid values: 320, 416, 480, 640.
+    # Smaller = faster but less accurate. Invalid values fall back to 640.
+    YOLO_IMGSZ: int = 640
 
     # Auto-load model
     DEFAULT_MODEL: str = "best.pt"
@@ -109,7 +131,24 @@ class Settings(BaseSettings):
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 
-settings = Settings()
+_VALID_IMGSZ = {320, 416, 480, 640}
+
+
+def _make_settings() -> "Settings":
+    s = Settings()
+    if s.YOLO_IMGSZ not in _VALID_IMGSZ:
+        import logging
+        logging.getLogger(__name__).warning(
+            "YOLO_IMGSZ=%d is invalid (valid: %s). Falling back to 640.",
+            s.YOLO_IMGSZ,
+            sorted(_VALID_IMGSZ),
+        )
+        # Pydantic settings are immutable after creation; use object.__setattr__
+        object.__setattr__(s, "YOLO_IMGSZ", 640)
+    return s
+
+
+settings = _make_settings()
 
 settings.MODELS_DIR.mkdir(parents=True, exist_ok=True)
 settings.UPLOADS_DIR.mkdir(parents=True, exist_ok=True)

@@ -44,6 +44,10 @@ class VehicleStats(BaseModel):
     classes_out: dict[str, int] = {}
     counting_mode: str = "all"      # "all" | "direction"
     fps: float = 0.0
+    fps_capture: float = 0.0        # frames read from RTSP per second
+    fps_inference: float = 0.0      # YOLO inference frames per second
+    fps_sent: float = 0.0           # frames broadcast to clients per second
+    avg_inference_ms: float = 0.0   # sliding-window avg of last 10 inference times (ms)
     frame_count: int = 0
     stream_active: bool = False
     model_loaded: bool = False
@@ -103,6 +107,9 @@ class SettingsUpdate(BaseModel):
     counting_mode: Optional[str] = Field(None, description="all | direction")
     congestion_threshold: Optional[int] = Field(None, ge=1, le=100)
     congestion_duration: Optional[float] = Field(None, ge=1.0, le=120.0)
+    jpeg_quality: Optional[int] = Field(None, ge=30, le=95)
+    max_width: Optional[int] = Field(None, ge=0, le=1920)
+    skip_frames: Optional[int] = Field(None, ge=0, le=10)
 
 
 class ModelLoadRequest(BaseModel):

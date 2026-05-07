@@ -7,6 +7,8 @@ Pipeline per frame:
 
 from __future__ import annotations
 import base64
+import asyncio
+import json
 import threading
 import time
 
@@ -26,6 +28,7 @@ from app.ml.congestion_monitor import CongestionMonitor
 # ── Service Layer ─────────────────────────────────────────────────────────────
 from app.services.roi_service import roi_service
 from app.utils.video_utils import is_youtube_url, resolve_youtube_url, validate_youtube_url
+from app.api.ws_routes import ws_manager, ws_companion_manager
 
 
 class StreamService:
@@ -61,6 +64,11 @@ class StreamService:
         self._timeline: list[dict] = []
         self._timeline_last: int = 0
         self._last_error: str | None = None
+        # Legacy: stored event loop for optional WS broadcasting (may be unused)
+        self._event_loop: asyncio.AbstractEventLoop | None = None
+        # For inference skipping (keep last detections to reuse on skipped frames)
+        self._skip_counter: int = 0
+        self._last_api_dets: list[dict] = []
         # Optional second RTSP — same intersection, other approach (video only)
         self._companion_thread: threading.Thread | None = None
         self._companion_running: bool = False
@@ -70,7 +78,23 @@ class StreamService:
         self._companion_frame_count: int = 0
         self._companion_fps: float = 0.0
 
+        # Extra live streams (screens 3/4): each has its own worker + latest payload
+        self._extra_threads: dict[int, threading.Thread] = {}
+        self._extra_running: dict[int, bool] = {}
+        self._extra_urls: dict[int, str] = {}
+        self._extra_latest: dict[int, dict] = {}
+        self._extra_lock = threading.Lock()
+
     # ── Public API ────────────────────────────────────────────────────────────
+
+    def set_event_loop(self, loop: asyncio.AbstractEventLoop | None) -> None:
+        """
+        Store the running asyncio loop for integrations that need to schedule work
+        from the worker thread (e.g., WebSocket broadcasts).
+
+        Safe to call even if the StreamService does not currently use it.
+        """
+        self._event_loop = loop
 
     def start(self, url: str, companion_url: str | None = None) -> None:
         self._last_error = None
@@ -80,6 +104,33 @@ class StreamService:
         t = threading.Thread(target=self._do_start_with_stop, args=(url, cu), daemon=True)
         t.start()
         logger.info("StreamService: start requested → %s", url[:80])
+
+    def start_extra(self, slot: int, url: str) -> None:
+        """Start an extra live stream (slot=2 for screen 3, slot=3 for screen 4)."""
+        s = int(slot)
+        if s < 2 or s > 3:
+            raise ValueError("extra slot must be 2 or 3")
+        u = (url or "").strip()
+        if not u:
+            raise ValueError("url is required")
+        with self._extra_lock:
+            self._extra_urls[s] = u
+            self._extra_running[s] = True
+        t = threading.Thread(target=self._extra_worker, args=(s, u), daemon=True)
+        self._extra_threads[s] = t
+        t.start()
+
+    def stop_extra(self, slot: int) -> None:
+        s = int(slot)
+        with self._extra_lock:
+            self._extra_running[s] = False
+            self._extra_urls.pop(s, None)
+            self._extra_latest.pop(s, None)
+
+    def get_extra_latest(self, slot: int) -> dict | None:
+        s = int(slot)
+        with self._extra_lock:
+            return self._extra_latest.get(s)
 
     def _do_start_with_stop(self, url: str, companion_url: str = "") -> None:
         self.stop()
@@ -122,6 +173,12 @@ class StreamService:
     def stop(self) -> None:
         self._running = False
         self._companion_running = False
+        # Stop extra streams
+        with self._extra_lock:
+            for k in list(self._extra_running.keys()):
+                self._extra_running[k] = False
+            self._extra_latest.clear()
+            self._extra_urls.clear()
         if self._companion_thread:
             self._companion_thread.join(timeout=5)
             self._companion_thread = None
@@ -298,7 +355,7 @@ class StreamService:
                 # Grab (but don't decode) until buffer is nearly empty so we
                 # always process the freshest frame.
                 if is_rtsp:
-                    for _ in range(2):
+                    for _ in range(max(0, int(settings.RTSP_FLUSH_FRAMES))):
                         grabbed = cap.grab()
                         if not grabbed:
                             break
@@ -315,18 +372,42 @@ class StreamService:
                     t0 = time.time()
                     self._push_timeline()
 
+                # ── Optional resize before encode (reduce payload / CPU) ─────
+                try:
+                    max_w = int(getattr(settings, "STREAM_MAX_WIDTH", 0) or 0)
+                    if max_w > 0 and frame is not None and frame.shape[1] > max_w:
+                        h, w = frame.shape[:2]
+                        new_h = max(1, int(h * (max_w / float(w))))
+                        frame = cv2.resize(frame, (max_w, new_h), interpolation=cv2.INTER_AREA)
+                except Exception:
+                    pass
+
                 # ── Pipeline ─────────────────────────────────────────────────
                 try:
-                    # 1. Detection + Tracking (built-in ByteTrack/BoT-SORT)
-                    raw_dets = yolo_model.track(
-                        frame,
-                        conf=self.conf_threshold,
-                        tracker=self._tracker.tracker_yaml,
-                        persist=True,
-                    )
+                    skip_n = max(0, int(getattr(settings, "INFERENCE_SKIP_FRAMES", 0) or 0))
+                    do_infer = True
+                    if skip_n > 0:
+                        # infer on 1 frame, then reuse last detections for next N frames
+                        if self._skip_counter > 0:
+                            do_infer = False
+                            self._skip_counter -= 1
+                        else:
+                            self._skip_counter = skip_n
 
-                    # 2. Convert to Track objects (with prev_cy for line-crossing)
-                    tracks = self._tracker.update(raw_dets)
+                    if do_infer:
+                        # 1. Detection + Tracking (built-in ByteTrack/BoT-SORT)
+                        raw_dets = yolo_model.track(
+                            frame,
+                            conf=self.conf_threshold,
+                            tracker=self._tracker.tracker_yaml,
+                            persist=True,
+                        )
+
+                        # 2. Convert to Track objects (with prev_cy for line-crossing)
+                        tracks = self._tracker.update(raw_dets)
+                    else:
+                        raw_dets = []
+                        tracks = []
                 except Exception as pipe_err:
                     logger.warning("Pipeline error (skipping frame): %s", pipe_err)
                     raw_dets = []
@@ -392,8 +473,10 @@ class StreamService:
                     for d in raw_dets
                 ]
 
-                # 6. Encode frame — quality 92 reduces blocking/grain artefacts
-                _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                # 6. Encode frame (lower quality = smaller payload = higher FPS)
+                jpeg_q = int(getattr(settings, "STREAM_JPEG_QUALITY", 75) or 75)
+                jpeg_q = max(30, min(95, jpeg_q))
+                _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
                 frame_b64 = base64.b64encode(buf.tobytes()).decode()
 
                 payload = {
@@ -404,6 +487,16 @@ class StreamService:
 
                 with self._lock:
                     self._latest = payload
+
+                # Broadcast via WebSocket when clients are connected
+                try:
+                    if ws_manager.has_clients and self._event_loop is not None:
+                        msg = json.dumps(payload, ensure_ascii=False)
+                        self._event_loop.call_soon_threadsafe(
+                            lambda: asyncio.create_task(ws_manager.broadcast(msg))
+                        )
+                except Exception:
+                    pass
 
                 # Throttle
                 sleep_t = frame_interval - (time.time() - t_start)
@@ -459,7 +552,7 @@ class StreamService:
 
             # RTSP: flush a bit to keep it fresh when inference is slower than camera FPS
             if is_rtsp:
-                for _ in range(2):
+                for _ in range(max(0, int(settings.RTSP_FLUSH_FRAMES))):
                     if not cap.grab():
                         break
                 ret2, fresh = cap.retrieve()
@@ -473,11 +566,13 @@ class StreamService:
                 self._companion_fps = round(fps_cnt / elapsed, 1)
                 fps_cnt = 0
                 t0 = time.time()
-            try:
-                dets = yolo_model.predict(fr, conf=self.conf_threshold)
-            except Exception as ce:
-                logger.debug("Companion lane predict skipped: %s", ce)
-                continue
+            dets = []
+            if bool(getattr(settings, "COMPANION_DETECT_ENABLED", True)):
+                try:
+                    dets = yolo_model.predict(fr, conf=self.conf_threshold)
+                except Exception as ce:
+                    logger.debug("Companion lane predict skipped: %s", ce)
+                    dets = []
 
             # Optional: publish companion frame + detections for UI second panel
             try:
@@ -492,7 +587,9 @@ class StreamService:
                     )
                     for d in dets
                 ]
-                _, buf = cv2.imencode(".jpg", fr, [cv2.IMWRITE_JPEG_QUALITY, 88])
+                jpeg_q = int(getattr(settings, "STREAM_JPEG_QUALITY", 75) or 75)
+                jpeg_q = max(30, min(95, jpeg_q))
+                _, buf = cv2.imencode(".jpg", fr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
                 frame_b64 = base64.b64encode(buf.tobytes()).decode()
                 payload = {
                     "frame": frame_b64,
@@ -506,6 +603,16 @@ class StreamService:
             except Exception as e:
                 logger.debug("Companion publish skipped: %s", e)
 
+            # Broadcast companion via WebSocket
+            try:
+                if ws_companion_manager.has_clients and self._event_loop is not None:
+                    msg = json.dumps(payload, ensure_ascii=False)
+                    self._event_loop.call_soon_threadsafe(
+                        lambda: asyncio.create_task(ws_companion_manager.broadcast(msg))
+                    )
+            except Exception:
+                pass
+
             # Throttle (independent of primary)
             sleep_t = frame_interval - (time.time() - t_start)
             if sleep_t > 0:
@@ -515,6 +622,102 @@ class StreamService:
         with self._companion_lock:
             self._companion_latest = None
         logger.info("StreamService: companion lane worker exited")
+
+    def _extra_worker(self, slot: int, url: str) -> None:
+        """Extra LIVE stream for additional screens (detect + frame)."""
+        logger.info("StreamService: extra slot %d worker → %s", int(slot), str(url)[:80])
+        is_rtsp = str(url).lower().startswith("rtsp://")
+        if is_rtsp:
+            import os
+            os.environ.setdefault(
+                "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+                "rtsp_transport;tcp|buffer_size;4096000|max_delay;500000|stimeout;5000000|fflags;nobuffer|flags;low_delay",
+            )
+            cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        else:
+            cap = cv2.VideoCapture(url)
+        if not cap.isOpened():
+            logger.warning("StreamService: extra slot %d cannot open stream", int(slot))
+            with self._extra_lock:
+                self._extra_running[int(slot)] = False
+            return
+
+        fps_cnt = 0
+        t0 = time.time()
+        frame_interval = 1.0 / max(int(getattr(settings, "EXTRA_MAX_FPS", 12)), 1)
+
+        while True:
+            with self._extra_lock:
+                if not self._extra_running.get(int(slot), False):
+                    break
+            t_start = time.time()
+            ok, fr = cap.read()
+            if not ok or fr is None:
+                continue
+            if is_rtsp:
+                for _ in range(max(0, int(settings.RTSP_FLUSH_FRAMES))):
+                    if not cap.grab():
+                        break
+                ret2, fresh = cap.retrieve()
+                if ret2 and fresh is not None:
+                    fr = fresh
+
+            fps_cnt += 1
+            elapsed = time.time() - t0
+            fps_val = 0.0
+            if elapsed >= 1.0:
+                fps_val = round(fps_cnt / elapsed, 1)
+                fps_cnt = 0
+                t0 = time.time()
+
+            dets = []
+            try:
+                dets = yolo_model.predict(fr, conf=self.conf_threshold)
+            except Exception:
+                dets = []
+
+            try:
+                from app.models.detection_model import Detection, BoundingBox
+                api_dets = [
+                    Detection(
+                        bbox=BoundingBox(x1=d.x1, y1=d.y1, x2=d.x2, y2=d.y2),
+                        class_name=d.class_name,
+                        confidence=d.confidence,
+                        track_id=d.track_id,
+                    )
+                    for d in dets
+                ]
+                jpeg_q = int(getattr(settings, "STREAM_JPEG_QUALITY", 75) or 75)
+                jpeg_q = max(30, min(95, jpeg_q))
+                _, buf = cv2.imencode(".jpg", fr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
+                frame_b64 = base64.b64encode(buf.tobytes()).decode()
+                payload = {
+                    "slot": int(slot),
+                    "frame": frame_b64,
+                    "detections": [d.model_dump() for d in api_dets],
+                    "fps": float(fps_val),
+                    "stream_active": True,
+                }
+                with self._extra_lock:
+                    self._extra_latest[int(slot)] = payload
+                # Broadcast on main WS with slot tag (reuse ws_manager)
+                if ws_manager.has_clients and self._event_loop is not None:
+                    msg = json.dumps(payload, ensure_ascii=False)
+                    self._event_loop.call_soon_threadsafe(
+                        lambda: asyncio.create_task(ws_manager.broadcast(msg))
+                    )
+            except Exception:
+                pass
+
+            sleep_t = frame_interval - (time.time() - t_start)
+            if sleep_t > 0:
+                time.sleep(sleep_t)
+
+        cap.release()
+        with self._extra_lock:
+            self._extra_latest.pop(int(slot), None)
+        logger.info("StreamService: extra slot %d worker exited", int(slot))
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

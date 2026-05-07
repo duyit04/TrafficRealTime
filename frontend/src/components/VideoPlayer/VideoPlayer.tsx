@@ -12,9 +12,10 @@ interface Props {
   detections: Detection[];
   stats: VehicleStats;
   showLine?: boolean;
+  onEmptyClick?: () => void;
 }
 
-export function VideoPlayer({ frame, detections, stats, showLine = true }: Props) {
+export function VideoPlayer({ frame, detections, stats, showLine = true, onEmptyClick }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imgRef    = useRef<HTMLImageElement | null>(null);
   const prevSrcRef = useRef<string>('');
@@ -87,12 +88,18 @@ export function VideoPlayer({ frame, detections, stats, showLine = true }: Props
   return (
     <div className="relative w-full h-full bg-white overflow-hidden">
       {!frame && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-slate-500 bg-white">
+        <button
+          type="button"
+          onClick={onEmptyClick}
+          className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-slate-500 bg-white"
+          style={{ cursor: onEmptyClick ? 'pointer' : 'default' }}
+          aria-label="Chọn camera / kết nối stream"
+        >
           <div className="w-20 h-20 rounded-full border-2 border-slate-300 flex items-center justify-center animate-pulse-slow">
             <span className="text-4xl">📹</span>
           </div>
           <p className="text-sm font-medium">Kết nối stream để xem camera</p>
-        </div>
+        </button>
       )}
       {frame && (
         <div className="absolute top-3 right-3 flex items-center gap-1.5 bg-red-600 text-white text-[11px] font-bold px-2.5 py-1 rounded-full z-10 shadow">

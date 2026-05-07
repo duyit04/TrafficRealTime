@@ -147,7 +147,8 @@ class YOLOModel:
         with self._infer_lock:
             results = self._model(
                 frame, verbose=False, conf=conf,
-                device=self._device, half=self._use_half, imgsz=640,
+                device=self._device, half=self._use_half,
+                imgsz=settings.YOLO_IMGSZ,
             )[0]
             return self._parse_boxes(results)
 
@@ -182,7 +183,7 @@ class YOLOModel:
                 persist=persist,
                 device=self._device,
                 half=self._use_half,
-                imgsz=640,
+                imgsz=settings.YOLO_IMGSZ,
             )[0]
             return self._parse_boxes(results)
 

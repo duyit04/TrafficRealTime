@@ -1,15 +1,26 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { trafficLightApi } from '../../services/api';
 import type { TLState } from '../../services/api';
+import { CameraWall } from '../CameraWall/CameraWall';
 
 const PHASE_LABELS = ['N-S', 'E-W'] as const;
 
 export type TrafficLightPanelProps = {
   phaseRoadLabels?: readonly [string, string];
+  /** RTSP URLs currently visible in the main camera area (Camera 1..N). */
+  activeUrls?: readonly string[];
   cameraOptions?: readonly { label: string; url: string }[];
   selectedUrls?: readonly [string, string];
   onSelectUrl?: (phaseIndex: 0 | 1, url: string) => void;
 };
+
+function getRtspRoot(url: string): string {
+  const u = (url || '').trim();
+  if (!u) return '';
+  // Match: rtsp(s)://[user[:pass]@]host[:port]/
+  const m = u.match(/^(rtsps?:\/\/[^/]+)\//i);
+  return (m?.[1] ?? '').toLowerCase();
+}
 
 function useOnEscape(onEscape: () => void, active: boolean) {
   useEffect(() => {
@@ -53,7 +64,7 @@ function TrafficLightVisual({
               <div className="h-6" />
             )}
             <div className="text-[9px] text-slate-400 mt-0.5">
-              Màn {i + 1} · {PHASE_LABELS[i]}
+              Camera {i + 1} · {PHASE_LABELS[i]}
             </div>
 
             <div className="mt-3 flex justify-center">
@@ -91,23 +102,24 @@ function RtspAssignModalBody({
   options,
   selectedUrls,
   onSelectUrl,
+  activeUrls,
 }: {
   options: readonly { label: string; url: string }[];
   selectedUrls: readonly [string, string];
   onSelectUrl: (phaseIndex: 0 | 1, url: string) => void;
+  activeUrls: readonly string[];
 }) {
-  const [q, setQ] = useState('');
   const [picked, setPicked] = useState<string>('');
 
-  const filtered = useMemo(() => {
-    const qq = q.trim().toLowerCase();
-    if (!qq) return options;
-    return options.filter((o) => o.label.toLowerCase().includes(qq) || o.url.toLowerCase().includes(qq));
-  }, [options, q]);
+  const visibleOnly = useMemo(() => {
+    const set = new Set((activeUrls ?? []).map((u) => u.trim()).filter(Boolean));
+    if (!set.size) return [];
+    return options.filter((o) => set.has(o.url.trim()));
+  }, [options, activeUrls]);
 
-  const pickedOpt = useMemo(() => options.find((o) => o.url === picked) ?? null, [options, picked]);
+  const pickedOpt = useMemo(() => visibleOnly.find((o) => o.url === picked) ?? null, [visibleOnly, picked]);
 
-  const initialPicked = selectedUrls?.[0]?.trim() ? selectedUrls[0] : selectedUrls?.[1]?.trim() ? selectedUrls[1] : '';
+  const initialPicked = (activeUrls?.[0] ?? '').trim();
   useEffect(() => {
     setPicked(initialPicked);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -117,47 +129,39 @@ function RtspAssignModalBody({
     <div className="p-4">
       <div className="grid grid-cols-2 gap-4">
         <div className="min-w-0">
-          <div className="text-[11px] font-bold text-slate-700 mb-2">Danh sách camera</div>
-          <input
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            placeholder="Tìm camera…"
-            className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800 placeholder-slate-400 outline-none focus:border-accent focus:ring-1 focus:ring-accent/30"
-          />
-
-          <div className="p-2 mt-2 overflow-auto max-h-[26rem] rounded-xl border border-slate-100 bg-white">
-            {filtered.length ? (
-              <div className="space-y-1">
-                {filtered.map((o) => {
-                  const active = o.url === picked;
-                  return (
-                    <button
-                      key={o.url}
-                      type="button"
-                      onClick={() => setPicked(o.url)}
-                      className={`w-full text-left px-3 py-2 rounded-lg border transition-colors text-xs ${
-                        active
-                          ? 'border-accent/50 bg-accent/10 text-accent'
-                          : 'border-transparent hover:border-slate-200 hover:bg-slate-50 text-slate-800'
-                      }`}
-                      title={o.label}
-                    >
-                      <div className="font-semibold truncate">{o.label}</div>
-                      <div className="text-[10px] text-slate-400 truncate mt-0.5">{o.url}</div>
-                    </button>
-                  );
-                })}
-              </div>
+          <div className="text-[11px] font-bold text-slate-700 mb-2">Chọn camera</div>
+          <div className="rounded-xl border border-slate-200 bg-white p-2">
+            {visibleOnly.length ? (
+              <CameraWall
+                cameras={visibleOnly.map((o) => ({ id: o.url, label: o.label, location: '', url: o.url }))}
+                selectedUrl={picked}
+                activeUrl=""
+                onSelect={setPicked}
+                onConnect={(u) => setPicked(u)}
+                streamOn={false}
+                connecting={false}
+                variant="compact"
+                showHeader={false}
+                showHint={false}
+                columns={2}
+              />
             ) : (
-              <div className="text-center text-[11px] text-slate-400 py-8">Không có camera phù hợp</div>
+              <div className="text-center text-[11px] text-slate-400 py-10">
+                Chưa có camera nào đang hiển thị.
+              </div>
             )}
           </div>
         </div>
 
         <div className="min-w-0">
-          <div className="text-[11px] font-bold text-slate-700 mb-2">Camera đang chọn</div>
-          <div className="text-xs text-slate-800 font-semibold border border-slate-200 rounded-xl px-3 py-2 bg-slate-50 truncate" title={pickedOpt?.label ?? picked}>
-            {pickedOpt?.label ?? (picked ? 'Camera đã chọn' : 'Chưa chọn')}
+          <div className="flex items-center justify-between gap-2 mb-2">
+            <div className="text-[11px] font-bold text-slate-700">Gán cho đèn</div>
+            <div
+              className="text-[11px] font-semibold text-slate-700 px-2.5 py-1 rounded-full border border-slate-200 bg-slate-50 truncate max-w-[16rem]"
+              title={pickedOpt?.label ?? picked}
+            >
+              {pickedOpt?.label ?? (picked ? 'Đang chọn' : 'Chưa chọn')}
+            </div>
           </div>
 
           <div className="mt-3 space-y-3">
@@ -167,7 +171,7 @@ function RtspAssignModalBody({
               return (
                 <div key={idx} className="rounded-xl border border-slate-200 bg-white p-3">
                   <div className="flex items-center justify-between gap-2">
-                    <div className="text-xs font-bold text-slate-800">Màn {idx + 1}</div>
+                    <div className="text-xs font-bold text-slate-800">Camera {idx + 1}</div>
                     <button
                       type="button"
                       onClick={() => onSelectUrl(idx, '')}
@@ -187,7 +191,7 @@ function RtspAssignModalBody({
                     onClick={() => onSelectUrl(idx, picked)}
                     className="mt-3 w-full px-3 py-2 rounded-lg text-xs font-bold transition-colors disabled:opacity-40 disabled:cursor-not-allowed bg-accent text-white hover:bg-accent/90"
                   >
-                    Gán vào Màn {idx + 1}
+                    Gán vào Camera {idx + 1}
                   </button>
                 </div>
               );
@@ -199,7 +203,7 @@ function RtspAssignModalBody({
   );
 }
 
-export function TrafficLightPanel({ phaseRoadLabels, cameraOptions, selectedUrls, onSelectUrl }: TrafficLightPanelProps = {}) {
+export function TrafficLightPanel({ phaseRoadLabels, activeUrls, cameraOptions, selectedUrls, onSelectUrl }: TrafficLightPanelProps = {}) {
   const [state, setState] = useState<TLState | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval>>();
 
@@ -242,6 +246,13 @@ export function TrafficLightPanel({ phaseRoadLabels, cameraOptions, selectedUrls
   const [rtspModalOpen, setRtspModalOpen] = useState(false);
   useOnEscape(() => setRtspModalOpen(false), rtspModalOpen);
 
+  const filteredCameraOptions = useMemo(() => {
+    const opts = cameraOptions ?? [];
+    const set = new Set((activeUrls ?? []).map((u) => u.trim()).filter(Boolean));
+    if (!set.size) return [];
+    return opts.filter((o) => set.has(o.url.trim()));
+  }, [cameraOptions, activeUrls]);
+
   return (
     <div className="flex flex-col gap-3 p-3 bg-white rounded-xl border border-slate-200 shadow-sm">
       <div className="flex items-center justify-between">
@@ -278,7 +289,7 @@ export function TrafficLightPanel({ phaseRoadLabels, cameraOptions, selectedUrls
                   <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100">
                     <div className="min-w-0">
                       <div className="text-sm font-extrabold text-slate-800 truncate">Chọn RTSP</div>
-                      <div className="text-[11px] text-slate-500 truncate">Gán camera cho Màn 1 / Màn 2</div>
+                      <div className="text-[11px] text-slate-500 truncate">Chỉ hiển thị camera đang chạy ở khu vực chính</div>
                     </div>
                     <button
                       type="button"
@@ -289,9 +300,10 @@ export function TrafficLightPanel({ phaseRoadLabels, cameraOptions, selectedUrls
                     </button>
                   </div>
                   <RtspAssignModalBody
-                    options={cameraOptions}
+                    options={filteredCameraOptions}
                     selectedUrls={[selectedUrls[0] ?? '', selectedUrls[1] ?? ''] as const}
                     onSelectUrl={onSelectUrl}
+                    activeUrls={activeUrls ?? []}
                   />
                 </div>
               </div>

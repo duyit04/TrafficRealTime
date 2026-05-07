@@ -16,6 +16,16 @@ import type {
 
 const BASE = '/api/v1';
 
+/**
+ * Build a WebSocket URL that works in both dev (Vite proxy) and production.
+ * In dev, Vite proxies /ws → ws://localhost:8000/ws so we just use relative path.
+ */
+export function getWebSocketUrl(path: string): string {
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const host = window.location.host; // includes port in dev (e.g. localhost:5173)
+  return `${proto}//${host}${path}`;
+}
+
 async function apiFetch<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${url}`, {
     headers: { 'Content-Type': 'application/json', ...options?.headers },
@@ -78,6 +88,12 @@ export const streamApi = {
     }),
 
   stop: () => apiFetch<SuccessResponse>('/stream/stop', { method: 'POST' }),
+
+  startExtra: (slot: number, url: string) =>
+    apiFetch<SuccessResponse>(`/stream/extra/start?slot=${slot}&url=${encodeURIComponent(url)}`, { method: 'POST' }),
+
+  stopExtra: (slot: number) =>
+    apiFetch<SuccessResponse>(`/stream/extra/stop?slot=${slot}`, { method: 'POST' }),
 
   getStatus: () => apiFetch<StreamStatus>('/stream/status'),
 
