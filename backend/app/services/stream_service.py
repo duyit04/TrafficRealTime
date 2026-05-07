@@ -218,11 +218,11 @@ class StreamService:
         is_rtsp = str(url).lower().startswith("rtsp://")
 
         # ── RTSP tuning: reduce buffering + proper HEVC handling ──────────────
+        rtsp_url = url
         if is_rtsp:
             # Use TCP transport (more reliable than UDP for HEVC)
             # max_delay: reduce jitter buffer for live stream
             # stimeout: socket timeout 5s to detect dead streams fast
-            rtsp_url = url
             if "?" not in url and "rtsp_transport" not in url:
                 # Inject FFmpeg options via OpenCV environment
                 import os
@@ -273,7 +273,8 @@ class StreamService:
                         # Try reopening the capture
                         logger.warning("RTSP: %d failures, reopening capture...", consecutive_failures)
                         cap.release()
-                        cap = cv2.VideoCapture(url)
+                        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                         if not cap.isOpened():
                             self._last_error = "RTSP stream đã kết thúc."
                             self._stats.stream_error = self._last_error
