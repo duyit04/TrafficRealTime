@@ -85,14 +85,13 @@ export function VideoPlayer({ frame, detections, stats, showLine = true }: Props
   }, [frame, detections, stats.line_position, showLine, renderFrame]);
 
   return (
-    <div className="relative w-full h-full bg-slate-100 rounded-xl border border-slate-200 overflow-hidden">
+    <div className="relative w-full h-full bg-white overflow-hidden">
       {!frame && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-slate-500">
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-slate-500 bg-white">
           <div className="w-20 h-20 rounded-full border-2 border-slate-300 flex items-center justify-center animate-pulse-slow">
             <span className="text-4xl">📹</span>
           </div>
-          <p className="text-sm font-medium">Kết nối stream để xem video</p>
-          <p className="text-xs text-slate-400">Nhập RTSP, link YouTube hoặc đường dẫn video → Connect</p>
+          <p className="text-sm font-medium">Kết nối stream để xem camera</p>
         </div>
       )}
       {frame && (

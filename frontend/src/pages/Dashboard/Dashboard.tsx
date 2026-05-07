@@ -3,7 +3,7 @@
  * Uses useDetection hook for all state management.
  */
 
-import { useState, useEffect, useCallback, type ReactNode } from 'react';
+import { useState, useEffect, useCallback, useMemo, type ReactNode } from 'react';
 import { useDetection } from '../../hooks/useDetection';
 import { VideoPlayer } from '../../components/VideoPlayer';
 import { RoiDrawer, RoiCanvasOverlay } from '../../components/RoiDrawer';
@@ -11,6 +11,7 @@ import type { RoiPoint } from '../../components/RoiDrawer';
 import { ModelUploader } from '../../components/ModelUploader';
 import { CounterPanel } from '../../components/CounterPanel';
 import { CameraWall } from '../../components/CameraWall/CameraWall';
+import { TwinSiblingPanel, getPreviewRefreshMs, getPreviewStaggerMs } from '../../components/TwinSiblingPanel';
 import { TrafficLightPanel } from '../../components/TrafficLight';
 import { modelApi, detectionApi, streamApi } from '../../services/api';
 import type { DeviceInfo } from '../../services/api';
@@ -19,11 +20,59 @@ import type { ModelInfo, Settings, Toast } from '../../types/detection';
 // ── Camera presets (control room) ─────────────────────────────────────────────
 const CAMERA_PRESETS = [
   { id: 'cam-1201', label: 'Camera 12 – Cổng chính',   location: 'KCN DD', url: 'rtsp://hctech:Admin@789@kcndd.cameraddns.net:554/Streaming/channels/1201' },
-  { id: 'cam-601',  label: 'Camera 6 – Cổng phụ',      location: 'KCN DD', url: 'rtsp://hctech:Admin@789@kcndd.cameraddns.net:554/Streaming/channels/601' },
+  { id: 'cam-501',  label: 'Camera 5 – Lane 501 (cùng tuyến 601)', location: 'KCN DD', url: 'rtsp://hctech:Admin@789@kcndd.cameraddns.net:554/Streaming/channels/501' },
+  { id: 'cam-601',  label: 'Camera 6 – Lane 601 (cùng tuyến 501)', location: 'KCN DD', url: 'rtsp://hctech:Admin@789@kcndd.cameraddns.net:554/Streaming/channels/601' },
   { id: 'cam-401',  label: 'Camera 4 – Nội khu A',     location: 'KCN DD', url: 'rtsp://hctech:Admin@789@kcndd.cameraddns.net:554/Streaming/channels/401' },
   { id: 'cam-101',  label: 'Camera 1 – Ngã tư trung tâm', location: 'KCN DD', url: 'rtsp://hctech:Admin@789@kcndd.cameraddns.net:554/Streaming/channels/101' },
   { id: 'cam-2701', label: 'Camera 27 – Đường vòng',   location: 'KCN DD', url: 'rtsp://hctech:Admin@789@kcndd.cameraddns.net:554/Streaming/channels/2701' },
 ] as const;
+
+/** Hai camera cùng tuyến (501 · 601) — chỉ lane đang Connect có AI; lane kèm là preview (tùy chọn « Xem song song »). */
+const SAME_ROAD_TWINS = (['cam-501', 'cam-601'] as const)
+  .map((id) => CAMERA_PRESETS.find((c) => c.id === id))
+  .filter((c): c is (typeof CAMERA_PRESETS)[number] => c != null)
+  .map(({ label, url }) => ({ label, url }));
+
+function getTwinSiblingForUrl(trimmed: string): { label: string; url: string } | null {
+  if (!SAME_ROAD_TWINS.some((t) => t.url === trimmed)) return null;
+  return SAME_ROAD_TWINS.find((t) => t.url !== trimmed) ?? null;
+}
+
+/** Hai nhãn cạnh cột đèn: màn 1 = preset luồng chính, màn 2 = camera cặp hoặc mô tả chia ROI. */
+function phaseRoadTitlesFromPrimaryUrl(primaryUrl: string): [string, string] {
+  const u = primaryUrl.trim();
+  const preset = CAMERA_PRESETS.find((c) => c.url === u);
+  const sib = getTwinSiblingForUrl(u);
+  const line1 =
+    preset?.label ?? (u ? 'Màn 1 — luồng đang kết nối' : 'Màn 1 — chưa chọn camera');
+  const line2 = sib
+    ? sib.label
+    : 'Màn 2 — cùng camera (phía dưới vạch đếm)';
+  return [line1, line2];
+}
+
+const MAX_EXTRA_PREVIEW_COLS = 4;
+
+/** Thứ tự: lane kèm (501↔601) trước, sau đó các preset khác chưa dùng. */
+function buildExtraPreviewSlots(trimmedPrimary: string, extraCount: number): { label: string; url: string }[] {
+  const p = trimmedPrimary.trim();
+  if (!p || extraCount <= 0) return [];
+  const used = new Set<string>([p]);
+  const out: { label: string; url: string }[] = [];
+
+  const sib = getTwinSiblingForUrl(p);
+  if (sib && !used.has(sib.url) && out.length < extraCount) {
+    out.push({ label: sib.label, url: sib.url });
+    used.add(sib.url);
+  }
+  while (out.length < extraCount) {
+    const cand = CAMERA_PRESETS.find((c) => !used.has(c.url));
+    if (!cand) break;
+    out.push({ label: cand.label, url: cand.url });
+    used.add(cand.url);
+  }
+  return out;
+}
 
 // ── Toast helper ──────────────────────────────────────────────────────────────
 let toastId = 0;
@@ -31,6 +80,7 @@ let toastId = 0;
 export function Dashboard() {
   const {
     currentFrame, detections, stats, wsConnected,
+    companionFrame, companionDetections, companionFps,
     startStream, stopStream, reloadStats, setRoi, clearRoi, resetCount, updateSettings,
   } = useDetection();
 
@@ -53,6 +103,46 @@ export function Dashboard() {
   const [roiDrawing, setRoiDrawing]   = useState(false);
   const [countingEnabled, setCountingEnabled] = useState(true);
   const [deviceInfo, setDeviceInfo] = useState<DeviceInfo>({ cuda_available: false, device_name: null });
+  /** Số màn preview RTSP thêm cạnh luồng chính (0 = chỉ một màn LIVE). */
+  const [extraPreviewCount, setExtraPreviewCount] = useState(0);
+  /** Gán RTSP cho panel đèn giao thông (màn 1 / màn 2). Rỗng = chưa chọn. */
+  const [tlSelectedUrls, setTlSelectedUrls] = useState<[string, string]>(['', '']);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [cameraOpen, setCameraOpen] = useState(false);
+  const [roiOpen, setRoiOpen] = useState(false);
+
+  const trimmedStream = streamUrl.trim();
+  const trafficPhaseRoadLabels = useMemo(
+    (): [string, string] => phaseRoadTitlesFromPrimaryUrl(trimmedStream),
+    [trimmedStream],
+  );
+  const maxExtraPreviews = useMemo(
+    () => Math.min(MAX_EXTRA_PREVIEW_COLS, buildExtraPreviewSlots(trimmedStream, 99).length),
+    [trimmedStream],
+  );
+  const previewSlots = useMemo(
+    () => buildExtraPreviewSlots(trimmedStream, extraPreviewCount),
+    [trimmedStream, extraPreviewCount],
+  );
+  const multiView = previewSlots.length > 0;
+  const primarySiblingUrl = useMemo(() => getTwinSiblingForUrl(trimmedStream)?.url ?? '', [trimmedStream]);
+
+  const previewGridClass = useMemo(() => {
+    const n = 1 + previewSlots.length;
+    if (n <= 1) return 'grid-cols-1';
+    if (n === 2) return 'grid-cols-1 lg:grid-cols-2';
+    if (n === 3) return 'grid-cols-1 lg:grid-cols-2 xl:grid-cols-3';
+    if (n === 4) return 'grid-cols-1 lg:grid-cols-2 xl:grid-cols-4';
+    return 'grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-5';
+  }, [previewSlots.length]);
+
+  const previewRefreshMs = useMemo(() => getPreviewRefreshMs(previewSlots.length), [previewSlots.length]);
+  const previewThumbWidth = previewSlots.length >= 3 ? 560 : previewSlots.length >= 2 ? 640 : 720;
+  // Video area should fill available space; no fixed height.
+
+  useEffect(() => {
+    setExtraPreviewCount((c) => Math.min(c, maxExtraPreviews));
+  }, [maxExtraPreviews]);
 
   // Merge live stats from backend with local settings for UI
   const statsForView = {
@@ -62,6 +152,33 @@ export function Dashboard() {
   };
 
   const congestion = stats.congestion;
+
+  useEffect(() => {
+    if (!settingsOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setSettingsOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [settingsOpen]);
+
+  useEffect(() => {
+    if (!cameraOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setCameraOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [cameraOpen]);
+
+  useEffect(() => {
+    if (!roiOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setRoiOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [roiOpen]);
 
   const addToast = useCallback((message: string, type: Toast['type'] = 'info') => {
     const id = ++toastId;
@@ -97,7 +214,8 @@ export function Dashboard() {
     }
     setConnecting(true);
     try {
-      await startStream(url);
+      const sib = getTwinSiblingForUrl(url);
+      await startStream(url, sib ? { companionUrl: sib.url } : undefined);
       setStreamOn(true);
       addToast('Stream dang ket noi...', 'info');
       const deadline = Date.now() + 25000;
@@ -229,30 +347,28 @@ export function Dashboard() {
     <div className="flex flex-col min-h-screen bg-bg-base font-sans">
 
       {/* ── Header ─────────────────────────────────────────────────────────── */}
-      <header className="flex items-center justify-between gap-3 px-5 min-h-14 py-2 bg-white border-b border-slate-200 shadow-sm shrink-0 z-50">
-        <div className="flex items-center gap-3 shrink-0">
-          <svg width="32" height="32" viewBox="0 0 32 32" fill="none" className="shrink-0">
-            <circle cx="16" cy="16" r="14" stroke="#2563eb" strokeWidth="1.5" strokeDasharray="4 2"/>
-            <path d="M8 21L12 12L16 18L21 10L25 21Z" fill="#2563eb" opacity="0.85"/>
-          </svg>
-          <div className="min-w-0">
-            <h1 className="text-sm font-extrabold text-slate-800 truncate">Traffic Monitor</h1>
-            <p className="text-[10px] text-slate-500 truncate">YOLOv8 Vehicle Detection &amp; Counting</p>
+      <header className="flex items-center gap-3 px-5 min-h-14 py-2 bg-white border-b border-slate-200 shadow-sm shrink-0 z-50">
+        {/* Left: model + device */}
+        <div className="flex items-center gap-2 shrink-0">
+          <StatusPill label={stats.model_loaded ? stats.model_name.replace('.pt', '') : 'No Model'} active={stats.model_loaded} />
+          <StatusPill label={deviceInfo.cuda_available ? 'GPU' : 'CPU'} active={deviceInfo.cuda_available} title={deviceInfo.device_name ?? undefined} />
+        </div>
+
+        {/* Center: system title */}
+        <div className="flex-1 min-w-0 flex justify-center">
+          <div className="min-w-0 text-center">
+            <h1 className="text-lg sm:text-xl font-black text-accent tracking-tight truncate">
+              Hệ thống giám sát giao thông
+            </h1>
           </div>
         </div>
 
+        {/* Right: FPS + frame */}
         <div className="flex items-center gap-3 text-[11px] text-slate-500 shrink-0">
           <span className="text-2xl font-bold text-accent tabular-nums">{stats.fps.toFixed(1)}</span>
           <span>FPS</span>
           <span>·</span>
           <span>Frame {stats.frame_count.toLocaleString()}</span>
-        </div>
-
-        <div className="flex items-center gap-2 flex-wrap justify-end min-w-0">
-          <StatusPill label={stats.model_loaded ? stats.model_name.replace('.pt', '') : 'No Model'} active={stats.model_loaded} />
-          <StatusPill label={deviceInfo.cuda_available ? 'GPU' : 'CPU'} active={deviceInfo.cuda_available} title={deviceInfo.device_name ?? undefined} />
-          <StatusPill label={streamOn ? 'Live' : 'No Stream'} active={streamOn} />
-          <StatusPill label={wsConnected ? 'WS Connected' : 'WS Offline'} active={wsConnected} />
         </div>
       </header>
 
@@ -260,278 +376,105 @@ export function Dashboard() {
       {/* ── Body ───────────────────────────────────────────────────────────── */}
       <div className="flex flex-1 min-h-0">
 
-        {/* ── Sidebar ──────────────────────────────────────────────────────── */}
-        <aside className="w-80 shrink-0 border-r border-slate-200 overflow-y-auto bg-white flex flex-col gap-2 p-3">
-
-          {/* Model upload + library */}
-          <SideCard title="Model (.pt)" icon="🧠">
-            <ModelUploader
-              models={models}
-              onModelsChange={reloadModels}
-              onToast={addToast}
-              onReloadStats={reloadStats}
-            />
-          </SideCard>
-
-          {/* Camera Wall + Stream controls */}
-          <SideCard title="Camera / Stream" icon="📡">
-            <div className="flex flex-col gap-3">
-
-              {/* Camera wall grid with live thumbnails */}
-              <CameraWall
-                cameras={CAMERA_PRESETS}
-                selectedUrl={streamUrl}
-                activeUrl={streamUrl}
-                onSelect={setStreamUrl}
-                onConnect={async (url) => {
-                  if (!url.trim()) return;
-                  setStreamUrl(url);
-                  setConnecting(true);
-                  try {
-                    // Disconnect stream cũ trước
-                    if (streamOn) {
-                      await stopStream();
-                      setStreamOn(false);
-                      await new Promise(r => setTimeout(r, 500)); // chờ backend stop
-                    }
-                    await startStream(url);
-                    setStreamOn(true);
-                    addToast(`Dang ket noi: ${url.split('/').pop()}`, 'info');
-                    const deadline = Date.now() + 25000;
-                    const t = setInterval(async () => {
-                      if (Date.now() > deadline) { clearInterval(t); setStreamOn(false); addToast('Timeout ket noi', 'error'); return; }
-                      try {
-                        const status = await streamApi.getStatus();
-                        if (status.active) clearInterval(t);
-                        else if (status.error) { clearInterval(t); setStreamOn(false); addToast(status.error, 'error'); }
-                      } catch { /* ignore */ }
-                    }, 1500);
-                  } catch (e: any) {
-                    addToast(e.message || 'Khong the ket noi', 'error');
-                  } finally {
-                    setConnecting(false);
-                  }
-                }}
-                streamOn={streamOn}
-                connecting={connecting}
-              />
-
-              {/* Manual URL */}
-              <div className="flex flex-col gap-1">
-                <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold">Hoặc nhập URL thủ công</p>
-                <input
-                  type="text"
-                  value={streamUrl}
-                  onChange={(e) => setStreamUrl(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && handleConnect()}
-                  placeholder="rtsp://... hoặc C:/path/video.mp4"
-                  className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800 placeholder-slate-400 outline-none focus:border-accent focus:ring-1 focus:ring-accent/30 transition-colors"
-                />
-              </div>
-
-              <div className="flex gap-2">
-                <button
-                  onClick={handleConnect}
-                  disabled={connecting || streamOn}
-                  className="flex-1 py-2 text-xs font-bold rounded-lg bg-accent text-white disabled:opacity-40 hover:bg-blue-700 transition-all"
-                >
-                  {connecting ? 'Connecting...' : '▶ Connect'}
-                </button>
-                <button
-                  onClick={handleDisconnect}
-                  disabled={!streamOn}
-                  className="flex-1 py-2 text-xs font-semibold rounded-lg border border-slate-300 text-slate-600 hover:bg-slate-100 disabled:opacity-30 transition-all"
-                >
-                  ■ Stop
-                </button>
-              </div>
-            </div>
-          </SideCard>
-
-          {/* ROI */}
-          <SideCard title="ROI" icon="🎯">
-            <RoiDrawer
-              onApply={handleApplyRoi}
-              onClear={handleClearRoi}
-              active={roiActive}
-              points={roiPoints}
-              setPoints={setRoiPoints}
-              isDrawing={roiDrawing}
-              setIsDrawing={setRoiDrawing}
-            />
-          </SideCard>
-
-          {/* Settings */}
-          <SideCard title="Cai Dat" icon="⚙️">
-            <SliderField
-              label="Confidence"
-              value={settings.conf_threshold}
-              min={0.1} max={0.95} step={0.01}
-              display={settings.conf_threshold.toFixed(2)}
-              onChange={(v) => handleSettingChange('conf_threshold', v)}
-            />
-            <SliderField
-              label="Counting Line"
-              value={settings.line_position}
-              min={0.1} max={0.9} step={0.01}
-              display={`${Math.round(settings.line_position * 100)}%`}
-              onChange={(v) => handleSettingChange('line_position', v)}
-            />
-
-            <div className="mt-2">
-              <span className="text-[11px] text-slate-500 block mb-1">Tracker</span>
-              <select
-                value={settings.tracker_type ?? 'bytetrack'}
-                onChange={(e) => {
-                  const v = e.target.value;
-                  setSettings((s) => ({ ...s, tracker_type: v }));
-                  updateSettings({ tracker_type: v });
-                  const names: Record<string, string> = { bytetrack: 'ByteTrack', botsort: 'BoT-SORT' };
-                  addToast(`Da chuyen tracker sang ${names[v] ?? v}`, 'success');
-                }}
-                className="w-full text-xs border border-slate-300 rounded px-2 py-1.5 bg-white text-slate-700"
-              >
-                <option value="bytetrack">ByteTrack (recommended)</option>
-                <option value="botsort">BoT-SORT</option>
-              </select>
-            </div>
-
-            <div className="mt-2">
-              <span className="text-[11px] text-slate-500 block mb-1">Che do dem</span>
-              <select
-                value={settings.counting_mode ?? 'all'}
-                onChange={(e) => {
-                  const v = e.target.value as 'all' | 'direction';
-                  setSettings((s) => ({ ...s, counting_mode: v }));
-                  updateSettings({ counting_mode: v });
-                  addToast(v === 'all' ? 'Dem tat ca (ko phan biet chieu)' : 'Dem theo 2 chieu IN/OUT', 'success');
-                }}
-                className="w-full text-xs border border-slate-300 rounded px-2 py-1.5 bg-white text-slate-700"
-              >
-                <option value="all">Dem tat ca (tong hop)</option>
-                <option value="direction">Dem theo chieu (IN / OUT)</option>
-              </select>
-            </div>
-
-            <div className="mt-2 flex items-center justify-between">
-              <span className="text-[11px] text-slate-500">Enable Counting</span>
-              <button
-                type="button"
-                onClick={() => setCountingEnabled((v) => !v)}
-                className={`relative inline-flex h-4 w-8 items-center rounded-full border transition-colors ${
-                  countingEnabled ? 'bg-accent border-accent' : 'bg-slate-200 border-slate-300'
-                }`}
-              >
-                <span
-                  className={`inline-block h-3 w-3 rounded-full bg-white shadow transform transition-transform ${
-                    countingEnabled ? 'translate-x-4' : 'translate-x-1'
-                  }`}
-                />
-              </button>
-            </div>
-          </SideCard>
-
-          {/* Congestion Settings */}
-          <SideCard title="Canh Bao Ket Xe" icon="🚨">
-            <SliderField
-              label="Nguong phuong tien"
-              value={settings.congestion_threshold ?? 10}
-              min={1} max={50} step={1}
-              display={`${settings.congestion_threshold ?? 10}`}
-              onChange={(v) => handleSettingChange('congestion_threshold', v)}
-            />
-            <SliderField
-              label="Thoi gian on dinh (s)"
-              value={settings.congestion_duration ?? 5}
-              min={1} max={60} step={1}
-              display={`${settings.congestion_duration ?? 5}s`}
-              onChange={(v) => handleSettingChange('congestion_duration', v)}
-            />
-            {/* Live congestion status */}
-            {congestion && (
-              <div className={`mt-2 px-3 py-2 rounded-lg text-xs font-semibold ${
-                congestion.level === 'critical' ? 'bg-red-100 text-red-700 border border-red-200' :
-                congestion.level === 'warning' ? 'bg-amber-100 text-amber-700 border border-amber-200' :
-                'bg-green-50 text-green-700 border border-green-200'
-              }`}>
-                {congestion.level === 'normal'
-                  ? `Binh thuong (${congestion.vehicle_count} xe)`
-                  : `${congestion.level === 'critical' ? 'Nghiem trong' : 'Canh bao'}: ${congestion.vehicle_count} xe / ${congestion.duration_seconds.toFixed(0)}s`
-                }
-              </div>
-            )}
-          </SideCard>
-
-        </aside>
-
         {/* ── Main ─────────────────────────────────────────────────────────── */}
         <main className="flex flex-1 min-w-0 min-h-0 overflow-hidden">
 
-          {/* Video panel */}
-          <div className="flex flex-col flex-1 p-3 gap-2 min-h-0">
-            <div className="relative flex-1" style={{ minHeight: '400px' }}>
-              <VideoPlayer
-                frame={currentFrame}
-                detections={detections}
-                stats={statsForView}
-                showLine={countingEnabled}
-              />
-              <RoiCanvasOverlay
-                points={roiPoints}
-                setPoints={setRoiPoints}
-                isDrawing={roiDrawing}
-                setIsDrawing={setRoiDrawing}
-                onApply={handleApplyRoi}
-                onClear={handleClearRoi}
-                active={roiActive}
-              />
+          {/* Video panel — 1 màn chính; mỗi lần « Mở rộng » thêm một cột preview */}
+          <div className="flex flex-col flex-1 min-w-0 p-3 gap-2 min-h-0">
+            <div className={`gap-3 flex-1 min-h-0 min-w-0 grid ${previewGridClass} items-stretch`}>
+              <div className="flex flex-col min-h-0 min-w-0 gap-1.5">
+                {multiView ? (
+                  <div className="flex items-center justify-between px-0.5 shrink-0 gap-2">
+                    <span className="text-[10px] font-bold uppercase tracking-wide text-slate-600">
+                      Màn 1 — LIVE + AI
+                    </span>
+                  </div>
+                ) : null}
+                <div className="relative overflow-hidden flex-1 min-h-0">
+                  <VideoPlayer
+                    frame={currentFrame}
+                    detections={detections}
+                    stats={statsForView}
+                    showLine={countingEnabled}
+                  />
+                  <RoiCanvasOverlay
+                    points={roiPoints}
+                    setPoints={setRoiPoints}
+                    isDrawing={roiDrawing}
+                    setIsDrawing={setRoiDrawing}
+                    onApply={handleApplyRoi}
+                    onClear={handleClearRoi}
+                    active={roiActive}
+                  />
 
-              {/* Congestion floating pill – fixed giữa màn hình, luôn thấy */}
-              {congestion && congestion.is_congested && (
-                <div className={`
-                  fixed bottom-6 left-1/2 -translate-x-1/2 z-50
-                  flex items-center gap-2 px-5 py-2.5 rounded-full
-                  shadow-2xl border backdrop-blur-sm
-                  text-sm font-bold pointer-events-none select-none
-                  animate-bounce
-                  ${congestion.level === 'critical'
-                    ? 'bg-red-600/95 border-red-400 text-white'
-                    : 'bg-amber-500/95 border-amber-300 text-white'}
-                `}>
-                  <span>{congestion.level === 'critical' ? '🚨' : '⚠️'}</span>
-                  <span>
-                    {congestion.level === 'critical' ? 'KẸT XE NGHIÊM TRỌNG' : 'MẬT ĐỘ CAO'}
-                    {' — '}{congestion.vehicle_count} xe / {congestion.duration_seconds.toFixed(0)}s
-                  </span>
+                  {congestion && congestion.is_congested && (
+                    <div className={`
+                      fixed bottom-6 left-1/2 -translate-x-1/2 z-50
+                      flex items-center gap-2 px-5 py-2.5 rounded-full
+                      shadow-2xl border backdrop-blur-sm
+                      text-sm font-bold pointer-events-none select-none
+                      animate-bounce
+                      ${congestion.level === 'critical'
+                        ? 'bg-red-600/95 border-red-400 text-white'
+                        : 'bg-amber-500/95 border-amber-300 text-white'}
+                    `}>
+                      <span>{congestion.level === 'critical' ? '🚨' : '⚠️'}</span>
+                      <span>
+                        {congestion.level === 'critical' ? 'KẸT XE NGHIÊM TRỌNG' : 'MẬT ĐỘ CAO'}
+                        {' — '}{congestion.vehicle_count} xe / {congestion.duration_seconds.toFixed(0)}s
+                      </span>
+                    </div>
+                  )}
                 </div>
-              )}
-            </div>
+              </div>
 
-            {/* Toolbar */}
-            <div className="flex items-center gap-2 shrink-0 flex-wrap">
-              <TbBadge color="text-accent" label={`${statsForView.fps.toFixed(1)} FPS`} />
-              <TbBadge label={`Frame: ${statsForView.frame_count.toLocaleString()}`} />
-              {(settings.counting_mode ?? 'all') === 'direction' ? (
-                <>
-                  <TbBadge color="text-green-600" label={`IN: ${statsForView.count_in ?? 0}`} />
-                  <TbBadge color="text-orange-500" label={`OUT: ${statsForView.count_out ?? 0}`} />
-                </>
-              ) : (
-                <TbBadge color="text-accent" label={`Total: ${statsForView.total}`} />
-              )}
-              <TbBadge color={roiActive ? 'text-accent' : ''} label={`ROI: ${roiActive ? 'ON' : 'OFF'}`} />
-              <TbBadge
-                color={congestion?.is_congested ? 'text-red-600' : 'text-green-600'}
-                label={congestion?.is_congested ? `Ket xe (${congestion.vehicle_count})` : 'Luu thong'}
-              />
-              <div className="flex-1" />
-              <TbBadge color="text-slate-600" label={`Conf: ${settings.conf_threshold.toFixed(2)}`} />
-              <TbBadge color="text-slate-600" label={`Line: ${Math.round((statsForView.line_position ?? settings.line_position) * 100)}%`} />
+              {previewSlots.map((slot, i) => (
+                <div key={slot.url} className="flex flex-col flex-1 min-h-0 min-w-0 gap-1.5">
+                  <div className="flex items-center justify-between px-0.5 shrink-0 gap-2">
+                    <span className="text-[10px] font-bold uppercase tracking-wide text-slate-600">
+                      Màn {i + 2} — {slot.url === primarySiblingUrl ? 'LIVE (lane kèm)' : 'preview'}
+                    </span>
+                  </div>
+                  {slot.url === primarySiblingUrl ? (
+                    <div className="relative overflow-hidden flex-1 min-h-0">
+                      <VideoPlayer
+                        frame={companionFrame}
+                        detections={companionDetections}
+                        stats={statsForView}
+                        showLine={false}
+                      />
+                      <div className="mt-1 flex items-center gap-2">
+                        <TbBadge color="text-amber-700" label={`Lane kèm: ${companionFps.toFixed(1)} FPS`} />
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="overflow-hidden flex-1 min-h-0">
+                      <TwinSiblingPanel
+                        url={slot.url}
+                        label={slot.label}
+                        showHeader={false}
+                        className="h-full flex flex-col min-h-0"
+                        refreshMs={previewRefreshMs}
+                        staggerMs={getPreviewStaggerMs(i)}
+                        thumbMaxWidth={previewThumbWidth}
+                      />
+                    </div>
+                  )}
+                </div>
+              ))}
             </div>
           </div>
 
           {/* Stats + Traffic Light panel (right sidebar) */}
           <aside className="w-64 shrink-0 border-l border-slate-200 overflow-y-auto p-3 bg-white flex flex-col gap-3">
+            <TrafficLightPanel
+              cameraOptions={CAMERA_PRESETS.map(({ label, url }) => ({ label, url }))}
+              selectedUrls={tlSelectedUrls}
+              onSelectUrl={(idx, url) =>
+                setTlSelectedUrls((prev) => (idx === 0 ? [url, prev[1]] : [prev[0], url]))
+              }
+            />
+
             <div className="flex items-center justify-between">
               <h2 className="text-xs font-bold uppercase tracking-wider text-slate-500">Thong Ke</h2>
               <span className={`w-2 h-2 rounded-full ${streamOn ? 'bg-accent animate-pulse' : 'bg-slate-300'}`} />
@@ -542,7 +485,39 @@ export function Dashboard() {
               onExport={handleExport}
             />
             <hr className="border-slate-100" />
-            <TrafficLightPanel />
+
+            <div className="mt-auto" />
+            <div className="rounded-xl border border-slate-200 bg-white p-2">
+              <div className="grid grid-cols-3 gap-2">
+                <button
+                  type="button"
+                  onClick={() => setCameraOpen(true)}
+                  className="h-10 w-full inline-flex items-center justify-center rounded-lg border border-slate-200 bg-white hover:bg-slate-50 transition-colors"
+                  title="Camera / Stream"
+                  aria-label="Camera / Stream"
+                >
+                  <span className="text-base">📡</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRoiOpen(true)}
+                  className="h-10 w-full inline-flex items-center justify-center rounded-lg border border-slate-200 bg-white hover:bg-slate-50 transition-colors"
+                  title="ROI"
+                  aria-label="ROI"
+                >
+                  <span className="text-base">🎯</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSettingsOpen(true)}
+                  className="h-10 w-full inline-flex items-center justify-center rounded-lg border border-slate-200 bg-white hover:bg-slate-50 transition-colors shadow-sm"
+                  title="Cài đặt"
+                  aria-label="Cài đặt"
+                >
+                  <span className="text-base">⚙️</span>
+                </button>
+              </div>
+            </div>
           </aside>
 
         </main>
@@ -554,6 +529,303 @@ export function Dashboard() {
           <ToastItem key={t.id} {...t} />
         ))}
       </div>
+
+      {/* ── ROI Modal ────────────────────────────────────────────────────── */}
+      {roiOpen ? (
+        <div className="fixed inset-0 z-[9996]">
+          <button
+            type="button"
+            className="absolute inset-0 bg-slate-900/35"
+            onClick={() => setRoiOpen(false)}
+            aria-label="Đóng"
+          />
+          <div className="absolute inset-0 flex items-start justify-center p-4 pt-20">
+            <div className="w-[min(38rem,calc(100vw-2rem))] max-h-[min(80vh,42rem)] rounded-2xl border border-slate-200 bg-white shadow-2xl overflow-hidden flex flex-col">
+              <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-slate-100">
+                <div className="min-w-0">
+                  <div className="text-sm font-extrabold text-slate-800 truncate">🎯 ROI</div>
+                  <div className="text-[11px] text-slate-500 truncate">Vẽ vùng quan tâm trên khung video để lọc/đếm.</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setRoiOpen(false)}
+                  className="shrink-0 px-3 py-1.5 rounded-lg border border-slate-300 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                >
+                  Đóng
+                </button>
+              </div>
+              <div className="p-4 overflow-auto">
+                <RoiDrawer
+                  onApply={handleApplyRoi}
+                  onClear={handleClearRoi}
+                  active={roiActive}
+                  points={roiPoints}
+                  setPoints={setRoiPoints}
+                  isDrawing={roiDrawing}
+                  setIsDrawing={setRoiDrawing}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* ── Camera Modal ─────────────────────────────────────────────────── */}
+      {cameraOpen ? (
+        <div className="fixed inset-0 z-[9997]">
+          <button
+            type="button"
+            className="absolute inset-0 bg-slate-900/35"
+            onClick={() => setCameraOpen(false)}
+            aria-label="Đóng"
+          />
+          <div className="absolute inset-0 flex items-start justify-center p-4 pt-16">
+            <div className="w-[min(48rem,calc(100vw-2rem))] max-h-[min(85vh,48rem)] rounded-2xl border border-slate-200 bg-white shadow-2xl overflow-hidden flex flex-col">
+              <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-slate-100">
+                <div className="min-w-0">
+                  <div className="text-sm font-extrabold text-slate-800 truncate">📡 Camera / Stream</div>
+                  <div className="text-[11px] text-slate-500 truncate">Chọn camera preset hoặc nhập RTSP/video → Connect.</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setCameraOpen(false)}
+                  className="shrink-0 px-3 py-1.5 rounded-lg border border-slate-300 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                >
+                  Đóng
+                </button>
+              </div>
+
+              <div className="p-4 overflow-auto space-y-4">
+                <CameraWall
+                  cameras={CAMERA_PRESETS}
+                  selectedUrl={streamUrl}
+                  activeUrl={streamUrl}
+                  onSelect={setStreamUrl}
+                  onConnect={async (url) => {
+                    if (!url.trim()) return;
+                    setStreamUrl(url);
+                    setConnecting(true);
+                    try {
+                      if (streamOn) {
+                        await stopStream();
+                        setStreamOn(false);
+                        await new Promise(r => setTimeout(r, 500));
+                      }
+                      const turl = url.trim();
+                      const sib = getTwinSiblingForUrl(turl);
+                      await startStream(turl, sib ? { companionUrl: sib.url } : undefined);
+                      setStreamOn(true);
+                      addToast(`Dang ket noi: ${turl.split('/').pop()}`, 'info');
+                      const deadline = Date.now() + 25000;
+                      const t = setInterval(async () => {
+                        if (Date.now() > deadline) { clearInterval(t); setStreamOn(false); addToast('Timeout ket noi', 'error'); return; }
+                        try {
+                          const status = await streamApi.getStatus();
+                          if (status.active) clearInterval(t);
+                          else if (status.error) { clearInterval(t); setStreamOn(false); addToast(status.error, 'error'); }
+                        } catch { /* ignore */ }
+                      }, 1500);
+                    } catch (e: any) {
+                      addToast(e.message || 'Khong the ket noi', 'error');
+                    } finally {
+                      setConnecting(false);
+                    }
+                  }}
+                  streamOn={streamOn}
+                  connecting={connecting}
+                />
+
+                <div className="flex flex-col gap-2">
+                  <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold">Hoặc nhập URL thủ công</p>
+                  <input
+                    type="text"
+                    value={streamUrl}
+                    onChange={(e) => setStreamUrl(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && handleConnect()}
+                    placeholder="rtsp://... hoặc C:/path/video.mp4"
+                    className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800 placeholder-slate-400 outline-none focus:border-accent focus:ring-1 focus:ring-accent/30 transition-colors"
+                  />
+                  <div className="flex gap-2">
+                    <button
+                      onClick={handleConnect}
+                      disabled={connecting || streamOn}
+                      className="flex-1 py-2 text-xs font-bold rounded-lg bg-accent text-white disabled:opacity-40 hover:bg-blue-700 transition-all"
+                    >
+                      {connecting ? 'Connecting...' : '▶ Connect'}
+                    </button>
+                    <button
+                      onClick={handleDisconnect}
+                      disabled={!streamOn}
+                      className="flex-1 py-2 text-xs font-semibold rounded-lg border border-slate-300 text-slate-600 hover:bg-slate-100 disabled:opacity-30 transition-all"
+                    >
+                      ■ Stop
+                    </button>
+                  </div>
+                </div>
+
+                {trimmedStream ? (
+                  <p className="text-[10px] text-slate-500 leading-snug">
+                    <span className="font-semibold text-slate-600">Mở rộng thêm màn</span> dưới khung video để thêm từng
+                    ô preview RTSP (lane kèm 501/601 trước, sau đó các preset khác). Thu gọn từng màn một.
+                  </p>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* ── Settings Modal ───────────────────────────────────────────────── */}
+      {settingsOpen ? (
+        <div className="fixed inset-0 z-[9998]">
+          <button
+            type="button"
+            className="absolute inset-0 bg-slate-900/35"
+            onClick={() => setSettingsOpen(false)}
+            aria-label="Đóng"
+          />
+          <div className="absolute inset-0 flex items-start justify-center p-4 pt-20">
+            <div className="w-[min(42rem,calc(100vw-2rem))] max-h-[min(80vh,42rem)] rounded-2xl border border-slate-200 bg-white shadow-2xl overflow-hidden flex flex-col">
+              <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-slate-100">
+                <div className="min-w-0">
+                  <div className="text-sm font-extrabold text-slate-800 truncate">⚙️ Cài đặt</div>
+                  <div className="text-[11px] text-slate-500 truncate">Chỉnh thông số nhận diện, đếm xe và cảnh báo kẹt xe.</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSettingsOpen(false)}
+                  className="shrink-0 px-3 py-1.5 rounded-lg border border-slate-300 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                >
+                  Đóng
+                </button>
+              </div>
+
+              <div className="p-4 overflow-auto">
+                <div className="rounded-xl border border-slate-200 bg-white p-3 mb-4">
+                  <div className="text-[11px] font-bold text-slate-600 uppercase tracking-wide mb-2">Model (.pt)</div>
+                  <ModelUploader
+                    models={models}
+                    onModelsChange={reloadModels}
+                    onToast={addToast}
+                    onReloadStats={reloadStats}
+                  />
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div className="rounded-xl border border-slate-200 bg-white p-3">
+                    <div className="text-[11px] font-bold text-slate-600 uppercase tracking-wide mb-2">Nhận diện</div>
+                    <SliderField
+                      label="Confidence"
+                      value={settings.conf_threshold}
+                      min={0.1} max={0.95} step={0.01}
+                      display={settings.conf_threshold.toFixed(2)}
+                      onChange={(v) => handleSettingChange('conf_threshold', v)}
+                    />
+                    <SliderField
+                      label="Counting Line"
+                      value={settings.line_position}
+                      min={0.1} max={0.9} step={0.01}
+                      display={`${Math.round(settings.line_position * 100)}%`}
+                      onChange={(v) => handleSettingChange('line_position', v)}
+                    />
+                  </div>
+
+                  <div className="rounded-xl border border-slate-200 bg-white p-3">
+                    <div className="text-[11px] font-bold text-slate-600 uppercase tracking-wide mb-2">Đếm xe</div>
+
+                    <div className="mb-3">
+                      <span className="text-[11px] text-slate-500 block mb-1">Tracker</span>
+                      <select
+                        value={settings.tracker_type ?? 'bytetrack'}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          setSettings((s) => ({ ...s, tracker_type: v }));
+                          updateSettings({ tracker_type: v });
+                          const names: Record<string, string> = { bytetrack: 'ByteTrack', botsort: 'BoT-SORT' };
+                          addToast(`Da chuyen tracker sang ${names[v] ?? v}`, 'success');
+                        }}
+                        className="w-full text-xs border border-slate-300 rounded-lg px-2 py-2 bg-white text-slate-700"
+                      >
+                        <option value="bytetrack">ByteTrack (recommended)</option>
+                        <option value="botsort">BoT-SORT</option>
+                      </select>
+                    </div>
+
+                    <div className="mb-3">
+                      <span className="text-[11px] text-slate-500 block mb-1">Che do dem</span>
+                      <select
+                        value={settings.counting_mode ?? 'all'}
+                        onChange={(e) => {
+                          const v = e.target.value as 'all' | 'direction';
+                          setSettings((s) => ({ ...s, counting_mode: v }));
+                          updateSettings({ counting_mode: v });
+                          addToast(v === 'all' ? 'Dem tat ca (ko phan biet chieu)' : 'Dem theo 2 chieu IN/OUT', 'success');
+                        }}
+                        className="w-full text-xs border border-slate-300 rounded-lg px-2 py-2 bg-white text-slate-700"
+                      >
+                        <option value="all">Dem tat ca (tong hop)</option>
+                        <option value="direction">Dem theo chieu (IN / OUT)</option>
+                      </select>
+                    </div>
+
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] text-slate-500">Enable Counting</span>
+                      <button
+                        type="button"
+                        onClick={() => setCountingEnabled((v) => !v)}
+                        className={`relative inline-flex h-4 w-8 items-center rounded-full border transition-colors ${
+                          countingEnabled ? 'bg-accent border-accent' : 'bg-slate-200 border-slate-300'
+                        }`}
+                      >
+                        <span
+                          className={`inline-block h-3 w-3 rounded-full bg-white shadow transform transition-transform ${
+                            countingEnabled ? 'translate-x-4' : 'translate-x-1'
+                          }`}
+                        />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-4 rounded-xl border border-slate-200 bg-white p-3">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-[11px] font-bold text-slate-600 uppercase tracking-wide">Cảnh báo kẹt xe</span>
+                    <span className="text-[10px] text-slate-400">🚨</span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <SliderField
+                      label="Nguong phuong tien"
+                      value={settings.congestion_threshold ?? 10}
+                      min={1} max={50} step={1}
+                      display={`${settings.congestion_threshold ?? 10}`}
+                      onChange={(v) => handleSettingChange('congestion_threshold', v)}
+                    />
+                    <SliderField
+                      label="Thoi gian on dinh (s)"
+                      value={settings.congestion_duration ?? 5}
+                      min={1} max={60} step={1}
+                      display={`${settings.congestion_duration ?? 5}s`}
+                      onChange={(v) => handleSettingChange('congestion_duration', v)}
+                    />
+                  </div>
+                  {congestion && (
+                    <div className={`mt-2 px-3 py-2 rounded-lg text-xs font-semibold ${
+                      congestion.level === 'critical' ? 'bg-red-100 text-red-700 border border-red-200' :
+                      congestion.level === 'warning' ? 'bg-amber-100 text-amber-700 border border-amber-200' :
+                      'bg-green-50 text-green-700 border border-green-200'
+                    }`}>
+                      {congestion.level === 'normal'
+                        ? `Binh thuong (${congestion.vehicle_count} xe)`
+                        : `${congestion.level === 'critical' ? 'Nghiem trong' : 'Canh bao'}: ${congestion.vehicle_count} xe / ${congestion.duration_seconds.toFixed(0)}s`
+                      }
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

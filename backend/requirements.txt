@@ -5,7 +5,11 @@ pydantic>=2.7.0
 pydantic-settings>=2.3.0
 opencv-python>=4.8.0
 numpy>=1.24.0
-ultralytics>=8.0.0
+# CPU wheel by default from PyPI. For NVIDIA GPU, reinstall torch from pytorch.org (CUDA index depends
+# on Python version; see backend/.env.example). Docker image overlays CUDA torch in Dockerfile (cu124).
+torch>=2.0.0
+# 8.4.46+ works with newer torch (e.g. 2.11+cu126) on Python 3.14 + GPU; older pins blocked torch<2.10 on Windows.
+ultralytics>=8.4.46
 python-dotenv>=1.0.0
 yt-dlp>=2024.1.0
 scipy>=1.9.0

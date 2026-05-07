@@ -1,21 +1,36 @@
-version: '3.9'
-
 services:
   backend:
     build: ./backend
     ports:
       - "8000:8000"
     volumes:
-      - ./backend/models_storage:/app/models_storage
-      - ./backend/uploads:/app/uploads
+      - backend_models:/app/models_storage
+      - backend_uploads:/app/uploads
     environment:
       - DEBUG=false
+    # Yêu cầu Docker cấp GPU cho container backend (nếu host đã cài NVIDIA Container Toolkit).
+    # Docker sẽ gắn tất cả GPU khả dụng vào container để PyTorch có thể nhìn thấy CUDA.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia        # sử dụng driver NVIDIA
+              count: all            # dùng tất cả GPU khả dụng
+              capabilities: ["gpu"] # chỉ cần capability GPU (compute)
     restart: unless-stopped
 
   frontend:
-    build: ./frontend
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
     ports:
-      - "5173:80"
+      - "5173:5173"
     depends_on:
       - backend
     restart: unless-stopped
+
+volumes:
+  backend_models:
+  backend_uploads:

@@ -23,6 +23,7 @@ class Track:
     cx: float
     cy: float
     class_name: str
+    prev_cx: float = -1.0
     prev_cy: float = 0.0
     age: int = 0
     x1: float = 0.0
@@ -42,6 +43,7 @@ class BuiltinTracker:
     def __init__(self, tracker_yaml: str = "bytetrack.yaml", **kwargs: Any) -> None:
         self.tracker_yaml = tracker_yaml
         self._id_to_prev_cy: dict[int, float] = {}
+        self._id_to_prev_cx: dict[int, float] = {}
 
     def update(self, detections: list, frame: np.ndarray | None = None) -> List[Track]:
         """
@@ -64,12 +66,15 @@ class BuiltinTracker:
             # so crossing is detected correctly on the very next frame.
             prev_cy = self._id_to_prev_cy.get(tid, -1.0)
             self._id_to_prev_cy[tid] = cy
+            prev_cx = self._id_to_prev_cx.get(tid, -1.0)
+            self._id_to_prev_cx[tid] = cx
 
             tracks.append(
                 Track(
                     track_id=tid,
                     cx=cx, cy=cy,
                     class_name=d.class_name,
+                    prev_cx=prev_cx,
                     prev_cy=prev_cy,
                     x1=d.x1, y1=d.y1, x2=d.x2, y2=d.y2,
                     det_index=i,
@@ -80,11 +85,15 @@ class BuiltinTracker:
         for key in list(self._id_to_prev_cy.keys()):
             if key not in active_ids:
                 self._id_to_prev_cy.pop(key, None)
+        for key in list(self._id_to_prev_cx.keys()):
+            if key not in active_ids:
+                self._id_to_prev_cx.pop(key, None)
 
         return tracks
 
     def reset(self) -> None:
         self._id_to_prev_cy.clear()
+        self._id_to_prev_cx.clear()
 
 
 def get_tracker(tracker_type: str, **kwargs: Any) -> BuiltinTracker:

@@ -52,6 +52,16 @@ export interface FramePayload {
   stats: VehicleStats;
 }
 
+// ── Companion Stream Payload (second RTSP) ────────────────────────────────────
+
+export interface CompanionFramePayload {
+  frame: string | null;     // base64 JPEG (null when not available)
+  detections: Detection[];
+  fps: number;
+  frame_count: number;
+  stream_active: boolean;
+}
+
 // ── API Types ─────────────────────────────────────────────────────────────────
 
 export interface ModelInfo {
@@ -62,6 +72,8 @@ export interface ModelInfo {
 
 export interface StreamStartRequest {
   url: string;
+  /** Second RTSP at same intersection — backend runs light YOLO lane for TLC phase 1. */
+  companion_url?: string;
 }
 
 export interface RoiPoint {

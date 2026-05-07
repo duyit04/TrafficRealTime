@@ -12,8 +12,60 @@ from __future__ import annotations
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List
+import threading
 
 import numpy as np
+
+from app.core.config import settings
+from app.core.logger import logger
+
+
+def _resolve_yolo_device():
+    """
+    Pick Ultralytics device + half precision from settings and torch capabilities.
+    Returns (device, use_half, label for logs).
+    """
+    import torch
+
+    mode = (settings.YOLO_DEVICE or "auto").strip().lower()
+    cuda_ok = torch.cuda.is_available()
+    ver = getattr(torch, "__version__", "?")
+
+    def with_name(dev, half: bool, label: str):
+        return dev, half, label
+
+    if mode == "auto":
+        if cuda_ok:
+            name = torch.cuda.get_device_name(0)
+            return with_name(0, True, f"cuda:0 ({name})")
+        hint = ""
+        if "+cpu" in ver:
+            hint = (
+                " Install a CUDA build matching your Python version (see "
+                "https://pytorch.org/get-started/locally/ ). "
+                "Example (Python 3.14 / Windows): --index-url https://download.pytorch.org/whl/cu126"
+            )
+        logger.warning(
+            "YOLOModel: CUDA not available (torch %s). Using CPU.%s", ver, hint
+        )
+        return with_name("cpu", False, "cpu")
+
+    if mode == "cpu":
+        return with_name("cpu", False, "cpu")
+
+    if mode in ("cuda", "gpu", "cuda:0", "0"):
+        if cuda_ok:
+            name = torch.cuda.get_device_name(0)
+            return with_name(0, True, f"cuda:0 ({name})")
+        logger.warning(
+            "YOLO_DEVICE requests GPU but CUDA is unavailable (torch %s). Using CPU.", ver
+        )
+        return with_name("cpu", False, "cpu")
+
+    if cuda_ok:
+        return with_name(mode, True, mode)
+    logger.warning("YOLO_DEVICE=%s but CUDA unavailable; using CPU", mode)
+    return with_name("cpu", False, "cpu")
 
 
 @dataclass
@@ -53,12 +105,12 @@ class YOLOModel:
         self._class_names: dict[int, str] = {}
         self._device = "cpu"
         self._use_half = False
+        self._infer_lock = threading.Lock()
 
     # ── Public ────────────────────────────────────────────────────────────────
 
     def load(self, path: str | Path) -> None:
         from ultralytics import YOLO
-        import torch
 
         path = Path(path)
         if not path.exists():
@@ -67,15 +119,20 @@ class YOLOModel:
         self._model = YOLO(str(path))
         self._model_path = path.name
 
-        # Move to GPU if available
-        self._device = 0 if torch.cuda.is_available() else "cpu"
-        self._use_half = torch.cuda.is_available()  # FP16 on GPU only
+        self._device, self._use_half, _dev_label = _resolve_yolo_device()
 
         names = getattr(self._model, "names", {})
         if isinstance(names, dict):
             self._class_names = {int(i): str(n) for i, n in names.items()}
         else:
             self._class_names = {i: str(n) for i, n in enumerate(names)}
+
+        logger.info(
+            "YOLOModel: loaded %s → device=%s half=%s",
+            self._model_path,
+            _dev_label,
+            self._use_half,
+        )
 
     def unload(self) -> None:
         self._model = None
@@ -87,11 +144,12 @@ class YOLOModel:
         if not self.is_loaded:
             return []
 
-        results = self._model(
-            frame, verbose=False, conf=conf,
-            device=self._device, half=self._use_half, imgsz=640,
-        )[0]
-        return self._parse_boxes(results)
+        with self._infer_lock:
+            results = self._model(
+                frame, verbose=False, conf=conf,
+                device=self._device, half=self._use_half, imgsz=640,
+            )[0]
+            return self._parse_boxes(results)
 
     def track(
         self,
@@ -115,17 +173,18 @@ class YOLOModel:
         if not self.is_loaded:
             return []
 
-        results = self._model.track(
-            frame,
-            verbose=False,
-            conf=conf,
-            tracker=tracker,
-            persist=persist,
-            device=self._device,
-            half=self._use_half,
-            imgsz=640,
-        )[0]
-        return self._parse_boxes(results)
+        with self._infer_lock:
+            results = self._model.track(
+                frame,
+                verbose=False,
+                conf=conf,
+                tracker=tracker,
+                persist=persist,
+                device=self._device,
+                half=self._use_half,
+                imgsz=640,
+            )[0]
+            return self._parse_boxes(results)
 
     def reset_tracker(self) -> None:
         """Reset the internal tracker state (new IDs on next track() call)."""

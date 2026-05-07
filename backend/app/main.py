@@ -28,17 +28,39 @@ async def lifespan(app: FastAPI):
     get_tracker(tracker_type)
     logger.info("Tracker ready: %s (ultralytics built-in)", tracker_type)
 
-    # Auto-load default model (e.g. best.pt) if present in models_storage
-    if settings.DEFAULT_MODEL:
-        default_path = settings.MODELS_DIR / settings.DEFAULT_MODEL
-        if default_path.exists():
-            try:
-                model_service.load(default_path)
-                logger.info("Default model loaded: %s", settings.DEFAULT_MODEL)
-            except Exception as e:
-                logger.warning("Could not auto-load default model %s: %s", settings.DEFAULT_MODEL, e)
+    # Auto-load a default model so UI is ready on first open.
+    # Priority:
+    # 1) DEFAULT_MODEL if it exists (e.g. best.pt)
+    # 2) Any **/best.pt under models_storage
+    # 3) First .pt found under models_storage
+    # 4) Fallback to pretrained yolov8n.pt
+    try:
+        chosen = None
+
+        if settings.DEFAULT_MODEL:
+            candidate = settings.MODELS_DIR / settings.DEFAULT_MODEL
+            if candidate.exists():
+                chosen = candidate
+
+        if chosen is None:
+            bests = sorted(settings.MODELS_DIR.glob("**/best.pt"))
+            if bests:
+                chosen = bests[0]
+
+        if chosen is None:
+            pts = sorted(settings.MODELS_DIR.glob("**/*.pt"))
+            if pts:
+                chosen = pts[0]
+
+        if chosen is not None and chosen.exists():
+            model_service.load(chosen)
+            logger.info("Default model loaded: %s", chosen)
         else:
-            logger.info("No default model at %s (optional)", default_path)
+            from app.ml.yolo_model import yolo_model
+            yolo_model.load_pretrained("yolov8n.pt")
+            logger.info("Default model loaded: yolov8n.pt (pretrained)")
+    except Exception as e:
+        logger.warning("Could not auto-load default model: %s", e)
 
     yield
     logger.info("Traffic Monitor API shutting down")

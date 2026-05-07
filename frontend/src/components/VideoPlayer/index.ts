@@ -1,2 +1,2 @@
 export { VideoPlayer } from './VideoPlayer'
-export type { VideoPlayerHandle, VideoTransform } from './VideoPlayer'
+// Note: keep barrel exports minimal; `VideoPlayer.tsx` only exports `VideoPlayer`.

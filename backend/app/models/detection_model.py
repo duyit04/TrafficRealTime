@@ -64,10 +64,28 @@ class FramePayload(BaseModel):
     stats: VehicleStats
 
 
+# ── Companion (second stream) payload ─────────────────────────────────────────
+
+class CompanionFramePayload(BaseModel):
+    """
+    Second RTSP live frame (for dual-view UI).
+    Keep it lightweight: no counters, no congestion; only frame + detections + basic runtime flags.
+    """
+    frame: str | None = None  # base64-encoded JPEG
+    detections: list[Detection] = []
+    fps: float = 0.0
+    frame_count: int = 0
+    stream_active: bool = False
+
+
 # ── Request Models ────────────────────────────────────────────────────────────
 
 class StreamStartRequest(BaseModel):
     url: str = Field(..., description="RTSP URL or local video file path")
+    companion_url: Optional[str] = Field(
+        None,
+        description="Optional second RTSP (other approach at same intersection). Enables dual-lane TLC density.",
+    )
 
 
 class RoiRequest(BaseModel):

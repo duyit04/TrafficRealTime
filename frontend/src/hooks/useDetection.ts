@@ -39,9 +39,14 @@ export function useDetection() {
   const [detections, setDetections]     = useState<Detection[]>([]);
   const [stats, setStats]               = useState<VehicleStats>(DEFAULT_STATS);
   const [streamActive, setStreamActive] = useState(false);
+  const [companionActive, setCompanionActive] = useState(false);
+  const [companionFrame, setCompanionFrame] = useState<string | null>(null);
+  const [companionDetections, setCompanionDetections] = useState<Detection[]>([]);
+  const [companionFps, setCompanionFps] = useState(0);
   const settingsTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const [wsConnected] = useState(false);
   const frameTimerRef = useRef<ReturnType<typeof setInterval>>();
+  const companionTimerRef = useRef<ReturnType<typeof setInterval>>();
 
   // Load initial stats once
   useEffect(() => {
@@ -64,8 +69,15 @@ export function useDetection() {
         clearInterval(frameTimerRef.current);
         frameTimerRef.current = undefined;
       }
+      if (companionTimerRef.current) {
+        clearInterval(companionTimerRef.current);
+        companionTimerRef.current = undefined;
+      }
       setCurrentFrame(null);
       setDetections([]);
+      setCompanionFrame(null);
+      setCompanionDetections([]);
+      setCompanionFps(0);
       return;
     }
 
@@ -106,24 +118,61 @@ export function useDetection() {
       }
     }, 250);
 
+    // Companion poll (staggered a bit to avoid burst on backend)
+    if (companionActive) {
+      let fetching2 = false;
+      const tick = async () => {
+        if (fetching2) return;
+        fetching2 = true;
+        try {
+          const payload = await streamApi.getCompanionFrame();
+          if (!payload || !payload.frame || !payload.stream_active) {
+            setCompanionFrame(null);
+            setCompanionDetections([]);
+            setCompanionFps(0);
+            return;
+          }
+          setCompanionFrame(payload.frame);
+          setCompanionDetections(payload.detections ?? []);
+          setCompanionFps(payload.fps ?? 0);
+        } catch {
+          // ignore
+        } finally {
+          fetching2 = false;
+        }
+      };
+      // Start slightly later than primary poll to spread load.
+      window.setTimeout(() => void tick(), 125);
+      companionTimerRef.current = setInterval(() => void tick(), 250);
+    }
+
     return () => {
       if (frameTimerRef.current) {
         clearInterval(frameTimerRef.current);
         frameTimerRef.current = undefined;
       }
+      if (companionTimerRef.current) {
+        clearInterval(companionTimerRef.current);
+        companionTimerRef.current = undefined;
+      }
     };
-  }, [streamActive]);
+  }, [streamActive, companionActive]);
 
   // ── Actions ────────────────────────────────────────────────────────────────
 
-  const startStream = useCallback(async (url: string) => {
-    await streamApi.start({ url });
+  const startStream = useCallback(async (url: string, opts?: { companionUrl?: string }) => {
+    await streamApi.start({
+      url,
+      ...(opts?.companionUrl ? { companion_url: opts.companionUrl } : {}),
+    });
+    setCompanionActive(Boolean(opts?.companionUrl));
     setStreamActive(true);
   }, []);
 
   const stopStream = useCallback(async () => {
     await streamApi.stop();
     setStreamActive(false);
+    setCompanionActive(false);
   }, []);
 
   const setRoi = useCallback(async (points: number[][]) => {
@@ -158,6 +207,9 @@ export function useDetection() {
     currentFrame,
     detections,
     stats,
+    companionFrame,
+    companionDetections,
+    companionFps,
     wsConnected,
     streamActive,
     // Actions

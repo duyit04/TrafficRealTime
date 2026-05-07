@@ -140,13 +140,6 @@ export function RoiDrawer({ onApply, onClear, active, points: controlledPoints, 
         </span>
       </div>
 
-      {/* Sidebar preview canvas (non-interactive); drawing happens on main video overlay */}
-      <div className="mt-1 w-full h-24 rounded-lg border border-dashed border-slate-300 bg-slate-50 overflow-hidden">
-        <canvas
-          ref={canvasRef}
-          className="w-full h-full block"
-        />
-      </div>
     </div>
   );
 }

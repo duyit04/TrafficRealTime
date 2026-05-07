@@ -61,22 +61,31 @@ class StreamService:
         self._timeline: list[dict] = []
         self._timeline_last: int = 0
         self._last_error: str | None = None
+        # Optional second RTSP — same intersection, other approach (video only)
+        self._companion_thread: threading.Thread | None = None
+        self._companion_running: bool = False
+        self._companion_url: str = ""
+        self._companion_latest: dict | None = None
+        self._companion_lock = threading.Lock()
+        self._companion_frame_count: int = 0
+        self._companion_fps: float = 0.0
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def start(self, url: str) -> None:
+    def start(self, url: str, companion_url: str | None = None) -> None:
         self._last_error = None
         self._stats.stream_error = ""
         url = url.strip()
-        t = threading.Thread(target=self._do_start_with_stop, args=(url,), daemon=True)
+        cu = (companion_url or "").strip()
+        t = threading.Thread(target=self._do_start_with_stop, args=(url, cu), daemon=True)
         t.start()
         logger.info("StreamService: start requested → %s", url[:80])
 
-    def _do_start_with_stop(self, url: str) -> None:
+    def _do_start_with_stop(self, url: str, companion_url: str = "") -> None:
         self.stop()
-        self._do_start(url)
+        self._do_start(url, companion_url)
 
-    def _do_start(self, url: str) -> None:
+    def _do_start(self, url: str, companion_url: str = "") -> None:
         try:
             self._reset_all()
             effective_url = url
@@ -91,6 +100,16 @@ class StreamService:
                 effective_url = resolved
                 logger.info("StreamService: YouTube resolved")
             self._running = True
+            self._companion_url = companion_url.strip()
+            if self._companion_url:
+                self._companion_running = True
+                self._companion_thread = threading.Thread(
+                    target=self._companion_worker,
+                    args=(self._companion_url,),
+                    daemon=True,
+                )
+                self._companion_thread.start()
+                logger.info("StreamService: companion TLC lane → %s", self._companion_url[:80])
             self._thread = threading.Thread(target=self._worker, args=(effective_url,), daemon=True)
             self._thread.start()
             logger.info("StreamService: worker started")
@@ -102,14 +121,27 @@ class StreamService:
 
     def stop(self) -> None:
         self._running = False
+        self._companion_running = False
+        if self._companion_thread:
+            self._companion_thread.join(timeout=5)
+            self._companion_thread = None
+        self._companion_url = ""
         if self._thread:
             self._thread.join(timeout=4)
             self._thread = None
         with self._lock:
             self._latest = None
+        with self._companion_lock:
+            self._companion_latest = None
         self._stats.stream_active = False
         self._last_error = None
         self._stats.stream_error = ""
+        try:
+            from app.services.traffic_light_service import traffic_light_service as tls
+
+            tls.set_stream_live(False)
+        except Exception as e:
+            logger.debug("TrafficLight detach(stop): %s", e)
         logger.info("StreamService: stopped")
 
     def reset_counters(self) -> None:
@@ -162,6 +194,10 @@ class StreamService:
         with self._lock:
             return self._latest
 
+    def get_companion_latest(self) -> dict | None:
+        with self._companion_lock:
+            return self._companion_latest
+
     # ── Properties ────────────────────────────────────────────────────────────
 
     @property
@@ -209,6 +245,12 @@ class StreamService:
             return
 
         self._stats.stream_active = True
+        try:
+            from app.services.traffic_light_service import traffic_light_service as tls
+
+            tls.set_stream_live(True)
+        except Exception as e:
+            logger.debug("TrafficLight attach: %s", e)
         fps_cnt = 0
         t0 = time.time()
         frame_interval = 1.0 / max(self.max_fps, 1)
@@ -294,6 +336,7 @@ class StreamService:
                 # Không ROI: đếm tất cả xe, line theo setting
                 # Có ROI:    chỉ đếm xe trong ROI, line = giữa ROI
                 frame_h = frame.shape[0]
+                frame_w = frame.shape[1]
 
                 if roi_service.active and roi_service.points:
                     active_tracks = [
@@ -319,6 +362,9 @@ class StreamService:
                 self._stats.classes_in = dict(self._counter.by_class_in)
                 self._stats.classes_out = dict(self._counter.by_class_out)
                 self._stats.counting_mode = self._counter.mode
+
+                # TLC fixed-cycle is display-only; we intentionally do not compute
+                # any per-frame TLC queue/approach inference here.
 
                 # 4. Congestion — cùng tập xe đã lọc
                 cong_state = self._congestion.update(len(active_tracks))
@@ -373,7 +419,101 @@ class StreamService:
             self._stats.stream_active = False
             self._stats.fps = 0.0
             self._running = False
+            try:
+                from app.services.traffic_light_service import traffic_light_service as tls
+
+                tls.set_stream_live(False)
+            except Exception as e:
+                logger.debug("TrafficLight detach: %s", e)
             logger.info("StreamService: worker exited")
+
+    def _companion_worker(self, url: str) -> None:
+        """Second RTSP: YOLO predict-only + optional live frame payload for UI."""
+        logger.info("StreamService: companion lane worker → %s", url[:80])
+        is_rtsp = str(url).lower().startswith("rtsp://")
+        if is_rtsp:
+            import os
+
+            os.environ.setdefault(
+                "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+                "rtsp_transport;tcp|buffer_size;4096000|max_delay;500000|stimeout;5000000|fflags;nobuffer|flags;low_delay",
+            )
+            cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        else:
+            cap = cv2.VideoCapture(url)
+        if not cap.isOpened():
+            logger.warning("StreamService: companion cannot open stream")
+            self._companion_running = False
+            return
+
+        fps_cnt = 0
+        t0 = time.time()
+        frame_interval = 1.0 / max(int(getattr(settings, "COMPANION_MAX_FPS", 12)), 1)
+        while self._companion_running:
+            t_start = time.time()
+            ok, fr = cap.read()
+            if not ok or fr is None:
+                continue
+
+            # RTSP: flush a bit to keep it fresh when inference is slower than camera FPS
+            if is_rtsp:
+                for _ in range(2):
+                    if not cap.grab():
+                        break
+                ret2, fresh = cap.retrieve()
+                if ret2 and fresh is not None:
+                    fr = fresh
+
+            self._companion_frame_count += 1
+            fps_cnt += 1
+            elapsed = time.time() - t0
+            if elapsed >= 1.0:
+                self._companion_fps = round(fps_cnt / elapsed, 1)
+                fps_cnt = 0
+                t0 = time.time()
+            try:
+                dets = yolo_model.predict(fr, conf=self.conf_threshold)
+            except Exception as ce:
+                logger.debug("Companion lane predict skipped: %s", ce)
+                continue
+
+            # Optional: publish companion frame + detections for UI second panel
+            try:
+                from app.models.detection_model import Detection, BoundingBox
+
+                api_dets = [
+                    Detection(
+                        bbox=BoundingBox(x1=d.x1, y1=d.y1, x2=d.x2, y2=d.y2),
+                        class_name=d.class_name,
+                        confidence=d.confidence,
+                        track_id=d.track_id,
+                    )
+                    for d in dets
+                ]
+                _, buf = cv2.imencode(".jpg", fr, [cv2.IMWRITE_JPEG_QUALITY, 88])
+                frame_b64 = base64.b64encode(buf.tobytes()).decode()
+                payload = {
+                    "frame": frame_b64,
+                    "detections": [d.model_dump() for d in api_dets],
+                    "fps": float(self._companion_fps),
+                    "frame_count": int(self._companion_frame_count),
+                    "stream_active": True,
+                }
+                with self._companion_lock:
+                    self._companion_latest = payload
+            except Exception as e:
+                logger.debug("Companion publish skipped: %s", e)
+
+            # Throttle (independent of primary)
+            sleep_t = frame_interval - (time.time() - t_start)
+            if sleep_t > 0:
+                time.sleep(sleep_t)
+
+        cap.release()
+        with self._companion_lock:
+            self._companion_latest = None
+        logger.info("StreamService: companion lane worker exited")
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -390,8 +530,12 @@ class StreamService:
         self._counting_line_y = None
         self._timeline.clear()
         self._timeline_last = 0
+        self._companion_frame_count = 0
+        self._companion_fps = 0.0
         with self._lock:
             self._latest = None
+        with self._companion_lock:
+            self._companion_latest = None
 
     def _push_timeline(self) -> None:
         delta = self._stats.total - self._timeline_last
