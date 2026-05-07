@@ -113,7 +113,16 @@ export const detectionApi = {
       body: JSON.stringify(body),
     }),
 
+  setRoiSlot: (slot: string | number, body: RoiRequest) =>
+    apiFetch<SuccessResponse>(`/roi/${encodeURIComponent(String(slot))}`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
   clearRoi: () => apiFetch<SuccessResponse>('/roi', { method: 'DELETE' }),
+
+  clearRoiSlot: (slot: string | number) =>
+    apiFetch<SuccessResponse>(`/roi/${encodeURIComponent(String(slot))}`, { method: 'DELETE' }),
 
   getStats: () => apiFetch<VehicleStats>('/stats'),
 
@@ -137,6 +146,7 @@ export interface TLPhase {
   color: 'red' | 'yellow' | 'green';
   remaining: number;
   green_time?: number;
+  queue_length?: number;
 }
 
 export interface TLState {
@@ -150,5 +160,7 @@ export interface TLState {
 
 export const trafficLightApi = {
   getState: () => apiFetch<TLState>('/traffic-light/state'),
+  setSources: (body: { phase0_slot: string; phase1_slot: string }) =>
+    apiFetch<TLState>('/traffic-light/sources', { method: 'POST', body: JSON.stringify(body) }),
 };
 

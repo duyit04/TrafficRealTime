@@ -209,3 +209,12 @@ class TrafficLightConfig(BaseModel):
     rl_alpha: float | None = None
     rl_gamma: float | None = None
     rl_epsilon: float | None = None
+
+
+class TrafficLightSourceAssign(BaseModel):
+    """
+    Map UI-selected cameras to the 2 traffic-light phases.
+    slot can be: "primary", "companion", "2", "3" (extra live slots).
+    """
+    phase0_slot: str = "primary"
+    phase1_slot: str = "companion"

@@ -19,17 +19,32 @@ router = APIRouter(prefix="/api/v1", tags=["detection"])
 
 @router.post("/roi", response_model=SuccessResponse)
 async def set_roi(body: RoiRequest):
-    roi_service.set_roi(body.points, body.active)
+    # Back-compat: default slot = primary
+    roi_service.set_roi(body.points, body.active, slot="primary")
     return SuccessResponse(
         success=True,
         message=f"ROI set: {len(body.points)} points, active={roi_service.active}",
     )
 
+@router.post("/roi/{slot}", response_model=SuccessResponse)
+async def set_roi_slot(slot: str, body: RoiRequest):
+    roi_service.set_roi(body.points, body.active, slot=slot)
+    return SuccessResponse(
+        success=True,
+        message=f"ROI[{slot}] set: {len(body.points)} points, active={roi_service.active_for(slot)}",
+    )
+
 
 @router.delete("/roi", response_model=SuccessResponse)
 async def clear_roi():
-    roi_service.clear()
+    # Back-compat: default slot = primary
+    roi_service.clear(slot="primary")
     return SuccessResponse(success=True, message="ROI cleared")
+
+@router.delete("/roi/{slot}", response_model=SuccessResponse)
+async def clear_roi_slot(slot: str):
+    roi_service.clear(slot=slot)
+    return SuccessResponse(success=True, message=f"ROI[{slot}] cleared")
 
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
@@ -39,7 +54,7 @@ async def get_stats():
     s = stream_service.stats
     s.model_loaded = model_service.is_loaded
     s.model_name = model_service.name
-    s.roi_active = roi_service.active
+    s.roi_active = roi_service.active_for("primary")
     return s
 
 

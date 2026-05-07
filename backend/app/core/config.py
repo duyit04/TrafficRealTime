@@ -93,6 +93,8 @@ class Settings(BaseSettings):
     # Fuzzy green-time boost from approaching vehicles (seconds ≈ coeff * count, capped)
     TLC_FUZZY_APPROACH_BOOST: float = 0.55
     TLC_FUZZY_APPROACH_BOOST_MAX: float = 14.0
+    # Suggested green-time from stopped queue in ROI (seconds per stopped vehicle)
+    TLC_STOPPED_GREEN_COEFF: float = 2.5
     # After all-red: if the scheduled green phase has no queue/approaching but the other does, serve the other first
     TLC_ACTUATED_PREFER_DEMAND_PHASE: bool = True
     # Fraction of max_red_wait beyond which UI shows "priority" hint before hard force

@@ -3,7 +3,7 @@
  * Uses useDetection hook for all state management.
  */
 
-import { useState, useEffect, useCallback, useMemo, type ReactNode } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef, type ReactNode } from 'react';
 import { useDetection } from '../../hooks/useDetection';
 import { VideoPlayer } from '../../components/VideoPlayer';
 import { RoiDrawer, RoiCanvasOverlay } from '../../components/RoiDrawer';
@@ -13,7 +13,7 @@ import { CounterPanel } from '../../components/CounterPanel';
 import { CameraWall } from '../../components/CameraWall/CameraWall';
 import { TwinSiblingPanel, getPreviewRefreshMs, getPreviewStaggerMs } from '../../components/TwinSiblingPanel';
 import { TrafficLightPanel } from '../../components/TrafficLight';
-import { modelApi, detectionApi, streamApi } from '../../services/api';
+import { modelApi, detectionApi, streamApi, trafficLightApi } from '../../services/api';
 import type { DeviceInfo } from '../../services/api';
 import type { ModelInfo, Settings, Toast } from '../../types/detection';
 
@@ -47,7 +47,7 @@ export function Dashboard() {
     currentFrame, detections, stats, wsConnected, usingFallback,
     companionFrame, companionDetections, companionFps,
     extraLive,
-    startStream, stopStream, reloadStats, setRoi, clearRoi, resetCount, updateSettings,
+    startStream, stopStream, reloadStats, setRoi, clearRoi, setRoiSlot, clearRoiSlot, resetCount, updateSettings,
   } = useDetection();
 
   const [streamUrl, setStreamUrl]     = useState('');
@@ -64,9 +64,19 @@ export function Dashboard() {
     congestion_duration: 5,
   });
   const [toasts, setToasts]           = useState<Toast[]>([]);
-  const [roiActive, setRoiActive]     = useState(false);
-  const [roiPoints, setRoiPoints]     = useState<RoiPoint[]>([]);
-  const [roiDrawing, setRoiDrawing]   = useState(false);
+  type RoiSlotKey = 'primary' | 'companion' | 2 | 3;
+  type RoiSlotState = { active: boolean; points: RoiPoint[]; drawing: boolean };
+  const [roiTarget, setRoiTarget] = useState<RoiSlotKey>('primary');
+  const [roiBySlot, setRoiBySlot] = useState<Record<string, RoiSlotState>>({
+    primary: { active: false, points: [], drawing: false },
+    companion: { active: false, points: [], drawing: false },
+    2: { active: false, points: [], drawing: false },
+    3: { active: false, points: [], drawing: false },
+  });
+  const roiCanvasPrimaryRef = useRef<HTMLCanvasElement>(null);
+  const roiCanvasCompanionRef = useRef<HTMLCanvasElement>(null);
+  const roiCanvasExtra2Ref = useRef<HTMLCanvasElement>(null);
+  const roiCanvasExtra3Ref = useRef<HTMLCanvasElement>(null);
   const [countingEnabled, setCountingEnabled] = useState(true);
   const [deviceInfo, setDeviceInfo] = useState<DeviceInfo>({ cuda_available: false, device_name: null });
   /** Số màn preview RTSP thêm cạnh luồng chính (0 = chỉ một màn LIVE). */
@@ -149,6 +159,28 @@ export function Dashboard() {
   };
 
   const congestion = stats.congestion;
+
+  const urlToSlot = useCallback((urlRaw: string): string => {
+    const u = (urlRaw || '').trim();
+    if (!u) return 'primary';
+    if (trimmedStream && u === trimmedStream) return 'primary';
+    // Camera 2 LIVE is driven by extraPreviewUrls[0]
+    const cam2 = (extraPreviewUrls[0] ?? '').trim();
+    if (cam2 && u === cam2) return 'companion';
+    const cam3 = (extraPreviewUrls[1] ?? '').trim();
+    if (cam3 && u === cam3) return '2';
+    const cam4 = (extraPreviewUrls[2] ?? '').trim();
+    if (cam4 && u === cam4) return '3';
+    // Fallback: if user picked a visible URL we can't map, treat as primary.
+    return 'primary';
+  }, [trimmedStream, extraPreviewUrls]);
+
+  useEffect(() => {
+    // Push mapping to backend so TLC can consume ROI+tracking from the correct camera slots.
+    const p0 = urlToSlot(tlSelectedUrls[0] ?? '');
+    const p1 = urlToSlot(tlSelectedUrls[1] ?? '');
+    trafficLightApi.setSources({ phase0_slot: p0, phase1_slot: p1 }).catch(() => {});
+  }, [tlSelectedUrls, urlToSlot]);
 
   useEffect(() => {
     if (!settingsOpen) return;
@@ -290,66 +322,85 @@ export function Dashboard() {
     addToast('Stream da dung', 'info');
   };
 
-  // ROI — convert canvas coords → video coords before sending to backend
-  const handleApplyRoi = async (points: number[][]) => {
-    // Get the video container size (canvas overlay) and original video dimensions
-    const videoContainer = document.querySelector('.relative.flex-1') as HTMLElement | null;
-    const videoCanvas = videoContainer?.querySelector('canvas') as HTMLCanvasElement | null;
+  const getCanvasRefFor = useCallback((slot: RoiSlotKey) => {
+    if (slot === 'primary') return roiCanvasPrimaryRef;
+    if (slot === 'companion') return roiCanvasCompanionRef;
+    if (slot === 2) return roiCanvasExtra2Ref;
+    return roiCanvasExtra3Ref;
+  }, []);
 
-    // We need the original video dimensions from the last decoded frame
-    // imgRef in VideoPlayer holds naturalWidth/naturalHeight, but we can also
-    // get it from the stats or by decoding the current frame.
-    // Simplest: read the VideoPlayer canvas dimensions vs the container.
-    // The RoiCanvasOverlay sits over the same container as VideoPlayer.
-    // Points are in container-pixel coords. We need to map to video-pixel coords.
+  const getFrameFor = useCallback((slot: RoiSlotKey): string | null => {
+    if (slot === 'primary') return currentFrame;
+    if (slot === 'companion') return companionFrame;
+    if (slot === 2) return extraLive?.[2]?.frame ?? null;
+    return extraLive?.[3]?.frame ?? null;
+  }, [currentFrame, companionFrame, extraLive]);
 
-    if (videoCanvas && currentFrame) {
-      // Decode frame to get natural dimensions
-      const img = new Image();
-      await new Promise<void>((resolve) => {
-        img.onload = () => resolve();
-        img.onerror = () => resolve();
-        img.src = `data:image/jpeg;base64,${currentFrame}`;
-      });
+  async function mapPointsToVideo(points: number[][], frameB64: string | null, canvas: HTMLCanvasElement | null) {
+    if (!frameB64 || !canvas) return points;
+    const img = new Image();
+    await new Promise<void>((resolve) => {
+      img.onload = () => resolve();
+      img.onerror = () => resolve();
+      img.src = `data:image/jpeg;base64,${frameB64}`;
+    });
+    if (!(img.naturalWidth > 0 && img.naturalHeight > 0)) return points;
 
-      if (img.naturalWidth > 0 && img.naturalHeight > 0) {
-        const cw = videoCanvas.offsetWidth;
-        const ch = videoCanvas.offsetHeight;
-        const imgRatio = img.naturalWidth / img.naturalHeight;
-        const canRatio = cw / ch;
-        let dw: number, dh: number, dx: number, dy: number;
-        if (imgRatio > canRatio) {
-          dw = cw; dh = cw / imgRatio; dx = 0; dy = (ch - dh) / 2;
-        } else {
-          dh = ch; dw = ch * imgRatio; dx = (cw - dw) / 2; dy = 0;
-        }
-        const scaleX = img.naturalWidth / dw;
-        const scaleY = img.naturalHeight / dh;
+    const cw = canvas.offsetWidth;
+    const ch = canvas.offsetHeight;
+    if (!(cw > 0 && ch > 0)) return points;
 
-        const videoPoints = points.map(([x, y]) => [
-          Math.round((x - dx) * scaleX),
-          Math.round((y - dy) * scaleY),
-        ]);
-        await setRoi(videoPoints);
-        setRoiActive(true);
-        addToast(`ROI da ap dung (${points.length} diem)`, 'success');
-        return;
-      }
+    const imgRatio = img.naturalWidth / img.naturalHeight;
+    const canRatio = cw / ch;
+    let dw: number, dh: number, dx: number, dy: number;
+    if (imgRatio > canRatio) {
+      dw = cw; dh = cw / imgRatio; dx = 0; dy = (ch - dh) / 2;
+    } else {
+      dh = ch; dw = ch * imgRatio; dx = (cw - dw) / 2; dy = 0;
     }
+    const scaleX = img.naturalWidth / dw;
+    const scaleY = img.naturalHeight / dh;
+    return points.map(([x, y]) => [
+      Math.round((x - dx) * scaleX),
+      Math.round((y - dy) * scaleY),
+    ]);
+  }
 
-    // Fallback: send as-is (may be wrong if canvas != video size)
-    await setRoi(points);
-    setRoiActive(true);
-    addToast(`ROI da ap dung (${points.length} diem)`, 'success');
-  };
+  const handleApplyRoiFor = useCallback(async (slot: RoiSlotKey, canvasPoints: number[][]) => {
+    const frameB64 = getFrameFor(slot);
+    const canvas = getCanvasRefFor(slot).current;
+    const videoPoints = await mapPointsToVideo(canvasPoints, frameB64, canvas);
+    if (slot === 'primary') await setRoi(videoPoints);
+    else await setRoiSlot(slot, videoPoints);
 
-  const handleClearRoi = async () => {
-    await clearRoi();
-    setRoiActive(false);
-    setRoiPoints([]);
-    setRoiDrawing(false);
-    addToast('ROI da xoa', 'info');
-  };
+    setRoiBySlot((prev) => ({ ...prev, [String(slot)]: { ...prev[String(slot)], active: true, drawing: false } }));
+    addToast(`ROI (Camera ${slot === 'primary' ? 1 : slot === 'companion' ? 2 : slot === 2 ? 3 : 4}) đã áp dụng (${canvasPoints.length} điểm)`, 'success');
+  }, [addToast, getCanvasRefFor, getFrameFor, setRoi, setRoiSlot]);
+
+  const handleClearRoiFor = useCallback(async (slot: RoiSlotKey) => {
+    if (slot === 'primary') await clearRoi();
+    else await clearRoiSlot(slot);
+    setRoiBySlot((prev) => ({ ...prev, [String(slot)]: { active: false, points: [], drawing: false } }));
+    addToast(`ROI (Camera ${slot === 'primary' ? 1 : slot === 'companion' ? 2 : slot === 2 ? 3 : 4}) đã xoá`, 'info');
+  }, [addToast, clearRoi, clearRoiSlot]);
+
+  const roiState = roiBySlot[String(roiTarget)] ?? { active: false, points: [], drawing: false };
+
+  const roiActiveSlots = useMemo(() => {
+    const slots: RoiSlotKey[] = [];
+    if (streamOn && trimmedStream) slots.push('primary');
+    if (streamOn && Boolean(companionFrame)) slots.push('companion');
+    if (streamOn && Boolean(extraLive?.[2]?.frame)) slots.push(2);
+    if (streamOn && Boolean(extraLive?.[3]?.frame)) slots.push(3);
+    // If nothing is live yet, still allow configuring Camera 1.
+    if (slots.length === 0) slots.push('primary');
+    return slots;
+  }, [streamOn, trimmedStream, companionFrame, extraLive]);
+
+  useEffect(() => {
+    // Keep roiTarget valid when camera slots change
+    if (!roiActiveSlots.includes(roiTarget)) setRoiTarget(roiActiveSlots[0] ?? 'primary');
+  }, [roiActiveSlots, roiTarget]);
 
   // Export CSV
   const handleExport = async () => {
@@ -516,13 +567,14 @@ export function Dashboard() {
                     onEmptyClick={() => setCameraOpen(true)}
                   />
                   <RoiCanvasOverlay
-                    points={roiPoints}
-                    setPoints={setRoiPoints}
-                    isDrawing={roiDrawing}
-                    setIsDrawing={setRoiDrawing}
-                    onApply={handleApplyRoi}
-                    onClear={handleClearRoi}
-                    active={roiActive}
+                    points={roiBySlot.primary.points}
+                    setPoints={(p) => setRoiBySlot((prev) => ({ ...prev, primary: { ...prev.primary, points: typeof p === 'function' ? (p as any)(prev.primary.points) : p } }))}
+                    isDrawing={roiBySlot.primary.drawing}
+                    setIsDrawing={(v) => setRoiBySlot((prev) => ({ ...prev, primary: { ...prev.primary, drawing: v } }))}
+                    onApply={(pts) => void handleApplyRoiFor('primary', pts)}
+                    onClear={() => void handleClearRoiFor('primary')}
+                    active={roiBySlot.primary.active}
+                    canvasRefExternal={roiCanvasPrimaryRef}
                   />
 
                   {congestion && congestion.is_congested && (
@@ -583,6 +635,16 @@ export function Dashboard() {
                         showLine={false}
                         onEmptyClick={() => { setAssignExtraIndex(0); setCameraOpen(true); }}
                       />
+                      <RoiCanvasOverlay
+                        points={roiBySlot.companion.points}
+                        setPoints={(p) => setRoiBySlot((prev) => ({ ...prev, companion: { ...prev.companion, points: typeof p === 'function' ? (p as any)(prev.companion.points) : p } }))}
+                        isDrawing={roiBySlot.companion.drawing}
+                        setIsDrawing={(v) => setRoiBySlot((prev) => ({ ...prev, companion: { ...prev.companion, drawing: v } }))}
+                        onApply={(pts) => void handleApplyRoiFor('companion', pts)}
+                        onClear={() => void handleClearRoiFor('companion')}
+                        active={roiBySlot.companion.active}
+                        canvasRefExternal={roiCanvasCompanionRef}
+                      />
                       <div className="mt-1 flex items-center gap-2">
                         <TbBadge color="text-emerald-700" label={`LIVE: ${companionFps.toFixed(1)} FPS`} />
                       </div>
@@ -598,6 +660,24 @@ export function Dashboard() {
                         stats={statsForView}
                         showLine={false}
                         onEmptyClick={() => { setAssignExtraIndex(i); setCameraOpen(true); }}
+                      />
+                      <RoiCanvasOverlay
+                        points={(extraSlot === 2 ? roiBySlot['2'] : roiBySlot['3']).points}
+                        setPoints={(p) => setRoiBySlot((prev) => {
+                          const key = String(extraSlot) as '2' | '3';
+                          const cur = prev[key];
+                          const nextPoints = typeof p === 'function' ? (p as any)(cur.points) : p;
+                          return { ...prev, [key]: { ...cur, points: nextPoints } };
+                        })}
+                        isDrawing={(extraSlot === 2 ? roiBySlot['2'] : roiBySlot['3']).drawing}
+                        setIsDrawing={(v) => setRoiBySlot((prev) => {
+                          const key = String(extraSlot) as '2' | '3';
+                          return { ...prev, [key]: { ...prev[key], drawing: v } };
+                        })}
+                        onApply={(pts) => void handleApplyRoiFor(extraSlot as 2 | 3, pts)}
+                        onClear={() => void handleClearRoiFor(extraSlot as 2 | 3)}
+                        active={(extraSlot === 2 ? roiBySlot['2'] : roiBySlot['3']).active}
+                        canvasRefExternal={extraSlot === 2 ? roiCanvasExtra2Ref : roiCanvasExtra3Ref}
                       />
                       <div className="mt-1 flex items-center gap-2">
                         <TbBadge color="text-emerald-700" label={`LIVE: ${(live.fps ?? 0).toFixed(1)} FPS`} />
@@ -715,14 +795,41 @@ export function Dashboard() {
                 </button>
               </div>
               <div className="p-4 overflow-auto">
+                <div className="mb-3 flex flex-wrap gap-2">
+                  {roiActiveSlots.map((k) => {
+                    const label = k === 'primary' ? 'Camera 1' : k === 'companion' ? 'Camera 2' : k === 2 ? 'Camera 3' : 'Camera 4';
+                    const isOn = roiTarget === k;
+                    return (
+                      <button
+                        key={String(k)}
+                        type="button"
+                        onClick={() => setRoiTarget(k)}
+                        className={`px-3 py-1.5 rounded-lg border text-xs font-semibold transition-colors ${
+                          isOn ? 'bg-blue-50 border-accent text-accent' : 'bg-white border-slate-200 text-slate-600 hover:border-slate-300'
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    );
+                  })}
+                </div>
                 <RoiDrawer
-                  onApply={handleApplyRoi}
-                  onClear={handleClearRoi}
-                  active={roiActive}
-                  points={roiPoints}
-                  setPoints={setRoiPoints}
-                  isDrawing={roiDrawing}
-                  setIsDrawing={setRoiDrawing}
+                  onApply={(pts) => void handleApplyRoiFor(roiTarget, pts)}
+                  onClear={() => void handleClearRoiFor(roiTarget)}
+                  active={roiState.active}
+                  points={roiState.points}
+                  setPoints={(p) => setRoiBySlot((prev) => {
+                    const key = String(roiTarget);
+                    const cur = prev[key] ?? { active: false, points: [], drawing: false };
+                    const nextPoints = typeof p === 'function' ? (p as any)(cur.points) : p;
+                    return { ...prev, [key]: { ...cur, points: nextPoints } };
+                  })}
+                  isDrawing={roiState.drawing}
+                  setIsDrawing={(v) => setRoiBySlot((prev) => {
+                    const key = String(roiTarget);
+                    const cur = prev[key] ?? { active: false, points: [], drawing: false };
+                    return { ...prev, [key]: { ...cur, drawing: v } };
+                  })}
                 />
               </div>
             </div>

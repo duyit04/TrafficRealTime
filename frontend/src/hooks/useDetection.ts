@@ -279,8 +279,16 @@ export function useDetection() {
     await detectionApi.setRoi({ points, active: true });
   }, []);
 
+  const setRoiSlot = useCallback(async (slot: string | number, points: number[][]) => {
+    await detectionApi.setRoiSlot(slot, { points, active: true });
+  }, []);
+
   const clearRoi = useCallback(async () => {
     await detectionApi.clearRoi();
+  }, []);
+
+  const clearRoiSlot = useCallback(async (slot: string | number) => {
+    await detectionApi.clearRoiSlot(slot);
   }, []);
 
   const resetCount = useCallback(async () => {
@@ -320,6 +328,8 @@ export function useDetection() {
     reloadStats,
     setRoi,
     clearRoi,
+    setRoiSlot,
+    clearRoiSlot,
     resetCount,
     updateSettings,
   };

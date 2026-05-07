@@ -75,6 +75,13 @@ class StreamService:
         # For inference skipping (keep last detections to reuse on skipped frames)
         self._skip_counter: int = 0
         self._last_api_dets: list[dict] = []
+        # Stop detection inside ROI (per slot) for traffic-light inference
+        self._stop_hist: dict[str, dict[int, dict]] = {
+            "primary": {},
+            "companion": {},
+            "2": {},
+            "3": {},
+        }
         # Optional second RTSP — same intersection, other approach (video only)
         self._companion_thread: threading.Thread | None = None
         self._companion_running: bool = False
@@ -456,10 +463,10 @@ class StreamService:
 
                 if roi_service.active and roi_service.points:
                     active_tracks = [
-                        t for t in tracks if roi_service.is_inside(t.cx, t.cy)
+                        t for t in tracks if roi_service.is_inside(t.cx, t.cy, slot="primary")
                     ]
                     # Counting line = giữa vùng ROI (pixel Y)
-                    roi_mid = roi_service.mid_y
+                    roi_mid = roi_service.mid_y_for("primary")
                     line_y = roi_mid if roi_mid is not None else int(frame_h * self.line_position)
                     # Cập nhật line_position để frontend vẽ đúng vị trí
                     self._stats.line_position = line_y / frame_h
@@ -494,6 +501,15 @@ class StreamService:
                     level=cong_state.level,
                 )
 
+                # 4.1 Model info for UI (avoid "No Model" flicker)
+                try:
+                    from app.services.model_service import model_service
+
+                    self._stats.model_loaded = bool(model_service.is_loaded)
+                    self._stats.model_name = str(model_service.name or "")
+                except Exception:
+                    pass
+
                 # 5. Build payload
                 from app.models.detection_model import Detection, BoundingBox
 
@@ -505,7 +521,17 @@ class StreamService:
                         track_id=d.track_id,
                     )
                     for d in raw_dets
+                    if roi_service.is_inside(d.cx, d.cy, slot="primary")
                 ]
+
+                # 5.1 Feed stopped-count-in-ROI to traffic-light service (phase mapping happens there)
+                try:
+                    from app.services.traffic_light_service import traffic_light_service as tls
+
+                    stopped_cnt, total_cnt = self._compute_stopped_in_roi("primary", raw_dets)
+                    tls.update_lane_observation("primary", stopped_cnt, total_cnt)
+                except Exception:
+                    pass
 
                 # 6. Encode frame (lower quality = smaller payload = higher FPS)
                 jpeg_q = int(getattr(settings, "STREAM_JPEG_QUALITY", 75) or 75)
@@ -630,7 +656,15 @@ class StreamService:
                         track_id=d.track_id,
                     )
                     for d in dets
+                    if roi_service.is_inside(d.cx, d.cy, slot="companion")
                 ]
+                try:
+                    from app.services.traffic_light_service import traffic_light_service as tls
+
+                    stopped_cnt, total_cnt = self._compute_stopped_in_roi("companion", dets)
+                    tls.update_lane_observation("companion", stopped_cnt, total_cnt)
+                except Exception:
+                    pass
                 jpeg_q = int(getattr(settings, "STREAM_JPEG_QUALITY", 75) or 75)
                 jpeg_q = max(30, min(95, jpeg_q))
                 _, buf = cv2.imencode(".jpg", fr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
@@ -744,7 +778,15 @@ class StreamService:
                         track_id=d.track_id,
                     )
                     for d in dets
+                    if roi_service.is_inside(d.cx, d.cy, slot=int(slot))
                 ]
+                try:
+                    from app.services.traffic_light_service import traffic_light_service as tls
+
+                    stopped_cnt, total_cnt = self._compute_stopped_in_roi(str(int(slot)), dets)
+                    tls.update_lane_observation(str(int(slot)), stopped_cnt, total_cnt)
+                except Exception:
+                    pass
                 jpeg_q = int(getattr(settings, "STREAM_JPEG_QUALITY", 75) or 75)
                 jpeg_q = max(30, min(95, jpeg_q))
                 _, buf = cv2.imencode(".jpg", fr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
@@ -775,6 +817,60 @@ class StreamService:
         with self._extra_lock:
             self._extra_latest.pop(int(slot), None)
             self._extra_yolo.pop(int(slot), None)
+
+    def _compute_stopped_in_roi(self, slot_key: str, dets: list) -> tuple[int, int]:
+        """
+        Compute stopped vehicles count inside ROI for a given slot.
+        Uses per-track centroid motion (px/s) over time.
+        """
+        key = str(slot_key)
+        now = time.monotonic()
+        hist = self._stop_hist.get(key)
+        if hist is None:
+            hist = {}
+            self._stop_hist[key] = hist
+
+        # Build active set from detections inside ROI
+        active_ids: set[int] = set()
+        in_roi: list = []
+        for d in dets or []:
+            tid = getattr(d, "track_id", None)
+            if tid is None:
+                continue
+            if not roi_service.is_inside(getattr(d, "cx", 0), getattr(d, "cy", 0), slot=key):
+                continue
+            active_ids.add(int(tid))
+            in_roi.append(d)
+
+        stop_speed = float(getattr(settings, "TLC_STOP_SPEED_PX_S", 8.0) or 8.0)
+        min_frames = int(getattr(settings, "TLC_MIN_STOPPED_FRAMES", 5) or 5)
+
+        for d in in_roi:
+            tid = int(d.track_id)
+            cx = float(getattr(d, "cx", 0.0))
+            cy = float(getattr(d, "cy", 0.0))
+            prev = hist.get(tid)
+            if not prev:
+                hist[tid] = {"cx": cx, "cy": cy, "t": now, "streak": 0}
+                continue
+            dt = max(1e-3, float(now - float(prev.get("t", now))))
+            dx = cx - float(prev.get("cx", cx))
+            dy = cy - float(prev.get("cy", cy))
+            sp = (dx * dx + dy * dy) ** 0.5 / dt
+            streak = int(prev.get("streak", 0))
+            if sp <= stop_speed:
+                streak += 1
+            else:
+                streak = 0
+            prev.update({"cx": cx, "cy": cy, "t": now, "streak": streak})
+
+        # Prune tracks not present
+        for tid in list(hist.keys()):
+            if tid not in active_ids:
+                hist.pop(tid, None)
+
+        stopped_cnt = sum(1 for v in hist.values() if int(v.get("streak", 0)) >= min_frames)
+        return int(stopped_cnt), int(len(in_roi))
         logger.info("StreamService: extra slot %d worker exited", int(slot))
 
     # ── Helpers ───────────────────────────────────────────────────────────────

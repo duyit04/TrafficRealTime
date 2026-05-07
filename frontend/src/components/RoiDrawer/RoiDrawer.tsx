@@ -154,10 +154,13 @@ export interface RoiCanvasOverlayProps {
   onApply: (points: number[][]) => void;
   onClear: () => void;
   active: boolean;
+  /** Optional external ref so parent can read canvas sizing for coordinate mapping. */
+  canvasRefExternal?: React.RefObject<HTMLCanvasElement>;
 }
 
-export function RoiCanvasOverlay({ points, setPoints, isDrawing, setIsDrawing, onApply, onClear, active }: RoiCanvasOverlayProps) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+export function RoiCanvasOverlay({ points, setPoints, isDrawing, setIsDrawing, onApply, onClear, active, canvasRefExternal }: RoiCanvasOverlayProps) {
+  const internalRef = useRef<HTMLCanvasElement>(null);
+  const canvasRef = canvasRefExternal ?? internalRef;
 
   useEffect(() => {
     const canvas = canvasRef.current;
