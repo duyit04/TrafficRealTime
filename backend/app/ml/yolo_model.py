@@ -102,6 +102,7 @@ class YOLOModel:
     def __init__(self) -> None:
         self._model = None
         self._model_path: str = ""
+        self._weights_path: Path | None = None
         self._class_names: dict[int, str] = {}
         self._device = "cpu"
         self._use_half = False
@@ -118,6 +119,7 @@ class YOLOModel:
 
         self._model = YOLO(str(path))
         self._model_path = path.name
+        self._weights_path = path.resolve()
 
         self._device, self._use_half, _dev_label = _resolve_yolo_device()
 
@@ -137,7 +139,34 @@ class YOLOModel:
     def unload(self) -> None:
         self._model = None
         self._model_path = ""
+        self._weights_path = None
         self._class_names = {}
+
+    def load_pretrained(self, name: str = "yolov8n.pt") -> None:
+        """
+        Load a pretrained Ultralytics model by name (auto-downloads if missing).
+        Example: "yolov8n.pt"
+        """
+        from ultralytics import YOLO
+
+        self._model = YOLO(str(name))
+        self._model_path = str(name)
+        self._weights_path = None
+
+        self._device, self._use_half, _dev_label = _resolve_yolo_device()
+
+        names = getattr(self._model, "names", {})
+        if isinstance(names, dict):
+            self._class_names = {int(i): str(n) for i, n in names.items()}
+        else:
+            self._class_names = {i: str(n) for i, n in enumerate(names)}
+
+        logger.info(
+            "YOLOModel: loaded pretrained %s → device=%s half=%s",
+            self._model_path,
+            _dev_label,
+            self._use_half,
+        )
 
     def predict(self, frame: np.ndarray, conf: float = 0.35) -> List[RawDetection]:
         """Run inference on a BGR numpy frame (detection only, no tracking)."""
@@ -230,6 +259,14 @@ class YOLOModel:
     @property
     def model_path(self) -> str:
         return self._model_path
+
+    @property
+    def weights_path(self) -> Path | None:
+        """
+        Full path to the currently loaded weights (only for local .pt loads).
+        Returns None when using load_pretrained().
+        """
+        return self._weights_path
 
 
 # Module-level singleton

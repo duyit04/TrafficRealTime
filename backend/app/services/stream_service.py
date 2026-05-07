@@ -57,6 +57,12 @@ class StreamService:
             vehicle_threshold=settings.CONGESTION_VEHICLE_THRESHOLD,
             stable_duration=settings.CONGESTION_STABLE_DURATION,
         )
+        # Per-camera YOLO instances for independent tracking state.
+        # (Ultralytics built-in trackers store state inside the model predictor.)
+        from app.ml.yolo_model import YOLOModel
+
+        self._companion_yolo = YOLOModel()
+        self._extra_yolo: dict[int, YOLOModel] = {}
 
         # Runtime state
         self._stats = VehicleStats()
@@ -205,6 +211,15 @@ class StreamService:
         self._counter.reset()
         self._tracker.reset()
         yolo_model.reset_tracker()
+        try:
+            self._companion_yolo.reset_tracker()
+        except Exception:
+            pass
+        for m in list(self._extra_yolo.values()):
+            try:
+                m.reset_tracker()
+            except Exception:
+                pass
         self._congestion.reset()
         self._stats.total = 0
         self._stats.count_in = 0
@@ -254,6 +269,25 @@ class StreamService:
     def get_companion_latest(self) -> dict | None:
         with self._companion_lock:
             return self._companion_latest
+
+    def _sync_secondary_model(self, local_model) -> bool:
+        """
+        Ensure a secondary YOLOModel has the same weights as the primary yolo_model.
+        Returns True if ready to run tracking; False if no primary model is loaded.
+        """
+        try:
+            if not yolo_model.is_loaded:
+                return False
+            wp = getattr(yolo_model, "weights_path", None)
+            if wp is None:
+                return False
+            # Reload if not loaded or model name changed.
+            if (not local_model.is_loaded) or (local_model.model_path != yolo_model.model_path):
+                local_model.load(wp)
+            return True
+        except Exception as e:
+            logger.debug("Secondary model sync failed: %s", e)
+            return False
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -522,8 +556,9 @@ class StreamService:
             logger.info("StreamService: worker exited")
 
     def _companion_worker(self, url: str) -> None:
-        """Second RTSP: YOLO predict-only + optional live frame payload for UI."""
+        """Second RTSP: YOLO tracking with independent per-camera state."""
         logger.info("StreamService: companion lane worker → %s", url[:80])
+        self._sync_secondary_model(self._companion_yolo)
         is_rtsp = str(url).lower().startswith("rtsp://")
         if is_rtsp:
             import os
@@ -569,9 +604,18 @@ class StreamService:
             dets = []
             if bool(getattr(settings, "COMPANION_DETECT_ENABLED", True)):
                 try:
-                    dets = yolo_model.predict(fr, conf=self.conf_threshold)
+                    # Ensure model is synced (handle model changes while running)
+                    if self._sync_secondary_model(self._companion_yolo):
+                        dets = self._companion_yolo.track(
+                            fr,
+                            conf=self.conf_threshold,
+                            tracker=self._tracker.tracker_yaml,
+                            persist=True,
+                        )
+                    else:
+                        dets = []
                 except Exception as ce:
-                    logger.debug("Companion lane predict skipped: %s", ce)
+                    logger.debug("Companion lane track skipped: %s", ce)
                     dets = []
 
             # Optional: publish companion frame + detections for UI second panel
@@ -624,8 +668,13 @@ class StreamService:
         logger.info("StreamService: companion lane worker exited")
 
     def _extra_worker(self, slot: int, url: str) -> None:
-        """Extra LIVE stream for additional screens (detect + frame)."""
+        """Extra LIVE stream for additional screens (tracking + frame)."""
         logger.info("StreamService: extra slot %d worker → %s", int(slot), str(url)[:80])
+        s = int(slot)
+        if s not in self._extra_yolo:
+            from app.ml.yolo_model import YOLOModel
+            self._extra_yolo[s] = YOLOModel()
+        self._sync_secondary_model(self._extra_yolo[s])
         is_rtsp = str(url).lower().startswith("rtsp://")
         if is_rtsp:
             import os
@@ -673,7 +722,15 @@ class StreamService:
 
             dets = []
             try:
-                dets = yolo_model.predict(fr, conf=self.conf_threshold)
+                if self._sync_secondary_model(self._extra_yolo[s]):
+                    dets = self._extra_yolo[s].track(
+                        fr,
+                        conf=self.conf_threshold,
+                        tracker=self._tracker.tracker_yaml,
+                        persist=True,
+                    )
+                else:
+                    dets = []
             except Exception:
                 dets = []
 
@@ -717,6 +774,7 @@ class StreamService:
         cap.release()
         with self._extra_lock:
             self._extra_latest.pop(int(slot), None)
+            self._extra_yolo.pop(int(slot), None)
         logger.info("StreamService: extra slot %d worker exited", int(slot))
 
     # ── Helpers ───────────────────────────────────────────────────────────────
