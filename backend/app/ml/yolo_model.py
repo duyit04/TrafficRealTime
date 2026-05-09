@@ -121,12 +121,12 @@ class YOLOModel:
             raise FileNotFoundError(f"Weights not found: {path}")
 
         self._device, self._use_half, _dev_label = _resolve_yolo_device()
-        self._model_path = path.name
-        self._weights_path = path.resolve()
 
         model, backend, loaded_path = self._load_with_backend_preference(path, YOLO)
         self._model = model
         self._runtime_backend = backend
+        self._model_path = loaded_path.name
+        self._weights_path = loaded_path.resolve()
 
         names = getattr(self._model, "names", {})
         if isinstance(names, dict):
@@ -157,13 +157,12 @@ class YOLOModel:
         """
         from ultralytics import YOLO
 
-        self._model_path = str(name)
-        self._weights_path = None
-
         self._device, self._use_half, _dev_label = _resolve_yolo_device()
         model, backend, loaded_path = self._load_with_backend_preference(Path(str(name)), YOLO)
         self._model = model
         self._runtime_backend = backend
+        self._model_path = loaded_path.name
+        self._weights_path = loaded_path.resolve()
 
         names = getattr(self._model, "names", {})
         if isinstance(names, dict):
@@ -173,7 +172,7 @@ class YOLOModel:
 
         logger.info(
             "YOLOModel: loaded pretrained %s via %s (%s) → device=%s half=%s",
-            self._model_path,
+            str(name),
             backend,
             loaded_path.name,
             _dev_label,

@@ -36,10 +36,12 @@ async def lifespan(app: FastAPI):
 
     # Auto-load a default model so UI is ready on first open.
     # Priority:
-    # 1) DEFAULT_MODEL if it exists (e.g. best.pt)
-    # 2) Any **/best.pt under models_storage
-    # 3) First .pt found under models_storage
-    # 4) Fallback to pretrained yolov8n.pt
+    # 1) DEFAULT_MODEL if it exists (e.g. best.engine / best.pt)
+    # 2) Any **/best.engine under models_storage
+    # 3) Any **/best.pt under models_storage
+    # 4) First .engine found under models_storage
+    # 5) First .pt found under models_storage
+    # 6) Fallback to pretrained yolov8n.pt
     try:
         chosen = None
 
@@ -49,9 +51,19 @@ async def lifespan(app: FastAPI):
                 chosen = candidate
 
         if chosen is None:
+            best_engines = sorted(settings.MODELS_DIR.glob("**/best.engine"))
+            if best_engines:
+                chosen = best_engines[0]
+
+        if chosen is None:
             bests = sorted(settings.MODELS_DIR.glob("**/best.pt"))
             if bests:
                 chosen = bests[0]
+
+        if chosen is None:
+            engines = sorted(settings.MODELS_DIR.glob("**/*.engine"))
+            if engines:
+                chosen = engines[0]
 
         if chosen is None:
             pts = sorted(settings.MODELS_DIR.glob("**/*.pt"))
