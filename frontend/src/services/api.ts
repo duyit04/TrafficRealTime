@@ -152,6 +152,8 @@ export interface TLPhase {
   color: 'red' | 'yellow' | 'green';
   remaining: number;
   green_time?: number;
+  /** Estimated red stint after yielding (yellow + all-red + opposite suggested green); when absent treat as 0 */
+  red_time_hint?: number;
   queue_length?: number;
   time_until_green?: number;
 }

@@ -67,13 +67,18 @@ function TrafficLightVisual({
               Camera {i + 1} · {PHASE_LABELS[i]}
             </div>
             {showAdvice ? (
-              <div className="mt-1 flex items-center justify-between gap-2 text-[10px] text-slate-600 tabular-nums">
-                <span className="font-semibold">
-                  Gợi ý xanh: {(p.green_time ?? 30).toFixed(0)}s
-                </span>
-                <span className="text-slate-500">
-                  Dừng ROI: {p.queue_length ?? 0}
-                </span>
+              <div className="mt-1 space-y-0.5 text-[10px] text-slate-600 tabular-nums">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-semibold">
+                    Gợi ý xanh: {(p.green_time ?? 30).toFixed(0)}s
+                  </span>
+                  <span className="text-slate-500">Dừng ROI: {p.queue_length ?? 0}</span>
+                </div>
+                {p.color === 'green' ? (
+                  <div className="text-slate-500">
+                    Gợi ý khối đỏ tiếp: {(p.red_time_hint ?? 0).toFixed(0)}s
+                  </div>
+                ) : null}
               </div>
             ) : (
               <div className="h-2" />
@@ -303,7 +308,7 @@ export function TrafficLightPanel({ phaseRoadLabels, activeUrls, cameraOptions, 
           className={`px-3 py-2 rounded-xl text-xs font-bold border transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
             adviceEnabled ? 'bg-emerald-600 text-white border-emerald-700 hover:bg-emerald-700' : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
           }`}
-          title="Bật/tắt gợi ý giây xanh theo số xe dừng trong ROI (cần ROI cho cả 2 camera)"
+          title="Bật/tắt gợi ý: ghép hai ROI (xoay hệ số) — xanh và khối đỏ tiếp theo; cần ROI trên cả 2 camera"
         >
           {adviceEnabled ? 'Tắt gợi ý' : 'Bật gợi ý'}
         </button>

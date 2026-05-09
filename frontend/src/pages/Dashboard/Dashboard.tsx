@@ -96,7 +96,6 @@ export function Dashboard() {
   const [h264Mode, setH264Mode] = useState(true);
   const [h264FailedSlots, setH264FailedSlots] = useState<Record<string, boolean>>({});
   const h264SkipBackupRef = useRef<number | null>(null);
-  const h264MultiCamGuardToastRef = useRef(false);
 
   const trimmedStream = streamUrl.trim();
   const trafficPhaseRoadLabels = useMemo(
@@ -171,7 +170,6 @@ export function Dashboard() {
   const isCompanionLive = streamOn && Boolean(companionFrame);
   const isExtra2Live = streamOn && Boolean(extraLive?.[2]?.frame);
   const isExtra3Live = streamOn && Boolean(extraLive?.[3]?.frame);
-  const liveCameraCount = (streamOn ? 1 : 0) + (isCompanionLive ? 1 : 0) + (isExtra2Live ? 1 : 0) + (isExtra3Live ? 1 : 0);
 
   const urlToSlot = useCallback((urlRaw: string): string => {
     const u = (urlRaw || '').trim();
@@ -272,26 +270,6 @@ export function Dashboard() {
     setToasts((t) => [...t, { id, message, type }]);
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4000);
   }, []);
-
-  useEffect(() => {
-    // H264 relay and detect pipeline are different clocks.
-    // With >=2 live cameras this can cause severe box/frame desync.
-    // Guardrail: force JPEG for multi-cam to keep frame+detections aligned.
-    if (!streamOn) {
-      h264MultiCamGuardToastRef.current = false;
-      return;
-    }
-    if (h264Mode && liveCameraCount >= 2) {
-      setH264Mode(false);
-      if (!h264MultiCamGuardToastRef.current) {
-        addToast('Đang chạy nhiều camera LIVE: tự chuyển JPEG để tránh lệch box detect.', 'warning');
-        h264MultiCamGuardToastRef.current = true;
-      }
-    }
-    if (liveCameraCount < 2) {
-      h264MultiCamGuardToastRef.current = false;
-    }
-  }, [streamOn, h264Mode, liveCameraCount, addToast]);
 
   const openAssignFor = useCallback((idx: number) => {
     setAssignExtraIndex(idx);

@@ -111,6 +111,8 @@ class TrafficLightPhase(BaseModel):
     phase_id: int = 0
     color: str = "red"                  # "red" | "yellow" | "green"
     green_time: float = 30.0            # recommended green duration (s)
+    # When this approach is currently green: estimated red block after yielding (opp. green + clearance)
+    red_time_hint: float = 0.0
     remaining: float = 0.0              # pillar-specific: green/yellow countdown, or ETA for red
     queue_length: int = 0               # stopped / waiting vehicles (for TLC decisions)
     approaching_count: int = 0        # moving vehicles in approach (extension heuristic)
