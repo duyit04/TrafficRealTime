@@ -756,6 +756,7 @@ class StreamService:
                 # 5. Build payload
                 from app.models.detection_model import Detection, BoundingBox
 
+                # Full-frame detections for UI boxes; ROI only gates counting/track below.
                 api_dets = [
                     Detection(
                         bbox=BoundingBox(x1=d.x1, y1=d.y1, x2=d.x2, y2=d.y2),
@@ -764,7 +765,6 @@ class StreamService:
                         track_id=d.track_id,
                     )
                     for d in raw_dets
-                    if roi_service.is_inside(d.cx, d.cy, slot="primary")
                 ]
 
                 # 5.1 Feed stopped-count-in-ROI to traffic-light service (phase mapping happens there)
@@ -1004,7 +1004,6 @@ class StreamService:
                             track_id=d.track_id,
                         )
                         for d in dets
-                        if roi_service.is_inside(d.cx, d.cy, slot="companion")
                     ]
                     # Keep companion pipeline parity with primary:
                     # counting line + class counters + congestion + model info.
@@ -1183,7 +1182,6 @@ class StreamService:
                         track_id=d.track_id,
                     )
                     for d in dets
-                    if roi_service.is_inside(d.cx, d.cy, slot=int(slot))
                 ]
                 try:
                     from app.services.traffic_light_service import traffic_light_service as tls
