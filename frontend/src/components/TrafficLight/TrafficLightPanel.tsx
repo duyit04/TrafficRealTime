@@ -60,20 +60,11 @@ function TrafficLightVisual({
               <div className="text-[11px] font-bold text-slate-800 leading-snug line-clamp-2" title={title}>
                 {title}
               </div>
-            ) : (
-              <div className="h-6" />
-            )}
-            <div className="text-[9px] text-slate-400 mt-0.5">
+            ) : null}
+            <div className={`text-[9px] text-slate-400 ${title ? 'mt-0.5' : 'mt-0'}`}>
               Camera {i + 1} · {PHASE_LABELS[i]}
             </div>
-            <div className="mt-1 flex items-center justify-between gap-2 text-[10px] text-slate-600">
-              <span className="font-semibold">
-                Gợi ý xanh: {(p.green_time ?? 30).toFixed(0)}s
-              </span>
-              <span className="text-slate-500">
-                Dừng trong ROI: {p.queue_length ?? 0}
-              </span>
-            </div>
+            <div className="h-2" />
 
             <div className="mt-3 flex justify-center">
               <div className="bg-slate-900 rounded-2xl p-2.5 shadow-lg border border-slate-800">
