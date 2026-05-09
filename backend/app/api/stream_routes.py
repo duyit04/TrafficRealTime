@@ -45,6 +45,20 @@ async def stop_extra_stream(
     return SuccessResponse(success=True, message=f"Extra stream {slot} stopped")
 
 
+@router.post("/companion/start", response_model=SuccessResponse, status_code=202)
+async def start_companion_stream(
+    url: Annotated[str, Query(description="RTSP or video URL")],
+):
+    stream_service.start_companion(url)
+    return SuccessResponse(success=True, message="Companion stream starting...")
+
+
+@router.post("/companion/stop", response_model=SuccessResponse)
+async def stop_companion_stream():
+    stream_service.stop_companion()
+    return SuccessResponse(success=True, message="Companion stream stopped")
+
+
 @router.get("/extra/frame")
 async def extra_frame(
     slot: Annotated[int, Query(description="Extra slot id", ge=2, le=3)],
@@ -88,6 +102,12 @@ async def stream_status():
         "frame_count": s.frame_count,
         "error": s.stream_error or None,
     }
+
+
+@router.get("/streams")
+async def stream_streams():
+    """Return which stream pipelines are currently running."""
+    return stream_service.streams_status()
 
 
 @router.get("/thumbnail")

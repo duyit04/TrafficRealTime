@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from app.core.config import settings
 from app.core.logger import logger
 from app.models.traffic_light_model import TrafficLightState
+from app.services.roi_service import roi_service
 
 
 def _normalize_slot(slot: str) -> str:
@@ -69,6 +70,8 @@ class DisplayOnlyTrafficLightService:
         # Phase ↔ camera slot mapping (which stream provides behavior for each approach)
         self._phase_slot = ["primary", "companion"]
         self._obs_by_slot: dict[str, LaneObs] = {}
+        # Whether to compute and apply green-time suggestions from ROI queue.
+        self._advice_enabled: bool = False
         self._start_ticker()
         with self._state_lock:
             self._sync_state_locked()
@@ -107,6 +110,15 @@ class DisplayOnlyTrafficLightService:
             self._phase_slot[0] = _normalize_slot(phase0_slot)
             self._phase_slot[1] = _normalize_slot(phase1_slot)
             self._sync_state_locked()
+
+    def set_advice_enabled(self, enabled: bool) -> None:
+        with self._state_lock:
+            self._advice_enabled = bool(enabled)
+            self._sync_state_locked()
+
+    def advice_enabled(self) -> bool:
+        with self._state_lock:
+            return bool(self._advice_enabled)
 
     def update_lane_observation(self, slot: str, stopped_count: int, total_count: int) -> None:
         """
@@ -178,6 +190,21 @@ class DisplayOnlyTrafficLightService:
         self._state.stream_attached = bool(self._stream_live)
 
         # Ensure both phases exist (expected 2 heads).
+        self._state.lane_density_advice.enabled = bool(self._advice_enabled)
+
+        # Advice can only work when both mapped ROIs are active.
+        try:
+            slot0 = self._phase_slot[0]
+            slot1 = self._phase_slot[1]
+            advice_ready = bool(self._advice_enabled) and roi_service.active_for(slot0) and roi_service.active_for(slot1)
+        except Exception:
+            advice_ready = False
+
+        note = ""
+        if self._advice_enabled and not advice_ready:
+            note = "Cần vẽ ROI cho cả 2 camera đã gán để bật gợi ý."
+        self._state.lane_density_advice.note = note
+
         for idx, p in enumerate(self._state.phases[:2]):
             p.phase_id = idx
             slot = self._phase_slot[idx] if idx < len(self._phase_slot) else "primary"
@@ -191,13 +218,18 @@ class DisplayOnlyTrafficLightService:
             p.avg_wait = 0.0
 
             # Suggest green-time based on stopped queue in ROI for this phase.
-            base = float(settings.TLC_MIN_GREEN)
-            cap = float(settings.TLC_MAX_GREEN)
-            coeff = float(getattr(settings, "TLC_STOPPED_GREEN_COEFF", 2.5) or 2.5)
-            suggest = base + coeff * float(p.queue_length)
-            suggest = max(base, min(cap, suggest))
-            self._phase_green_seconds[idx] = float(suggest)
-            p.green_time = float(suggest)
+            if advice_ready:
+                base = float(settings.TLC_MIN_GREEN)
+                cap = float(settings.TLC_MAX_GREEN)
+                coeff = float(getattr(settings, "TLC_STOPPED_GREEN_COEFF", 2.5) or 2.5)
+                suggest = base + coeff * float(p.queue_length)
+                suggest = max(base, min(cap, suggest))
+                self._phase_green_seconds[idx] = float(suggest)
+                p.green_time = float(suggest)
+            else:
+                # Display-only baseline when advice disabled or not ready.
+                self._phase_green_seconds[idx] = 30.0
+                p.green_time = 30.0
 
         if not self._stream_live:
             self._state.intersection_state = "green"
@@ -218,9 +250,11 @@ class DisplayOnlyTrafficLightService:
                 if idx == self._active_phase:
                     p.color = "green"
                     p.remaining = float(rem)
+                    p.time_until_green = 0.0
                 else:
                     p.color = "red"
                     p.remaining = 0.0
+                    p.time_until_green = float(rem + self._yellow_seconds + self._all_red_seconds)
 
         elif self._movement_substate == "yellow":
             self._state.intersection_state = "yellow"
@@ -230,9 +264,11 @@ class DisplayOnlyTrafficLightService:
                 if idx == self._active_phase:
                     p.color = "yellow"
                     p.remaining = float(rem)
+                    p.time_until_green = 0.0
                 else:
                     p.color = "red"
                     p.remaining = 0.0
+                    p.time_until_green = float(rem + self._all_red_seconds)
 
         else:  # all_red
             self._state.intersection_state = "all_red"
@@ -240,6 +276,7 @@ class DisplayOnlyTrafficLightService:
             for p in self._state.phases[:2]:
                 p.color = "red"
                 p.remaining = 0.0
+                p.time_until_green = float(self._all_red_seconds - elapsed)
 
         self._state.ui_hint = ""
 

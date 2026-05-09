@@ -51,7 +51,8 @@ export interface VehicleStats {
 // ── WebSocket Payload ─────────────────────────────────────────────────────────
 
 export interface FramePayload {
-  frame: string;           // base64 JPEG
+  frame: string | null;    // base64 JPEG (HTTP polling) or null when using binary WS
+  frame_blob?: Blob;       // binary WS path: decoded JPEG bytes as Blob
   detections: Detection[];
   stats: VehicleStats;
 }

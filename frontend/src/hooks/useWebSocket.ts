@@ -11,6 +11,32 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import type { FramePayload } from '../types/detection';
 
+const WS_MAGIC = 'TMWS';
+
+function bytesToAscii(bytes: Uint8Array, start: number, len: number): string {
+  let out = '';
+  for (let i = 0; i < len; i++) out += String.fromCharCode(bytes[start + i] ?? 0);
+  return out;
+}
+
+function parseBinaryFrame(buf: ArrayBuffer): any | null {
+  const bytes = new Uint8Array(buf);
+  if (bytes.length < 8) return null;
+  const magic = bytesToAscii(bytes, 0, 4);
+  if (magic !== WS_MAGIC) return null;
+  const view = new DataView(buf);
+  const jsonLen = view.getUint32(4, true);
+  const headerStart = 8;
+  const headerEnd = headerStart + jsonLen;
+  if (headerEnd > bytes.length) return null;
+  const headerBytes = bytes.slice(headerStart, headerEnd);
+  const headerText = new TextDecoder('utf-8').decode(headerBytes);
+  const header = JSON.parse(headerText);
+  const jpegBytes = bytes.slice(headerEnd);
+  const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
+  return { ...header, frame: null, frame_blob: blob } satisfies Partial<FramePayload>;
+}
+
 export interface UseWebSocketOptions {
   /** WebSocket URL, e.g. "ws://localhost:8000/ws/stream" */
   url: string;
@@ -68,6 +94,7 @@ export function useWebSocket({
 
     try {
       const ws = new WebSocket(url);
+      ws.binaryType = 'arraybuffer';
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -78,10 +105,25 @@ export function useWebSocket({
 
       ws.onmessage = (event: MessageEvent) => {
         try {
-          const data = JSON.parse(event.data as string) as any;
-          // Ignore keepalive pings from server
-          if ('ping' in data) return;
-          onMessageRef.current(data);
+          if (typeof event.data === 'string') {
+            const data = JSON.parse(event.data as string) as any;
+            // Ignore keepalive pings from server
+            if ('ping' in data) return;
+            onMessageRef.current(data);
+            return;
+          }
+          if (event.data instanceof ArrayBuffer) {
+            const parsed = parseBinaryFrame(event.data);
+            if (parsed) onMessageRef.current(parsed);
+            return;
+          }
+          if (event.data instanceof Blob) {
+            // Should not happen with binaryType='arraybuffer', but handle anyway.
+            void event.data.arrayBuffer().then((ab) => {
+              const parsed = parseBinaryFrame(ab);
+              if (parsed) onMessageRef.current(parsed);
+            });
+          }
         } catch {
           // Malformed message — ignore
         }

@@ -49,15 +49,15 @@ const WS_COMPANION_URL = getWebSocketUrl('/ws/companion');
 const DETECTION_HOLD_MS = 450; // giữ box ngắn để tránh nhấp nháy
 
 export function useDetection() {
-  const [currentFrame, setCurrentFrame] = useState<string | null>(null);
+  const [currentFrame, setCurrentFrame] = useState<string | Blob | null>(null);
   const [detections, setDetections]     = useState<Detection[]>([]);
   const [stats, setStats]               = useState<VehicleStats>(DEFAULT_STATS);
   const [streamActive, setStreamActive] = useState(false);
   const [companionActive, setCompanionActive] = useState(false);
-  const [companionFrame, setCompanionFrame] = useState<string | null>(null);
+  const [companionFrame, setCompanionFrame] = useState<string | Blob | null>(null);
   const [companionDetections, setCompanionDetections] = useState<Detection[]>([]);
   const [companionFps, setCompanionFps] = useState(0);
-  const [extraLive, setExtraLive] = useState<Record<number, { frame: string | null; dets: Detection[]; fps: number }>>({});
+  const [extraLive, setExtraLive] = useState<Record<number, { frame: string | Blob | null; dets: Detection[]; fps: number }>>({});
   const settingsTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const frameTimerRef = useRef<ReturnType<typeof setInterval>>();
   const companionTimerRef = useRef<ReturnType<typeof setInterval>>();
@@ -84,11 +84,11 @@ export function useDetection() {
     const anyPayload = payload as any;
     const slot = typeof anyPayload.slot === 'number' ? anyPayload.slot : 0;
     if (slot >= 2) {
-      if (!anyPayload.frame) return;
+      if (!anyPayload.frame && !anyPayload.frame_blob) return;
       setExtraLive((prev) => ({
         ...prev,
         [slot]: {
-          frame: anyPayload.frame ?? null,
+          frame: anyPayload.frame_blob ?? anyPayload.frame ?? null,
           dets: anyPayload.detections ?? [],
           fps: anyPayload.fps ?? 0,
         },
@@ -96,12 +96,12 @@ export function useDetection() {
       return;
     }
 
-    if (!(payload as any).frame) return;
+    if (!(payload as any).frame && !(payload as any).frame_blob) return;
     if (payload.stats && !payload.stats.stream_active) {
       setStreamActive(false);
       return;
     }
-    setCurrentFrame(payload.frame);
+    setCurrentFrame((payload as any).frame_blob ?? payload.frame);
     const next = payload.detections ?? [];
     const now = Date.now();
     if (next.length > 0) {
@@ -128,13 +128,13 @@ export function useDetection() {
 
   // ── Companion WebSocket (preferred) ───────────────────────────────────────
   const handleCompanionWs = useCallback((msg: any) => {
-    if (!msg || !msg.frame || !msg.stream_active) {
+    if (!msg || (!msg.frame && !msg.frame_blob) || !msg.stream_active) {
       setCompanionFrame(null);
       setCompanionDetections([]);
       setCompanionFps(0);
       return;
     }
-    setCompanionFrame(msg.frame);
+    setCompanionFrame(msg.frame_blob ?? msg.frame);
     setCompanionDetections(msg.detections ?? []);
     setCompanionFps(msg.fps ?? 0);
   }, []);
@@ -214,7 +214,7 @@ export function useDetection() {
   // ── Companion stream polling fallback (when WS not connected) ─────────────
 
   useEffect(() => {
-    if (!streamActive || !companionActive || companionWsConnected) {
+    if (!streamActive || !companionActive) {
       if (companionTimerRef.current) {
         clearInterval(companionTimerRef.current);
         companionTimerRef.current = undefined;
@@ -222,6 +222,15 @@ export function useDetection() {
       setCompanionFrame(null);
       setCompanionDetections([]);
       setCompanionFps(0);
+      return;
+    }
+    // If WebSocket is connected, rely on pushed frames and avoid polling,
+    // but keep the last rendered frame to prevent a blank panel during reconnects.
+    if (companionWsConnected) {
+      if (companionTimerRef.current) {
+        clearInterval(companionTimerRef.current);
+        companionTimerRef.current = undefined;
+      }
       return;
     }
 
@@ -267,6 +276,16 @@ export function useDetection() {
     });
     setCompanionActive(Boolean(opts?.companionUrl));
     setStreamActive(true);
+  }, []);
+
+  const startCompanion = useCallback(async (url: string) => {
+    await streamApi.startCompanion(url);
+    setCompanionActive(true);
+  }, []);
+
+  const stopCompanion = useCallback(async () => {
+    await streamApi.stopCompanion();
+    setCompanionActive(false);
   }, []);
 
   const stopStream = useCallback(async () => {
@@ -324,6 +343,8 @@ export function useDetection() {
     streamActive,
     // Actions
     startStream,
+    startCompanion,
+    stopCompanion,
     stopStream,
     reloadStats,
     setRoi,

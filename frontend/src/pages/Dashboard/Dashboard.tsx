@@ -47,7 +47,7 @@ export function Dashboard() {
     currentFrame, detections, stats, wsConnected, usingFallback,
     companionFrame, companionDetections, companionFps,
     extraLive,
-    startStream, stopStream, reloadStats, setRoi, clearRoi, setRoiSlot, clearRoiSlot, resetCount, updateSettings,
+    startStream, startCompanion, stopCompanion, stopStream, reloadStats, setRoi, clearRoi, setRoiSlot, clearRoiSlot, resetCount, updateSettings,
   } = useDetection();
 
   const [streamUrl, setStreamUrl]     = useState('');
@@ -235,7 +235,8 @@ export function Dashboard() {
 
     if (idx === 0 && streamOn && trimmedStream) {
       try {
-        await startStream(trimmedStream, { companionUrl: picked });
+        // Start companion without restarting primary stream.
+        await startCompanion(picked);
         addToast('Camera 2 đã bật LIVE', 'success');
       } catch {
         addToast('Đã gán Camera 2 nhưng không bật được LIVE.', 'error');
@@ -255,7 +256,7 @@ export function Dashboard() {
     setCameraOpen(false);
     setAssignExtraIndex(null);
     setAssignPickedUrl('');
-  }, [addToast, startStream, streamOn, trimmedStream]);
+  }, [addToast, startStream, startCompanion, streamOn, trimmedStream, streamApi]);
 
   // Load models list
   const reloadModels = useCallback(() => {
@@ -329,21 +330,28 @@ export function Dashboard() {
     return roiCanvasExtra3Ref;
   }, []);
 
-  const getFrameFor = useCallback((slot: RoiSlotKey): string | null => {
+  const getFrameFor = useCallback((slot: RoiSlotKey): string | Blob | null => {
     if (slot === 'primary') return currentFrame;
     if (slot === 'companion') return companionFrame;
     if (slot === 2) return extraLive?.[2]?.frame ?? null;
     return extraLive?.[3]?.frame ?? null;
   }, [currentFrame, companionFrame, extraLive]);
 
-  async function mapPointsToVideo(points: number[][], frameB64: string | null, canvas: HTMLCanvasElement | null) {
-    if (!frameB64 || !canvas) return points;
+  async function mapPointsToVideo(points: number[][], frame: string | Blob | null, canvas: HTMLCanvasElement | null) {
+    if (!frame || !canvas) return points;
     const img = new Image();
+    let objectUrl = '';
     await new Promise<void>((resolve) => {
       img.onload = () => resolve();
       img.onerror = () => resolve();
-      img.src = `data:image/jpeg;base64,${frameB64}`;
+      if (frame instanceof Blob) {
+        objectUrl = URL.createObjectURL(frame);
+        img.src = objectUrl;
+      } else {
+        img.src = `data:image/jpeg;base64,${frame}`;
+      }
     });
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
     if (!(img.naturalWidth > 0 && img.naturalHeight > 0)) return points;
 
     const cw = canvas.offsetWidth;
@@ -367,9 +375,9 @@ export function Dashboard() {
   }
 
   const handleApplyRoiFor = useCallback(async (slot: RoiSlotKey, canvasPoints: number[][]) => {
-    const frameB64 = getFrameFor(slot);
+    const frame = getFrameFor(slot);
     const canvas = getCanvasRefFor(slot).current;
-    const videoPoints = await mapPointsToVideo(canvasPoints, frameB64, canvas);
+    const videoPoints = await mapPointsToVideo(canvasPoints, frame, canvas);
     if (slot === 'primary') await setRoi(videoPoints);
     else await setRoiSlot(slot, videoPoints);
 
@@ -452,12 +460,23 @@ export function Dashboard() {
           </div>
         </div>
 
-        {/* Right: FPS + frame + WS status */}
+        {/* Right: FPS + perf breakdown + WS status */}
         <div className="flex items-center gap-3 text-[11px] text-slate-500 shrink-0">
           <span className="text-2xl font-bold text-accent tabular-nums">{stats.fps.toFixed(1)}</span>
           <span>FPS</span>
           <span>·</span>
           <span>Frame {stats.frame_count.toLocaleString()}</span>
+          <span className="hidden md:inline">·</span>
+          <span
+            className="hidden md:inline text-slate-500 tabular-nums"
+            title="Capture / Inference / Sent FPS"
+          >
+            C/I/S: {stats.fps_capture.toFixed(1)}/{stats.fps_inference.toFixed(1)}/{stats.fps_sent.toFixed(1)}
+          </span>
+          <span className="hidden lg:inline">·</span>
+          <span className="hidden lg:inline text-slate-500 tabular-nums" title="Average YOLO inference time (ms)">
+            Infer: {stats.avg_inference_ms.toFixed(1)}ms
+          </span>
           {streamOn && (
             <>
               <span>·</span>

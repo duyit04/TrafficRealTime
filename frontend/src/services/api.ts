@@ -89,6 +89,12 @@ export const streamApi = {
 
   stop: () => apiFetch<SuccessResponse>('/stream/stop', { method: 'POST' }),
 
+  startCompanion: (url: string) =>
+    apiFetch<SuccessResponse>(`/stream/companion/start?url=${encodeURIComponent(url)}`, { method: 'POST' }),
+
+  stopCompanion: () =>
+    apiFetch<SuccessResponse>('/stream/companion/stop', { method: 'POST' }),
+
   startExtra: (slot: number, url: string) =>
     apiFetch<SuccessResponse>(`/stream/extra/start?slot=${slot}&url=${encodeURIComponent(url)}`, { method: 'POST' }),
 
@@ -147,6 +153,7 @@ export interface TLPhase {
   remaining: number;
   green_time?: number;
   queue_length?: number;
+  time_until_green?: number;
 }
 
 export interface TLState {
@@ -156,11 +163,14 @@ export interface TLState {
   stream_attached?: boolean;
   intersection_state?: 'green' | 'yellow' | 'all_red';
   yellow_phase_id?: number | null;
+  lane_density_advice?: { enabled?: boolean; note?: string };
 }
 
 export const trafficLightApi = {
   getState: () => apiFetch<TLState>('/traffic-light/state'),
   setSources: (body: { phase0_slot: string; phase1_slot: string }) =>
     apiFetch<TLState>('/traffic-light/sources', { method: 'POST', body: JSON.stringify(body) }),
+  setAdviceEnabled: (enabled: boolean) =>
+    apiFetch<TLState>(`/traffic-light/advice?enabled=${enabled ? 'true' : 'false'}`, { method: 'POST' }),
 };
 

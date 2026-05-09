@@ -10,12 +10,27 @@ Endpoint: GET /ws/stream
 
 from __future__ import annotations
 import asyncio
+import struct
+from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.core.logger import logger
 
 router = APIRouter(tags=["websocket"])
+
+WS_BINARY_MAGIC = b"TMWS"
+
+
+def pack_frame_message(header: dict[str, Any], jpeg_bytes: bytes) -> bytes:
+    """
+    Pack a single binary WS message:
+      magic(4) + json_len(uint32 LE) + json_utf8 + jpeg_bytes
+    """
+    import json as _json
+
+    header_bytes = _json.dumps(header, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return WS_BINARY_MAGIC + struct.pack("<I", len(header_bytes)) + header_bytes + jpeg_bytes
 
 
 class ConnectionManager:
@@ -43,6 +58,17 @@ class ConnectionManager:
         for ws in list(self.active):
             try:
                 await ws.send_text(data)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(ws)
+
+    async def broadcast_bytes(self, data: bytes) -> None:
+        """Send binary data to all connected clients; remove any that have closed."""
+        dead: list[WebSocket] = []
+        for ws in list(self.active):
+            try:
+                await ws.send_bytes(data)
             except Exception:
                 dead.append(ws)
         for ws in dead:

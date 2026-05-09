@@ -37,10 +37,12 @@ function TrafficLightVisual({
   phases,
   activePhase,
   getPhaseTitle,
+  showAdvice,
 }: {
   phases: TLState['phases'];
   activePhase: number;
   getPhaseTitle: (phaseIndex: number) => string;
+  showAdvice: boolean;
 }) {
   return (
     <div className="grid grid-cols-2 gap-3">
@@ -64,7 +66,18 @@ function TrafficLightVisual({
             <div className={`text-[9px] text-slate-400 ${title ? 'mt-0.5' : 'mt-0'}`}>
               Camera {i + 1} · {PHASE_LABELS[i]}
             </div>
-            <div className="h-2" />
+            {showAdvice ? (
+              <div className="mt-1 flex items-center justify-between gap-2 text-[10px] text-slate-600 tabular-nums">
+                <span className="font-semibold">
+                  Gợi ý xanh: {(p.green_time ?? 30).toFixed(0)}s
+                </span>
+                <span className="text-slate-500">
+                  Dừng ROI: {p.queue_length ?? 0}
+                </span>
+              </div>
+            ) : (
+              <div className="h-2" />
+            )}
 
             <div className="mt-3 flex justify-center">
               <div className="bg-slate-900 rounded-2xl p-2.5 shadow-lg border border-slate-800">
@@ -89,6 +102,12 @@ function TrafficLightVisual({
                   })}
                 </div>
               </div>
+            </div>
+
+            <div className="mt-2 text-center text-[10px] font-semibold text-slate-600 tabular-nums">
+              {p.color === 'red'
+                ? `Đỏ: ${(p.time_until_green ?? 0).toFixed(0)}s`
+                : `${p.color === 'green' ? 'Xanh' : 'Vàng'}: ${(p.remaining ?? 0).toFixed(0)}s`}
             </div>
           </div>
         );
@@ -205,6 +224,7 @@ function RtspAssignModalBody({
 export function TrafficLightPanel({ phaseRoadLabels, activeUrls, cameraOptions, selectedUrls, onSelectUrl }: TrafficLightPanelProps = {}) {
   const [state, setState] = useState<TLState | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval>>();
+  const [adviceEnabled, setAdviceEnabled] = useState(false);
 
   const selectedTitleFor = useCallback(
     (i: 0 | 1): string => {
@@ -232,6 +252,7 @@ export function TrafficLightPanel({ phaseRoadLabels, activeUrls, cameraOptions, 
       try {
         const s = await trafficLightApi.getState();
         setState(s);
+        setAdviceEnabled(Boolean(s.lane_density_advice?.enabled));
       } catch {
         // ignore
       }
@@ -263,6 +284,36 @@ export function TrafficLightPanel({ phaseRoadLabels, activeUrls, cameraOptions, 
         >
           {anyRtspSelected ? 'Đang theo dõi' : 'Đang chờ'}
         </span>
+      </div>
+
+      <div className="flex items-center justify-between gap-2">
+        <button
+          type="button"
+          disabled={!anyRtspSelected}
+          onClick={async () => {
+            try {
+              const next = !adviceEnabled;
+              const s = await trafficLightApi.setAdviceEnabled(next);
+              setState(s);
+              setAdviceEnabled(Boolean(s.lane_density_advice?.enabled));
+            } catch {
+              // ignore
+            }
+          }}
+          className={`px-3 py-2 rounded-xl text-xs font-bold border transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+            adviceEnabled ? 'bg-emerald-600 text-white border-emerald-700 hover:bg-emerald-700' : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+          }`}
+          title="Bật/tắt gợi ý giây xanh theo số xe dừng trong ROI (cần ROI cho cả 2 camera)"
+        >
+          {adviceEnabled ? 'Tắt gợi ý' : 'Bật gợi ý'}
+        </button>
+        {adviceEnabled && state?.lane_density_advice?.note ? (
+          <div className="text-[10px] text-amber-700 font-semibold truncate" title={state.lane_density_advice.note}>
+            {state.lane_density_advice.note}
+          </div>
+        ) : (
+          <div className="flex-1" />
+        )}
       </div>
 
       {cameraOptions && selectedUrls && onSelectUrl ? (
@@ -313,7 +364,7 @@ export function TrafficLightPanel({ phaseRoadLabels, activeUrls, cameraOptions, 
 
       {state ? (
         <div className={!anyRtspSelected ? 'opacity-50 pointer-events-none' : ''}>
-          <TrafficLightVisual phases={state.phases} activePhase={state.active_phase} getPhaseTitle={getPhaseTitle} />
+          <TrafficLightVisual phases={state.phases} activePhase={state.active_phase} getPhaseTitle={getPhaseTitle} showAdvice={adviceEnabled} />
         </div>
       ) : null}
     </div>
