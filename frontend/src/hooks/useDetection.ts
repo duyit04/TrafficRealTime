@@ -46,7 +46,7 @@ const DEFAULT_STATS: VehicleStats = {
 
 const WS_URL = getWebSocketUrl('/ws/stream');
 const WS_COMPANION_URL = getWebSocketUrl('/ws/companion');
-const DETECTION_HOLD_MS = 450; // giữ box ngắn để tránh nhấp nháy
+const DETECTION_HOLD_MS = 120; // giữ rất ngắn để hạn chế cảm giác box "đuổi theo" vật thể
 
 export function useDetection() {
   const [currentFrame, setCurrentFrame] = useState<string | Blob | null>(null);
@@ -57,6 +57,7 @@ export function useDetection() {
   const [companionFrame, setCompanionFrame] = useState<string | Blob | null>(null);
   const [companionDetections, setCompanionDetections] = useState<Detection[]>([]);
   const [companionFps, setCompanionFps] = useState(0);
+  const [companionLinePosition, setCompanionLinePosition] = useState<number>(DEFAULT_STATS.line_position);
   const [extraLive, setExtraLive] = useState<Record<number, { frame: string | Blob | null; dets: Detection[]; fps: number }>>({});
   const settingsTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const frameTimerRef = useRef<ReturnType<typeof setInterval>>();
@@ -96,23 +97,26 @@ export function useDetection() {
       return;
     }
 
-    if (!(payload as any).frame && !(payload as any).frame_blob) return;
     if (payload.stats && !payload.stats.stream_active) {
       setStreamActive(false);
       return;
     }
-    setCurrentFrame((payload as any).frame_blob ?? payload.frame);
-    const next = payload.detections ?? [];
-    const now = Date.now();
-    if (next.length > 0) {
-      lastDetectionsRef.current = { ts: now, dets: next };
-      setDetections(next);
-    } else {
-      const age = now - (lastDetectionsRef.current.ts || 0);
-      if (age <= DETECTION_HOLD_MS) {
-        setDetections(lastDetectionsRef.current.dets);
+    const incomingFrame = (payload as any).frame_blob ?? payload.frame ?? null;
+    // Keep detection/frame in the same phase to reduce visual trailing.
+    if (incomingFrame) {
+      setCurrentFrame(incomingFrame);
+      const next = payload.detections ?? [];
+      const now = Date.now();
+      if (next.length > 0) {
+        lastDetectionsRef.current = { ts: now, dets: next };
+        setDetections(next);
       } else {
-        setDetections([]);
+        const age = now - (lastDetectionsRef.current.ts || 0);
+        if (age <= DETECTION_HOLD_MS) {
+          setDetections(lastDetectionsRef.current.dets);
+        } else {
+          setDetections([]);
+        }
       }
     }
     setStats(payload.stats);
@@ -132,11 +136,16 @@ export function useDetection() {
       setCompanionFrame(null);
       setCompanionDetections([]);
       setCompanionFps(0);
+      setCompanionLinePosition(DEFAULT_STATS.line_position);
       return;
     }
     setCompanionFrame(msg.frame_blob ?? msg.frame);
     setCompanionDetections(msg.detections ?? []);
     setCompanionFps(msg.fps ?? 0);
+    const laneLine = Number(msg?.lane_stats?.line_position);
+    if (Number.isFinite(laneLine) && laneLine >= 0 && laneLine <= 1) {
+      setCompanionLinePosition(laneLine);
+    }
   }, []);
 
   const { connected: companionWsConnected } = useWebSocket({
@@ -169,30 +178,31 @@ export function useDetection() {
       fetching = true;
       try {
         const payload = await streamApi.getFrame();
-        if (!payload || !payload.frame) {
-          emptyCount++;
-          if (emptyCount > 20) {
-            setStreamActive(false);
-          }
-          return;
-        }
-        emptyCount = 0;
+        if (!payload) return;
         if (payload.stats && !payload.stats.stream_active) {
           setStreamActive(false);
           return;
         }
-        setCurrentFrame(payload.frame);
-        const next = payload.detections ?? [];
-        const now = Date.now();
-        if (next.length > 0) {
-          lastDetectionsRef.current = { ts: now, dets: next };
-          setDetections(next);
-        } else {
-          const age = now - (lastDetectionsRef.current.ts || 0);
-          if (age <= DETECTION_HOLD_MS) {
-            setDetections(lastDetectionsRef.current.dets);
+        if (payload.frame) {
+          emptyCount = 0;
+          setCurrentFrame(payload.frame);
+          const next = payload.detections ?? [];
+          const now = Date.now();
+          if (next.length > 0) {
+            lastDetectionsRef.current = { ts: now, dets: next };
+            setDetections(next);
           } else {
-            setDetections([]);
+            const age = now - (lastDetectionsRef.current.ts || 0);
+            if (age <= DETECTION_HOLD_MS) {
+              setDetections(lastDetectionsRef.current.dets);
+            } else {
+              setDetections([]);
+            }
+          }
+        } else {
+          emptyCount++;
+          if (emptyCount > 20) {
+            setStreamActive(false);
           }
         }
         setStats(payload.stats);
@@ -222,6 +232,7 @@ export function useDetection() {
       setCompanionFrame(null);
       setCompanionDetections([]);
       setCompanionFps(0);
+      setCompanionLinePosition(DEFAULT_STATS.line_position);
       return;
     }
     // If WebSocket is connected, rely on pushed frames and avoid polling,
@@ -244,11 +255,16 @@ export function useDetection() {
           setCompanionFrame(null);
           setCompanionDetections([]);
           setCompanionFps(0);
+          setCompanionLinePosition(DEFAULT_STATS.line_position);
           return;
         }
         setCompanionFrame(payload.frame);
         setCompanionDetections(payload.detections ?? []);
         setCompanionFps(payload.fps ?? 0);
+        const laneLine = Number((payload as any)?.lane_stats?.line_position);
+        if (Number.isFinite(laneLine) && laneLine >= 0 && laneLine <= 1) {
+          setCompanionLinePosition(laneLine);
+        }
       } catch {
         // ignore
       } finally {
@@ -337,6 +353,7 @@ export function useDetection() {
     companionFrame,
     companionDetections,
     companionFps,
+    companionLinePosition,
     extraLive,
     wsConnected,
     usingFallback,

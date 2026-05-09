@@ -35,11 +35,26 @@ class Settings(BaseSettings):
     # YOLO: auto uses GPU if PyTorch is built with CUDA and a GPU is visible; otherwise CPU.
     # Set to "cpu" to force CPU, or "cuda" / "0" to prefer GPU (logs a warning and falls back if CUDA missing).
     YOLO_DEVICE: str = "auto"
+    # Runtime backend preference: auto | torch | tensorrt.
+    # - auto: use TensorRT engine if available on CUDA, otherwise PyTorch.
+    # - torch: force PyTorch runtime.
+    # - tensorrt: prefer TensorRT; auto-fallback to PyTorch on failure.
+    YOLO_BACKEND: str = "auto"
+    # If True and TensorRT backend is preferred, export .pt -> .engine when sidecar engine is missing.
+    YOLO_TRT_AUTO_EXPORT: bool = False
+    # Prefer FP16 TensorRT engine export.
+    YOLO_TRT_FP16: bool = True
+    # TensorRT export workspace size in GB (used by Ultralytics export where supported).
+    YOLO_TRT_WORKSPACE_GB: int = 4
 
     # Companion RTSP (second panel) — lightweight inference FPS cap
     COMPANION_MAX_FPS: int = 12
     # Whether to run YOLO inference on companion stream
     COMPANION_DETECT_ENABLED: bool = True
+    # Optional lower imgsz for companion stream (0 = use YOLO_IMGSZ)
+    COMPANION_YOLO_IMGSZ: int = 0
+    # Optional skip-frames override for companion stream (None = use INFERENCE_SKIP_FRAMES)
+    COMPANION_SKIP_FRAMES: int | None = None
 
     # Extra live streams (screens 3/4) — FPS cap
     EXTRA_MAX_FPS: int = 12
@@ -55,6 +70,8 @@ class Settings(BaseSettings):
     INFERENCE_SKIP_FRAMES: int = 0
     # RTSP buffer flush: grab this many extra frames before retrieve() to get freshest frame.
     RTSP_FLUSH_FRAMES: int = 2
+    # Try FFmpeg hardware decode on CUDA for RTSP (reduces CPU decode load on supported setups).
+    RTSP_HWACCEL: bool = False
 
     # ── YOLO inference size ────────────────────────────────────────────────────
     # Input image size for YOLO inference. Valid values: 320, 416, 480, 640.

@@ -6,17 +6,32 @@ from __future__ import annotations
 import asyncio
 import base64
 import concurrent.futures
+import os
+import time
 import cv2
 from functools import partial
+from threading import Lock
 from typing import Annotated
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 
 from app.models.detection_model import StreamStartRequest, SuccessResponse, CompanionFramePayload
 from app.services.stream_service import stream_service
+from app.services.ffmpeg_relay_service import (
+    ffmpeg_relay_service,
+    ffmpeg_relay_companion_service,
+    ffmpeg_relay_extra2_service,
+    ffmpeg_relay_extra3_service,
+)
+from app.core.config import settings
+from app.ml.yolo_model import yolo_model
 
 # Thread pool for thumbnail grabs (non-blocking)
-_thumb_executor = concurrent.futures.ThreadPoolExecutor(max_workers=10, thread_name_prefix="thumb")
+_thumb_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="thumb")
+_thumb_cache: dict[tuple[str, int, bool], tuple[dict, float]] = {}
+_thumb_cache_lock = Lock()
+_ffmpeg_env_lock = Lock()
+THUMB_CACHE_TTL = 6.0
 
 router = APIRouter(prefix="/api/v1/stream", tags=["stream"])
 
@@ -63,6 +78,7 @@ async def stop_companion_stream():
 async def extra_frame(
     slot: Annotated[int, Query(description="Extra slot id", ge=2, le=3)],
 ):
+    stream_service.mark_http_poll("extra", slot=slot)
     payload = stream_service.get_extra_latest(slot)
     if payload is None:
         return {"slot": slot, "frame": None, "detections": [], "fps": 0.0, "stream_active": False}
@@ -93,6 +109,48 @@ async def stream_device():
     return _device_info()
 
 
+@router.get("/runtime")
+async def stream_runtime():
+    """
+    Runtime diagnostics for GPU-first tuning:
+    - active YOLO backend/device
+    - active model artifact (.pt/.engine)
+    - active performance knobs from settings
+    """
+    d = _device_info()
+    model_name = str(yolo_model.model_path or "")
+    weights = yolo_model.weights_path
+    loaded_artifact = str(weights) if weights else model_name
+    return {
+        "cuda_available": bool(d.get("cuda_available", False)),
+        "cuda_device_name": d.get("device_name"),
+        "yolo": {
+            "loaded": bool(yolo_model.is_loaded),
+            "model_name": model_name or None,
+            "artifact_path": loaded_artifact or None,
+            "artifact_ext": (loaded_artifact.rsplit(".", 1)[-1].lower() if "." in loaded_artifact else None),
+            "runtime_backend": yolo_model.runtime_backend,
+            "runtime_device": str(yolo_model.runtime_device),
+            "runtime_half": bool(yolo_model.runtime_half),
+            "backend_preference": str(getattr(settings, "YOLO_BACKEND", "auto")),
+            "trt_auto_export": bool(getattr(settings, "YOLO_TRT_AUTO_EXPORT", False)),
+            "trt_fp16": bool(getattr(settings, "YOLO_TRT_FP16", True)),
+            "trt_workspace_gb": int(getattr(settings, "YOLO_TRT_WORKSPACE_GB", 4)),
+        },
+        "stream_tuning": {
+            "yolo_device": str(getattr(settings, "YOLO_DEVICE", "auto")),
+            "rtsp_hwaccel": bool(getattr(settings, "RTSP_HWACCEL", False)),
+            "yolo_imgsz": int(getattr(settings, "YOLO_IMGSZ", 640)),
+            # Effective runtime knobs (can diverge from .env after PATCH /settings).
+            "inference_skip_frames": int(getattr(stream_service, "skip_frames", getattr(settings, "INFERENCE_SKIP_FRAMES", 0))),
+            "stream_max_width": int(getattr(stream_service, "max_width", getattr(settings, "STREAM_MAX_WIDTH", 0))),
+            "stream_jpeg_quality": int(getattr(stream_service, "jpeg_quality", getattr(settings, "STREAM_JPEG_QUALITY", 75))),
+            "max_fps": int(getattr(stream_service, "max_fps", getattr(settings, "MAX_FPS", 30))),
+            "companion_max_fps": int(getattr(settings, "COMPANION_MAX_FPS", 12)),
+        },
+    }
+
+
 @router.get("/status")
 async def stream_status():
     s = stream_service.stats
@@ -108,6 +166,29 @@ async def stream_status():
 async def stream_streams():
     """Return which stream pipelines are currently running."""
     return stream_service.streams_status()
+
+
+@router.get("/h264/status")
+async def stream_h264_status(
+    slot: Annotated[str, Query(description="H264 relay slot: primary|companion|extra2|extra3")] = "primary",
+):
+    """Status of FFmpeg NVENC relay (MPEG-TS over WebSocket) per slot."""
+    s = (slot or "primary").strip().lower()
+    if s in {"primary", "1", "main"}:
+        return ffmpeg_relay_service.status()
+    if s in {"companion", "2", "cam2"}:
+        return ffmpeg_relay_companion_service.status()
+    if s in {"extra2", "3", "cam3"}:
+        return ffmpeg_relay_extra2_service.status()
+    if s in {"extra3", "4", "cam4"}:
+        return ffmpeg_relay_extra3_service.status()
+    return {
+        "running": False,
+        "url_set": False,
+        "bytes_sent": 0,
+        "throughput_kbps": 0.0,
+        "last_error": f"unknown h264 slot: {slot}",
+    }
 
 
 @router.get("/thumbnail")
@@ -130,13 +211,26 @@ async def stream_thumbnail(
 
 def _grab_thumbnail(url: str, max_width: int = 320, *, fast_decode: bool = False) -> dict:
     """Synchronous: open stream, grab 1 frame, close immediately."""
+    cache_key = (url, int(max_width), bool(fast_decode))
+    now = time.time()
+    with _thumb_cache_lock:
+        cached = _thumb_cache.get(cache_key)
+        if cached and (now - cached[1]) < THUMB_CACHE_TTL:
+            return cached[0]
+
+    cap = None
     try:
-        import os
-        os.environ.setdefault(
-            "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-            "rtsp_transport;tcp|buffer_size;4096000|max_delay;500000|stimeout;5000000|fflags;nobuffer|flags;low_delay"
-        )
-        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+        thumb_ffmpeg_opts = "rtsp_transport;tcp|buffer_size;2048000|max_delay;1000000|stimeout;8000000"
+        if bool(getattr(settings, "RTSP_HWACCEL", False)):
+            thumb_ffmpeg_opts += "|hwaccel;cuda|hwaccel_output_format;cuda"
+        with _ffmpeg_env_lock:
+            old_opts = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = thumb_ffmpeg_opts
+            cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+            if old_opts is not None:
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = old_opts
+            else:
+                os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 8000)
         cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 8000)
@@ -153,8 +247,6 @@ def _grab_thumbnail(url: str, max_width: int = 320, *, fast_decode: bool = False
                 frame = f
                 break
 
-        cap.release()
-
         if frame is None:
             return {"ok": False, "frame": None, "error": "No frame"}
 
@@ -169,12 +261,23 @@ def _grab_thumbnail(url: str, max_width: int = 320, *, fast_decode: bool = False
         thumb = cv2.resize(frame, (thumb_w, thumb_h), interpolation=interp)
 
         quality = 82 if thumb_w >= 480 else 76
-        _, buf = cv2.imencode(".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        ok, buf = cv2.imencode(".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if not ok:
+            return {"ok": False, "frame": None, "error": "Encode failed"}
         b64 = base64.b64encode(buf.tobytes()).decode()
-        return {"ok": True, "frame": b64, "error": None}
+        result = {"ok": True, "frame": b64, "error": None}
+        with _thumb_cache_lock:
+            _thumb_cache[cache_key] = (result, time.time())
+        return result
 
     except Exception as e:
         return {"ok": False, "frame": None, "error": str(e)}
+    finally:
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
 
 
 @router.get("/frame")
@@ -183,6 +286,7 @@ async def stream_frame():
     Return latest encoded frame + detections + stats.
     If no frame is available yet, returns an empty payload with current stats.
     """
+    stream_service.mark_http_poll("primary")
     payload = stream_service.get_latest()
     if payload is None:
         # Keep response shape stable for frontend
@@ -201,6 +305,7 @@ async def stream_companion_frame():
     Return latest companion (second RTSP) frame + detections.
     If companion is not enabled or not ready yet, frame is null.
     """
+    stream_service.mark_http_poll("companion")
     payload = stream_service.get_companion_latest()
     if payload is None:
         return CompanionFramePayload(frame=None, detections=[], fps=0.0, frame_count=0, stream_active=False)

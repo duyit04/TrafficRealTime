@@ -16,9 +16,19 @@ interface Props {
   stats: VehicleStats;
   showLine?: boolean;
   onEmptyClick?: () => void;
+  overlayOnly?: boolean; // draw detections only, no base frame
+  showLiveBadge?: boolean;
 }
 
-export function VideoPlayer({ frame, detections, stats, showLine = true, onEmptyClick }: Props) {
+export function VideoPlayer({
+  frame,
+  detections,
+  stats,
+  showLine = true,
+  onEmptyClick,
+  overlayOnly = false,
+  showLiveBadge = true,
+}: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imgRef    = useRef<HTMLImageElement | null>(null);
   const prevSrcRef = useRef<string>('');
@@ -31,6 +41,59 @@ export function VideoPlayer({ frame, detections, stats, showLine = true, onEmpty
   const workerAliveRef = useRef(false);
   const workerLastFrameAtRef = useRef(0);
   const offscreenTransferredRef = useRef(false);
+  const trackMotionRef = useRef<Record<number, { cx: number; cy: number; t: number }>>({});
+  // Motion compensation can over-shoot on low-FPS / jittery streams and visually de-sync boxes.
+  // Keep it disabled by default to prioritize geometric correctness.
+  const ENABLE_H264_MOTION_COMPENSATION = false;
+  const MOTION_BASE_LEAD_MS = 45;
+  const MOTION_MAX_LEAD_MS = 240;
+  const MOTION_MAX_LEAD_PX = 40;
+  const MOTION_MIN_DT_MS = 25;
+  const MOTION_MAX_DT_MS = 500;
+
+  const applyMotionCompensation = useCallback((input: Detection[]): Detection[] => {
+    // Only compensate when drawing overlay-only on top of H264.
+    // JPEG path already carries frame+detections in the same packet.
+    if (!overlayOnly || !ENABLE_H264_MOTION_COMPENSATION) return input;
+    if (!input.length) return input;
+    const inferMs = Number(stats.avg_inference_ms || 0);
+    const fps = Number(stats.fps || 0);
+    const frameMs = fps > 0 ? (1000 / fps) : 80;
+    const leadMs = Math.max(
+      MOTION_BASE_LEAD_MS,
+      Math.min(MOTION_MAX_LEAD_MS, inferMs * 0.85 + frameMs * 0.6)
+    );
+    const now = Date.now();
+    const nextState: Record<number, { cx: number; cy: number; t: number }> = {};
+    const out = input.map((det) => {
+      const tid = det.track_id;
+      const cx = (det.bbox.x1 + det.bbox.x2) * 0.5;
+      const cy = (det.bbox.y1 + det.bbox.y2) * 0.5;
+      if (tid == null) return det;
+      const prev = trackMotionRef.current[tid];
+      nextState[tid] = { cx, cy, t: now };
+      if (!prev) return det;
+      const dt = now - prev.t;
+      if (dt < MOTION_MIN_DT_MS || dt > MOTION_MAX_DT_MS) return det;
+      const vx = (cx - prev.cx) / dt;
+      const vy = (cy - prev.cy) / dt;
+      let dx = vx * leadMs;
+      let dy = vy * leadMs;
+      dx = Math.max(-MOTION_MAX_LEAD_PX, Math.min(MOTION_MAX_LEAD_PX, dx));
+      dy = Math.max(-MOTION_MAX_LEAD_PX, Math.min(MOTION_MAX_LEAD_PX, dy));
+      return {
+        ...det,
+        bbox: {
+          x1: det.bbox.x1 + dx,
+          y1: det.bbox.y1 + dy,
+          x2: det.bbox.x2 + dx,
+          y2: det.bbox.y2 + dy,
+        },
+      };
+    });
+    trackMotionRef.current = nextState;
+    return out;
+  }, [overlayOnly, stats.avg_inference_ms, stats.fps]);
 
   function base64ToArrayBuffer(b64: string): ArrayBuffer {
     const bin = atob(b64);
@@ -42,12 +105,13 @@ export function VideoPlayer({ frame, detections, stats, showLine = true, onEmpty
 
   const canUseWorker = useMemo(() => {
     return (
+      !overlayOnly &&
       typeof Worker !== 'undefined' &&
       typeof OffscreenCanvas !== 'undefined' &&
       typeof HTMLCanvasElement !== 'undefined' &&
       typeof (HTMLCanvasElement.prototype as any).transferControlToOffscreen === 'function'
     );
-  }, []);
+  }, [overlayOnly]);
 
   // Init worker renderer (one worker per VideoPlayer instance).
   useEffect(() => {
@@ -134,7 +198,7 @@ export function VideoPlayer({ frame, detections, stats, showLine = true, onEmpty
     };
   }, [canUseWorker]);
 
-  const renderFrame = useCallback((img: HTMLImageElement) => {
+  const renderFrame = useCallback((img: HTMLImageElement, detsForDraw: Detection[]) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
@@ -160,21 +224,24 @@ export function VideoPlayer({ frame, detections, stats, showLine = true, onEmpty
     }
 
     ctx.clearRect(0, 0, cw, ch);
-    ctx.drawImage(img, dx, dy, dw, dh);
+    if (!overlayOnly) {
+      ctx.drawImage(img, dx, dy, dw, dh);
+    }
 
     const scaleX = dw / img.naturalWidth;
     const scaleY = dh / img.naturalHeight;
 
     ctx.save();
     ctx.translate(dx, dy);
-    drawDetections(ctx, detections, scaleX, scaleY);
+    drawDetections(ctx, detsForDraw, scaleX, scaleY);
     if (showLine && img.naturalHeight > 0) {
       drawCountingLine(ctx, img.naturalHeight * stats.line_position * scaleY, dw);
     }
     ctx.restore();
-  }, [detections, stats.line_position, showLine]);
+  }, [stats.line_position, showLine, overlayOnly]);
 
   useEffect(() => {
+    const compensatedDetections = applyMotionCompensation(detections);
     if (!frame) return;
 
     // Binary WS path: decode off main thread when possible
@@ -186,7 +253,7 @@ export function VideoPlayer({ frame, detections, stats, showLine = true, onEmpty
             {
               type: 'frame',
               jpeg: ab,
-              detections,
+              detections: compensatedDetections,
               line_position: stats.line_position,
               showLine,
             },
@@ -201,7 +268,7 @@ export function VideoPlayer({ frame, detections, stats, showLine = true, onEmpty
 
       // Fall back to main-thread render for this instance (non-OffscreenCanvas browsers only).
       if (prevBlobRef.current === frame && imgRef.current?.complete) {
-        renderFrame(imgRef.current);
+        renderFrame(imgRef.current, compensatedDetections);
         return;
       }
       prevBlobRef.current = frame;
@@ -241,13 +308,15 @@ export function VideoPlayer({ frame, detections, stats, showLine = true, onEmpty
           }
 
           ctx.clearRect(0, 0, cw, ch);
-          ctx.drawImage(bmp, dx, dy, dw, dh);
+          if (!overlayOnly) {
+            ctx.drawImage(bmp, dx, dy, dw, dh);
+          }
 
           const scaleX = dw / bmp.width;
           const scaleY = dh / bmp.height;
           ctx.save();
           ctx.translate(dx, dy);
-          drawDetections(ctx, detections, scaleX, scaleY);
+          drawDetections(ctx, compensatedDetections, scaleX, scaleY);
           if (showLine && bmp.height > 0) {
             drawCountingLine(ctx, bmp.height * stats.line_position * scaleY, dw);
           }
@@ -280,7 +349,7 @@ export function VideoPlayer({ frame, detections, stats, showLine = true, onEmpty
           {
             type: 'frame',
             jpeg: ab,
-            detections,
+            detections: compensatedDetections,
             line_position: stats.line_position,
             showLine,
           },
@@ -296,7 +365,7 @@ export function VideoPlayer({ frame, detections, stats, showLine = true, onEmpty
 
     // If src is the same as last time, just redraw overlays (detections may have changed)
     if (src === prevSrcRef.current && imgRef.current?.complete) {
-      renderFrame(imgRef.current);
+      renderFrame(imgRef.current, compensatedDetections);
       return;
     }
 
@@ -306,17 +375,17 @@ export function VideoPlayer({ frame, detections, stats, showLine = true, onEmpty
     const img = new Image();
     img.onload = () => {
       imgRef.current = img;
-      renderFrame(img);
+      renderFrame(img, compensatedDetections);
     };
     img.onerror = () => {
       console.error('[VideoPlayer] failed to decode frame');
     };
     img.src = src;
-  }, [frame, detections, stats.line_position, showLine, renderFrame]);
+  }, [frame, detections, stats.line_position, showLine, renderFrame, canUseWorker, overlayOnly, applyMotionCompensation]);
 
   return (
-    <div className="relative w-full h-full bg-white overflow-hidden">
-      {!frame && (
+    <div className={`relative w-full h-full overflow-hidden ${overlayOnly ? 'bg-transparent' : 'bg-white'}`}>
+      {!overlayOnly && !frame && (
         <button
           type="button"
           onClick={onEmptyClick}
@@ -330,7 +399,7 @@ export function VideoPlayer({ frame, detections, stats, showLine = true, onEmpty
           <p className="text-sm font-medium">Kết nối stream để xem camera</p>
         </button>
       )}
-      {frame && (
+      {!overlayOnly && showLiveBadge && frame && (
         <div className="absolute top-3 right-3 flex items-center gap-1.5 bg-red-600 text-white text-[11px] font-bold px-2.5 py-1 rounded-full z-10 shadow">
           <span className="w-1.5 h-1.5 bg-white rounded-full animate-pulse" />
           LIVE
@@ -339,7 +408,7 @@ export function VideoPlayer({ frame, detections, stats, showLine = true, onEmpty
       <canvas
         ref={canvasRef}
         className="w-full h-full block"
-        style={{ display: frame ? 'block' : 'none' }}
+        style={{ display: (overlayOnly || frame) ? 'block' : 'none' }}
       />
     </div>
   );

@@ -116,6 +116,14 @@ class ModelLoadRequest(BaseModel):
     name: str
 
 
+class ModelExportEngineRequest(BaseModel):
+    name: str = Field(..., description="Model name/path to .pt file under models storage")
+    fp16: Optional[bool] = Field(None, description="Override FP16 export (default from settings)")
+    workspace_gb: Optional[int] = Field(None, ge=1, le=64, description="TensorRT workspace size in GB")
+    imgsz: Optional[int] = Field(None, ge=320, le=1280, description="Export input size")
+    load_after_export: bool = Field(True, description="Load exported .engine as active model")
+
+
 # ── Response Models ───────────────────────────────────────────────────────────
 
 class ModelInfo(BaseModel):

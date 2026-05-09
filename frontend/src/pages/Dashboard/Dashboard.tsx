@@ -5,7 +5,7 @@
 
 import { useState, useEffect, useCallback, useMemo, useRef, type ReactNode } from 'react';
 import { useDetection } from '../../hooks/useDetection';
-import { VideoPlayer } from '../../components/VideoPlayer';
+import { VideoPlayer, H264LivePlayer } from '../../components/VideoPlayer';
 import { RoiDrawer, RoiCanvasOverlay } from '../../components/RoiDrawer';
 import type { RoiPoint } from '../../components/RoiDrawer';
 import { ModelUploader } from '../../components/ModelUploader';
@@ -45,7 +45,7 @@ let toastId = 0;
 export function Dashboard() {
   const {
     currentFrame, detections, stats, wsConnected, usingFallback,
-    companionFrame, companionDetections, companionFps,
+    companionFrame, companionDetections, companionFps, companionLinePosition,
     extraLive,
     startStream, startCompanion, stopCompanion, stopStream, reloadStats, setRoi, clearRoi, setRoiSlot, clearRoiSlot, resetCount, updateSettings,
   } = useDetection();
@@ -58,6 +58,7 @@ export function Dashboard() {
     conf_threshold: 0.35,
     line_position: 0.55,
     max_fps: 30,
+    skip_frames: 0,
     tracker_type: 'bytetrack',
     counting_mode: 'all',
     congestion_threshold: 10,
@@ -92,6 +93,10 @@ export function Dashboard() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [cameraOpen, setCameraOpen] = useState(false);
   const [roiOpen, setRoiOpen] = useState(false);
+  const [h264Mode, setH264Mode] = useState(true);
+  const [h264FailedSlots, setH264FailedSlots] = useState<Record<string, boolean>>({});
+  const h264SkipBackupRef = useRef<number | null>(null);
+  const h264MultiCamGuardToastRef = useRef(false);
 
   const trimmedStream = streamUrl.trim();
   const trafficPhaseRoadLabels = useMemo(
@@ -157,8 +162,16 @@ export function Dashboard() {
     conf_threshold: settings.conf_threshold,
     line_position: settings.line_position,
   };
+  const companionStatsForView = {
+    ...statsForView,
+    line_position: companionLinePosition,
+  };
 
   const congestion = stats.congestion;
+  const isCompanionLive = streamOn && Boolean(companionFrame);
+  const isExtra2Live = streamOn && Boolean(extraLive?.[2]?.frame);
+  const isExtra3Live = streamOn && Boolean(extraLive?.[3]?.frame);
+  const liveCameraCount = (streamOn ? 1 : 0) + (isCompanionLive ? 1 : 0) + (isExtra2Live ? 1 : 0) + (isExtra3Live ? 1 : 0);
 
   const urlToSlot = useCallback((urlRaw: string): string => {
     const u = (urlRaw || '').trim();
@@ -209,11 +222,76 @@ export function Dashboard() {
     return () => window.removeEventListener('keydown', onKey);
   }, [roiOpen]);
 
+  useEffect(() => {
+    if (!streamOn || !h264Mode) {
+      setH264FailedSlots({});
+    }
+  }, [streamOn, h264Mode]);
+
+  const markH264Failed = useCallback((slot: 'primary' | 'companion' | 'extra2' | 'extra3') => {
+    setH264FailedSlots((prev) => (prev[slot] ? prev : { ...prev, [slot]: true }));
+  }, []);
+
+  useEffect(() => {
+    // H264 playback is usually ahead of JPEG detection payload.
+    // Force skip_frames=0 while H264 is on to keep boxes closer to moving objects.
+    if (!streamOn) {
+      if (h264SkipBackupRef.current !== null) {
+        const restoreSkip = h264SkipBackupRef.current;
+        h264SkipBackupRef.current = null;
+        if (Number(settings.skip_frames ?? 0) !== restoreSkip) {
+          setSettings((s) => ({ ...s, skip_frames: restoreSkip }));
+          updateSettings({ skip_frames: restoreSkip });
+        }
+      }
+      return;
+    }
+    const currentSkip = Number(settings.skip_frames ?? 0);
+    if (h264Mode) {
+      if (h264SkipBackupRef.current === null) {
+        h264SkipBackupRef.current = currentSkip;
+      }
+      if (currentSkip !== 0) {
+        setSettings((s) => ({ ...s, skip_frames: 0 }));
+        updateSettings({ skip_frames: 0 });
+      }
+      return;
+    }
+    if (h264SkipBackupRef.current !== null) {
+      const restoreSkip = h264SkipBackupRef.current;
+      h264SkipBackupRef.current = null;
+      if (currentSkip !== restoreSkip) {
+        setSettings((s) => ({ ...s, skip_frames: restoreSkip }));
+        updateSettings({ skip_frames: restoreSkip });
+      }
+    }
+  }, [h264Mode, streamOn, settings.skip_frames, updateSettings]);
+
   const addToast = useCallback((message: string, type: Toast['type'] = 'info') => {
     const id = ++toastId;
     setToasts((t) => [...t, { id, message, type }]);
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4000);
   }, []);
+
+  useEffect(() => {
+    // H264 relay and detect pipeline are different clocks.
+    // With >=2 live cameras this can cause severe box/frame desync.
+    // Guardrail: force JPEG for multi-cam to keep frame+detections aligned.
+    if (!streamOn) {
+      h264MultiCamGuardToastRef.current = false;
+      return;
+    }
+    if (h264Mode && liveCameraCount >= 2) {
+      setH264Mode(false);
+      if (!h264MultiCamGuardToastRef.current) {
+        addToast('Đang chạy nhiều camera LIVE: tự chuyển JPEG để tránh lệch box detect.', 'warning');
+        h264MultiCamGuardToastRef.current = true;
+      }
+    }
+    if (liveCameraCount < 2) {
+      h264MultiCamGuardToastRef.current = false;
+    }
+  }, [streamOn, h264Mode, liveCameraCount, addToast]);
 
   const openAssignFor = useCallback((idx: number) => {
     setAssignExtraIndex(idx);
@@ -449,6 +527,16 @@ export function Dashboard() {
         <div className="flex items-center gap-2 shrink-0">
           <StatusPill label={stats.model_loaded ? stats.model_name.replace('.pt', '') : 'No Model'} active={stats.model_loaded} />
           <StatusPill label={deviceInfo.cuda_available ? 'GPU' : 'CPU'} active={deviceInfo.cuda_available} title={deviceInfo.device_name ?? undefined} />
+          <StatusPill
+            label={h264Mode ? 'H264' : 'JPEG'}
+            active={h264Mode}
+            onClick={streamOn ? () => setH264Mode((v) => !v) : undefined}
+            title={
+              streamOn
+                ? (h264Mode ? 'Click để chuyển sang JPEG' : 'Click để thử lại H264')
+                : 'Bật stream để chọn mode'
+            }
+          />
         </div>
 
         {/* Center: system title */}
@@ -578,13 +666,29 @@ export function Dashboard() {
                   </div>
                 ) : null}
                 <div className="relative overflow-hidden flex-1 min-h-0">
-                  <VideoPlayer
-                    frame={currentFrame}
-                    detections={detections}
-                    stats={statsForView}
-                    showLine={countingEnabled}
-                    onEmptyClick={() => setCameraOpen(true)}
-                  />
+                  {h264Mode && streamOn && !h264FailedSlots.primary ? (
+                    <>
+                      <H264LivePlayer enabled={true} onError={() => markH264Failed('primary')} />
+                      <div className="absolute inset-0 z-20 pointer-events-none">
+                        <VideoPlayer
+                          frame={currentFrame}
+                          detections={detections}
+                          stats={statsForView}
+                          showLine={countingEnabled}
+                          overlayOnly={true}
+                          showLiveBadge={false}
+                        />
+                      </div>
+                    </>
+                  ) : (
+                    <VideoPlayer
+                      frame={currentFrame}
+                      detections={detections}
+                      stats={statsForView}
+                      showLine={countingEnabled}
+                      onEmptyClick={() => setCameraOpen(true)}
+                    />
+                  )}
                   <RoiCanvasOverlay
                     points={roiBySlot.primary.points}
                     setPoints={(p) => setRoiBySlot((prev) => ({ ...prev, primary: { ...prev.primary, points: typeof p === 'function' ? (p as any)(prev.primary.points) : p } }))}
@@ -647,13 +751,29 @@ export function Dashboard() {
                     if (isManualLive2) {
                       return (
                     <div className="relative overflow-hidden flex-1 min-h-0">
-                      <VideoPlayer
-                        frame={companionFrame}
-                        detections={companionDetections}
-                        stats={statsForView}
-                        showLine={false}
-                        onEmptyClick={() => { setAssignExtraIndex(0); setCameraOpen(true); }}
-                      />
+                      {h264Mode && streamOn && !h264FailedSlots.companion ? (
+                        <>
+                          <H264LivePlayer enabled={true} wsPath="/ws/stream-h264/companion" onError={() => markH264Failed('companion')} />
+                          <div className="absolute inset-0 z-20 pointer-events-none">
+                            <VideoPlayer
+                              frame={companionFrame}
+                              detections={companionDetections}
+                              stats={companionStatsForView}
+                              showLine={countingEnabled}
+                              overlayOnly={true}
+                              showLiveBadge={false}
+                            />
+                          </div>
+                        </>
+                      ) : (
+                        <VideoPlayer
+                          frame={companionFrame}
+                          detections={companionDetections}
+                          stats={companionStatsForView}
+                          showLine={countingEnabled}
+                          onEmptyClick={() => { setAssignExtraIndex(0); setCameraOpen(true); }}
+                        />
+                      )}
                       <RoiCanvasOverlay
                         points={roiBySlot.companion.points}
                         setPoints={(p) => setRoiBySlot((prev) => ({ ...prev, companion: { ...prev.companion, points: typeof p === 'function' ? (p as any)(prev.companion.points) : p } }))}
@@ -673,13 +793,33 @@ export function Dashboard() {
                     if (live && live.frame) {
                       return (
                     <div className="relative overflow-hidden flex-1 min-h-0">
-                      <VideoPlayer
-                        frame={live.frame}
-                        detections={live.dets}
-                        stats={statsForView}
-                        showLine={false}
-                        onEmptyClick={() => { setAssignExtraIndex(i); setCameraOpen(true); }}
-                      />
+                      {h264Mode && streamOn && !(extraSlot === 2 ? h264FailedSlots.extra2 : h264FailedSlots.extra3) ? (
+                        <>
+                          <H264LivePlayer
+                            enabled={true}
+                            wsPath={extraSlot === 2 ? '/ws/stream-h264/extra2' : '/ws/stream-h264/extra3'}
+                            onError={() => markH264Failed(extraSlot === 2 ? 'extra2' : 'extra3')}
+                          />
+                          <div className="absolute inset-0 z-20 pointer-events-none">
+                            <VideoPlayer
+                              frame={live.frame}
+                              detections={live.dets}
+                              stats={statsForView}
+                              showLine={false}
+                              overlayOnly={true}
+                              showLiveBadge={false}
+                            />
+                          </div>
+                        </>
+                      ) : (
+                        <VideoPlayer
+                          frame={live.frame}
+                          detections={live.dets}
+                          stats={statsForView}
+                          showLine={false}
+                          onEmptyClick={() => { setAssignExtraIndex(i); setCameraOpen(true); }}
+                        />
+                      )}
                       <RoiCanvasOverlay
                         points={(extraSlot === 2 ? roiBySlot['2'] : roiBySlot['3']).points}
                         setPoints={(p) => setRoiBySlot((prev) => {
@@ -1038,6 +1178,15 @@ export function Dashboard() {
                       display={`${Math.round(settings.line_position * 100)}%`}
                       onChange={(v) => handleSettingChange('line_position', v)}
                     />
+                    <SliderField
+                      label="Inference Skip Frames"
+                      value={settings.skip_frames ?? 0}
+                      min={0}
+                      max={5}
+                      step={1}
+                      display={`${settings.skip_frames ?? 0}`}
+                      onChange={(v) => handleSettingChange('skip_frames', v)}
+                    />
                   </div>
 
                   <div className="rounded-xl border border-slate-200 bg-white p-3">
@@ -1142,14 +1291,29 @@ export function Dashboard() {
 
 // ── Sub-components ────────────────────────────────────────────────────────────
 
-function StatusPill({ label, active, title }: { label: string; active: boolean; title?: string }) {
+function StatusPill({
+  label,
+  active,
+  title,
+  onClick,
+}: {
+  label: string;
+  active: boolean;
+  title?: string;
+  onClick?: () => void;
+}) {
   return (
-    <div title={title} className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-semibold border transition-all ${
-      active ? 'border-accent/40 text-accent bg-blue-50' : 'border-slate-200 text-slate-500 bg-slate-50'
-    }`}>
+    <button
+      type="button"
+      title={title}
+      onClick={onClick}
+      className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-semibold border transition-all ${
+        active ? 'border-accent/40 text-accent bg-blue-50' : 'border-slate-200 text-slate-500 bg-slate-50'
+      } ${onClick ? 'cursor-pointer hover:brightness-95' : 'cursor-default'}`}
+    >
       <span className={`w-1.5 h-1.5 rounded-full ${active ? 'bg-accent animate-pulse' : 'bg-slate-300'}`} />
       {label}
-    </div>
+    </button>
   );
 }
 

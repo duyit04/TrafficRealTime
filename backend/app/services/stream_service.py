@@ -29,6 +29,12 @@ from app.ml.congestion_monitor import CongestionMonitor
 
 # ── Service Layer ─────────────────────────────────────────────────────────────
 from app.services.roi_service import roi_service
+from app.services.ffmpeg_relay_service import (
+    ffmpeg_relay_service,
+    ffmpeg_relay_companion_service,
+    ffmpeg_relay_extra2_service,
+    ffmpeg_relay_extra3_service,
+)
 from app.utils.video_utils import is_youtube_url, resolve_youtube_url, validate_youtube_url
 from app.api.ws_routes import ws_manager, ws_companion_manager, pack_frame_message
 
@@ -63,6 +69,12 @@ class StreamService:
             vehicle_threshold=settings.CONGESTION_VEHICLE_THRESHOLD,
             stable_duration=settings.CONGESTION_STABLE_DURATION,
         )
+        self._companion_tracker = get_tracker(self._tracker_type)
+        self._companion_counter = VehicleCounter()
+        self._companion_congestion = CongestionMonitor(
+            vehicle_threshold=settings.CONGESTION_VEHICLE_THRESHOLD,
+            stable_duration=settings.CONGESTION_STABLE_DURATION,
+        )
         # Per-camera YOLO instances for independent tracking state.
         # (Ultralytics built-in trackers store state inside the model predictor.)
         from app.ml.yolo_model import YOLOModel
@@ -78,6 +90,11 @@ class StreamService:
         self._last_error: str | None = None
         # Legacy: stored event loop for optional WS broadcasting (may be unused)
         self._event_loop: asyncio.AbstractEventLoop | None = None
+        # Recent HTTP polling activity marker.
+        # If inactive, skip expensive base64 encode and rely on WebSocket bytes.
+        self._http_primary_last_poll_ts: float = 0.0
+        self._http_companion_last_poll_ts: float = 0.0
+        self._http_extra_last_poll_ts: dict[int, float] = {}
         # For inference skipping (keep last detections to reuse on skipped frames)
         self._skip_counter: int = 0
         self._last_api_dets: list[dict] = []
@@ -96,6 +113,7 @@ class StreamService:
         self._companion_lock = threading.Lock()
         self._companion_frame_count: int = 0
         self._companion_fps: float = 0.0
+        self._companion_counting_line_y: int | None = None
 
         # Extra live streams (screens 3/4): each has its own worker + latest payload
         self._extra_threads: dict[int, threading.Thread] = {}
@@ -147,11 +165,19 @@ class StreamService:
             daemon=True,
         )
         self._companion_thread.start()
+        try:
+            ffmpeg_relay_companion_service.start(self._companion_url)
+        except Exception as re:
+            logger.debug("FFmpeg companion relay start skipped: %s", re)
         logger.info("StreamService: companion started (no restart) → %s", self._companion_url[:80])
 
     def stop_companion(self) -> None:
         """Stop companion stream without stopping primary."""
         self._companion_running = False
+        try:
+            ffmpeg_relay_companion_service.stop()
+        except Exception:
+            pass
         if self._companion_thread:
             self._companion_thread.join(timeout=3)
             self._companion_thread = None
@@ -174,9 +200,23 @@ class StreamService:
         t = threading.Thread(target=self._extra_worker, args=(s, u), daemon=True)
         self._extra_threads[s] = t
         t.start()
+        try:
+            if s == 2:
+                ffmpeg_relay_extra2_service.start(u)
+            elif s == 3:
+                ffmpeg_relay_extra3_service.start(u)
+        except Exception as re:
+            logger.debug("FFmpeg extra relay start skipped(slot=%s): %s", s, re)
 
     def stop_extra(self, slot: int) -> None:
         s = int(slot)
+        try:
+            if s == 2:
+                ffmpeg_relay_extra2_service.stop()
+            elif s == 3:
+                ffmpeg_relay_extra3_service.stop()
+        except Exception:
+            pass
         with self._extra_lock:
             self._extra_running[s] = False
             self._extra_urls.pop(s, None)
@@ -215,9 +255,18 @@ class StreamService:
                     daemon=True,
                 )
                 self._companion_thread.start()
+                try:
+                    ffmpeg_relay_companion_service.start(self._companion_url)
+                except Exception as re:
+                    logger.debug("FFmpeg companion relay start skipped: %s", re)
                 logger.info("StreamService: companion TLC lane → %s", self._companion_url[:80])
             self._thread = threading.Thread(target=self._worker, args=(effective_url,), daemon=True)
             self._thread.start()
+            # Start low-CPU H264 relay path in parallel (frontend can opt-in).
+            try:
+                ffmpeg_relay_service.start(effective_url)
+            except Exception as re:
+                logger.debug("FFmpeg relay start skipped: %s", re)
             logger.info("StreamService: worker started")
         except Exception as e:
             self._last_error = str(e)
@@ -228,6 +277,22 @@ class StreamService:
     def stop(self) -> None:
         self._running = False
         self._companion_running = False
+        try:
+            ffmpeg_relay_service.stop()
+        except Exception:
+            pass
+        try:
+            ffmpeg_relay_companion_service.stop()
+        except Exception:
+            pass
+        try:
+            ffmpeg_relay_extra2_service.stop()
+        except Exception:
+            pass
+        try:
+            ffmpeg_relay_extra3_service.stop()
+        except Exception:
+            pass
         # Stop extra streams
         with self._extra_lock:
             for k in list(self._extra_running.keys()):
@@ -259,6 +324,8 @@ class StreamService:
     def reset_counters(self) -> None:
         self._counter.reset()
         self._tracker.reset()
+        self._companion_counter.reset()
+        self._companion_tracker.reset()
         yolo_model.reset_tracker()
         try:
             self._companion_yolo.reset_tracker()
@@ -270,6 +337,7 @@ class StreamService:
             except Exception:
                 pass
         self._congestion.reset()
+        self._companion_congestion.reset()
         self._stats.total = 0
         self._stats.count_in = 0
         self._stats.count_out = 0
@@ -312,6 +380,7 @@ class StreamService:
             if t in ("bytetrack", "botsort"):
                 self._tracker_type = t
                 self._tracker = get_tracker(t)
+                self._companion_tracker = get_tracker(t)
                 yolo_model.reset_tracker()
         if counting_mode is not None:
             self._counter.set_mode(counting_mode)
@@ -351,6 +420,23 @@ class StreamService:
             "extra": extra,
         }
 
+    def mark_http_poll(self, channel: str, slot: int | None = None) -> None:
+        """Mark a recent HTTP polling access for frame fallback endpoints."""
+        now = time.monotonic()
+        ch = str(channel).strip().lower()
+        if ch == "primary":
+            self._http_primary_last_poll_ts = now
+            return
+        if ch == "companion":
+            self._http_companion_last_poll_ts = now
+            return
+        if ch == "extra" and slot is not None:
+            self._http_extra_last_poll_ts[int(slot)] = now
+
+    @staticmethod
+    def _is_http_poll_active(last_poll_ts: float, ttl_s: float = 2.0) -> bool:
+        return (time.monotonic() - float(last_poll_ts)) <= float(ttl_s)
+
     def _sync_secondary_model(self, local_model) -> bool:
         """
         Ensure a secondary YOLOModel has the same weights as the primary yolo_model.
@@ -369,6 +455,58 @@ class StreamService:
         except Exception as e:
             logger.debug("Secondary model sync failed: %s", e)
             return False
+
+    @staticmethod
+    def _rtsp_ffmpeg_options() -> str:
+        """
+        Build FFmpeg capture options for OpenCV.
+        Enable CUDA hwaccel optionally to move decode load from CPU to GPU when supported.
+        """
+        base = "rtsp_transport;tcp|buffer_size;4096000|max_delay;500000|stimeout;5000000"
+        if bool(getattr(settings, "RTSP_HWACCEL", False)):
+            return base + "|hwaccel;cuda|hwaccel_output_format;cuda"
+        return base
+
+    def _open_video_capture(self, url: str, *, is_rtsp: bool) -> cv2.VideoCapture:
+        """
+        Open capture with best-effort HW decode and CPU fallback.
+        """
+        if not is_rtsp:
+            return cv2.VideoCapture(url)
+
+        import os
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self._rtsp_ffmpeg_options()
+
+        if bool(getattr(settings, "RTSP_HWACCEL", False)):
+            cap_prop_hw_accel = getattr(cv2, "CAP_PROP_HW_ACCELERATION", None)
+            cap_prop_hw_device = getattr(cv2, "CAP_PROP_HW_DEVICE", None)
+            video_accel_any = getattr(cv2, "VIDEO_ACCELERATION_ANY", None)
+            if (
+                cap_prop_hw_accel is not None
+                and cap_prop_hw_device is not None
+                and video_accel_any is not None
+            ):
+                try:
+                    cap = cv2.VideoCapture(
+                        url,
+                        cv2.CAP_FFMPEG,
+                        [
+                            int(cap_prop_hw_accel),
+                            int(video_accel_any),
+                            int(cap_prop_hw_device),
+                            0,
+                        ],
+                    )
+                    if cap.isOpened():
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                        return cap
+                    cap.release()
+                except Exception:
+                    pass
+
+        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -396,18 +534,7 @@ class StreamService:
         def _capture_loop() -> None:
             rtsp_url = url
             # ── RTSP tuning: reduce buffering + proper HEVC handling ──────────────
-            if is_rtsp:
-                if "?" not in rtsp_url and "rtsp_transport" not in rtsp_url:
-                    import os
-
-                    os.environ.setdefault(
-                        "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-                        "rtsp_transport;tcp|buffer_size;4096000|max_delay;500000|stimeout;5000000|fflags;nobuffer|flags;low_delay",
-                    )
-                cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            else:
-                cap = cv2.VideoCapture(rtsp_url)
+            cap = self._open_video_capture(rtsp_url, is_rtsp=is_rtsp)
 
             if not cap.isOpened():
                 logger.error("StreamService: cannot open %s", rtsp_url)
@@ -428,8 +555,7 @@ class StreamService:
                                 time.sleep(0.1)
                                 continue
                             cap.release()
-                            cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-                            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                            cap = self._open_video_capture(rtsp_url, is_rtsp=True)
                             if not cap.isOpened():
                                 self._last_error = "RTSP stream đã kết thúc."
                                 self._stats.stream_error = self._last_error
@@ -492,6 +618,7 @@ class StreamService:
         t0_infer = time.time()
         infer_ms_hist: deque[float] = deque(maxlen=10)
         frame_interval = 1.0 / max(self.max_fps, 1)
+        last_dets: list = []
         try:
             while self._running:
                 t_start = time.time()
@@ -561,8 +688,9 @@ class StreamService:
                             self._stats.avg_inference_ms = round(
                                 sum(infer_ms_hist) / float(len(infer_ms_hist)), 1
                             )
+                        last_dets = raw_dets
                     else:
-                        raw_dets = []
+                        raw_dets = list(last_dets)
                         tracks = []
                 except Exception as pipe_err:
                     logger.warning("Pipeline error (skipping frame): %s", pipe_err)
@@ -648,10 +776,15 @@ class StreamService:
                 except Exception:
                     pass
 
-                # 6. Encode frame (lower quality = smaller payload = higher FPS)
-                jpeg_q = max(30, min(95, int(self.jpeg_quality or 75)))
-                ok_jpg, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
-                jpeg_bytes = buf.tobytes() if ok_jpg else b""
+                # 6. Encode frame only when there is an active consumer.
+                primary_http_active = self._is_http_poll_active(self._http_primary_last_poll_ts)
+                primary_ws_active = bool(ws_manager.has_clients)
+                need_jpeg = primary_http_active or primary_ws_active
+                jpeg_bytes = b""
+                if need_jpeg:
+                    jpeg_q = max(30, min(95, int(self.jpeg_quality or 75)))
+                    ok_jpg, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
+                    jpeg_bytes = buf.tobytes() if ok_jpg else b""
 
                 header = {
                     "v": 1,
@@ -663,7 +796,9 @@ class StreamService:
                 with self._lock:
                     # Keep a JSON-compatible latest snapshot for /frame fallback endpoint.
                     # (Frame stays base64 here to avoid changing HTTP API shape.)
-                    frame_b64 = base64.b64encode(jpeg_bytes).decode() if jpeg_bytes else ""
+                    frame_b64 = ""
+                    if jpeg_bytes and primary_http_active:
+                        frame_b64 = base64.b64encode(jpeg_bytes).decode()
                     self._latest = {
                         "frame": frame_b64,
                         "detections": header["detections"],
@@ -732,17 +867,7 @@ class StreamService:
 
         def _capture_loop() -> None:
             rtsp_url = url
-            if is_rtsp:
-                import os
-
-                os.environ.setdefault(
-                    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-                    "rtsp_transport;tcp|buffer_size;4096000|max_delay;500000|stimeout;5000000|fflags;nobuffer|flags;low_delay",
-                )
-                cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            else:
-                cap = cv2.VideoCapture(rtsp_url)
+            cap = self._open_video_capture(rtsp_url, is_rtsp=is_rtsp)
 
             if not cap.isOpened():
                 logger.warning("StreamService: companion cannot open stream")
@@ -761,8 +886,7 @@ class StreamService:
                                 time.sleep(0.1)
                                 continue
                             cap.release()
-                            cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-                            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                            cap = self._open_video_capture(rtsp_url, is_rtsp=True)
                             if not cap.isOpened():
                                 break
                             consecutive_failures = 0
@@ -835,6 +959,7 @@ class StreamService:
                     pass
 
                 dets = []
+                tracks = []
                 if bool(getattr(settings, "COMPANION_DETECT_ENABLED", True)):
                     do_infer = True
                     skip_n = max(0, int(self.skip_frames or 0))
@@ -854,14 +979,18 @@ class StreamService:
                                     tracker=self._tracker.tracker_yaml,
                                     persist=True,
                                 )
+                                tracks = self._companion_tracker.update(dets)
                             else:
                                 dets = []
+                                tracks = []
                         except Exception as ce:
                             logger.debug("Companion lane track skipped: %s", ce)
                             dets = []
+                            tracks = []
                         last_dets = dets
                     else:
                         dets = list(last_dets)
+                        tracks = []
 
                 # Optional: publish companion frame + detections for UI second panel
                 try:
@@ -877,6 +1006,40 @@ class StreamService:
                         for d in dets
                         if roi_service.is_inside(d.cx, d.cy, slot="companion")
                     ]
+                    # Keep companion pipeline parity with primary:
+                    # counting line + class counters + congestion + model info.
+                    frame_h = fr.shape[0]
+                    if roi_service.active_for("companion") and roi_service.points_for("companion"):
+                        active_tracks = [
+                            t for t in tracks if roi_service.is_inside(t.cx, t.cy, slot="companion")
+                        ]
+                        roi_mid = roi_service.mid_y_for("companion")
+                        companion_line_y = roi_mid if roi_mid is not None else int(frame_h * self.line_position)
+                    else:
+                        active_tracks = tracks
+                        if self._companion_counting_line_y is None:
+                            self._companion_counting_line_y = int(frame_h * self.line_position)
+                        companion_line_y = self._companion_counting_line_y
+                    self._companion_counter.update(active_tracks, companion_line_y)
+                    companion_cong = self._companion_congestion.update(len(active_tracks))
+                    companion_congestion_payload = CongestionInfo(
+                        is_congested=companion_cong.is_congested,
+                        vehicle_count=companion_cong.vehicle_count,
+                        threshold=companion_cong.threshold,
+                        duration_seconds=companion_cong.duration_seconds,
+                        stable_duration=companion_cong.stable_duration,
+                        message=companion_cong.message,
+                        level=companion_cong.level,
+                    ).model_dump()
+                    companion_model_loaded = False
+                    companion_model_name = ""
+                    try:
+                        from app.services.model_service import model_service
+
+                        companion_model_loaded = bool(model_service.is_loaded)
+                        companion_model_name = str(model_service.name or "")
+                    except Exception:
+                        pass
                     try:
                         from app.services.traffic_light_service import traffic_light_service as tls
 
@@ -884,9 +1047,14 @@ class StreamService:
                         tls.update_lane_observation("companion", stopped_cnt, total_cnt)
                     except Exception:
                         pass
-                    jpeg_q = max(30, min(95, int(self.jpeg_quality or 75)))
-                    ok_jpg, buf = cv2.imencode(".jpg", fr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
-                    jpeg_bytes = buf.tobytes() if ok_jpg else b""
+                    companion_http_active = self._is_http_poll_active(self._http_companion_last_poll_ts)
+                    companion_ws_active = bool(ws_companion_manager.has_clients)
+                    need_jpeg = companion_http_active or companion_ws_active
+                    jpeg_bytes = b""
+                    if need_jpeg:
+                        jpeg_q = max(30, min(95, int(self.jpeg_quality or 75)))
+                        ok_jpg, buf = cv2.imencode(".jpg", fr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
+                        jpeg_bytes = buf.tobytes() if ok_jpg else b""
 
                     header = {
                         "v": 1,
@@ -894,10 +1062,25 @@ class StreamService:
                         "fps": float(self._companion_fps),
                         "frame_count": int(self._companion_frame_count),
                         "stream_active": True,
+                        "lane_stats": {
+                            "total": int(self._companion_counter.total),
+                            "count_in": int(self._companion_counter.count_in),
+                            "count_out": int(self._companion_counter.count_out),
+                            "classes": dict(self._companion_counter.by_class),
+                            "classes_in": dict(self._companion_counter.by_class_in),
+                            "classes_out": dict(self._companion_counter.by_class_out),
+                            "counting_mode": self._companion_counter.mode,
+                            "line_position": (float(companion_line_y) / float(max(frame_h, 1))),
+                            "congestion": companion_congestion_payload,
+                            "model_loaded": companion_model_loaded,
+                            "model_name": companion_model_name,
+                        },
                     }
                     with self._companion_lock:
                         # Keep HTTP polling shape (base64)
-                        frame_b64 = base64.b64encode(jpeg_bytes).decode() if jpeg_bytes else ""
+                        frame_b64 = ""
+                        if jpeg_bytes and companion_http_active:
+                            frame_b64 = base64.b64encode(jpeg_bytes).decode()
                         self._companion_latest = {
                             "frame": frame_b64,
                             "detections": header["detections"],
@@ -941,16 +1124,7 @@ class StreamService:
             self._extra_yolo[s] = YOLOModel()
         self._sync_secondary_model(self._extra_yolo[s])
         is_rtsp = str(url).lower().startswith("rtsp://")
-        if is_rtsp:
-            import os
-            os.environ.setdefault(
-                "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-                "rtsp_transport;tcp|buffer_size;4096000|max_delay;500000|stimeout;5000000|fflags;nobuffer|flags;low_delay",
-            )
-            cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        else:
-            cap = cv2.VideoCapture(url)
+        cap = self._open_video_capture(url, is_rtsp=is_rtsp)
         if not cap.isOpened():
             logger.warning("StreamService: extra slot %d cannot open stream", int(slot))
             with self._extra_lock:
@@ -1018,9 +1192,14 @@ class StreamService:
                     tls.update_lane_observation(str(int(slot)), stopped_cnt, total_cnt)
                 except Exception:
                     pass
-                jpeg_q = max(30, min(95, int(self.jpeg_quality or 75)))
-                ok_jpg, buf = cv2.imencode(".jpg", fr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
-                jpeg_bytes = buf.tobytes() if ok_jpg else b""
+                extra_http_active = self._is_http_poll_active(self._http_extra_last_poll_ts.get(int(slot), 0.0))
+                extra_ws_active = bool(ws_manager.has_clients)
+                need_jpeg = extra_http_active or extra_ws_active
+                jpeg_bytes = b""
+                if need_jpeg:
+                    jpeg_q = max(30, min(95, int(self.jpeg_quality or 75)))
+                    ok_jpg, buf = cv2.imencode(".jpg", fr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
+                    jpeg_bytes = buf.tobytes() if ok_jpg else b""
                 header = {
                     "v": 1,
                     "slot": int(slot),
@@ -1030,7 +1209,9 @@ class StreamService:
                 }
                 with self._extra_lock:
                     # Keep HTTP polling shape (base64)
-                    frame_b64 = base64.b64encode(jpeg_bytes).decode() if jpeg_bytes else ""
+                    frame_b64 = ""
+                    if jpeg_bytes and extra_http_active:
+                        frame_b64 = base64.b64encode(jpeg_bytes).decode()
                     self._extra_latest[int(slot)] = {
                         "slot": int(slot),
                         "frame": frame_b64,
@@ -1123,14 +1304,19 @@ class StreamService:
     def _reset_all(self) -> None:
         self._tracker = get_tracker(self._tracker_type)
         self._tracker.reset()
+        self._companion_tracker = get_tracker(self._tracker_type)
+        self._companion_tracker.reset()
         yolo_model.reset_tracker()
         self._counter.reset()
+        self._companion_counter.reset()
         self._congestion.reset()
+        self._companion_congestion.reset()
         self._stats = VehicleStats(
             conf_threshold=self.conf_threshold,
             line_position=self.line_position,
         )
         self._counting_line_y = None
+        self._companion_counting_line_y = None
         self._timeline.clear()
         self._timeline_last = 0
         self._companion_frame_count = 0

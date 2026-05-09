@@ -13,6 +13,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import List
 import threading
+import re
 
 import numpy as np
 
@@ -106,7 +107,9 @@ class YOLOModel:
         self._class_names: dict[int, str] = {}
         self._device = "cpu"
         self._use_half = False
+        self._runtime_backend: str = "torch"
         self._infer_lock = threading.Lock()
+        self._fixed_imgsz_override: int | None = None
 
     # ── Public ────────────────────────────────────────────────────────────────
 
@@ -117,11 +120,13 @@ class YOLOModel:
         if not path.exists():
             raise FileNotFoundError(f"Weights not found: {path}")
 
-        self._model = YOLO(str(path))
+        self._device, self._use_half, _dev_label = _resolve_yolo_device()
         self._model_path = path.name
         self._weights_path = path.resolve()
 
-        self._device, self._use_half, _dev_label = _resolve_yolo_device()
+        model, backend, loaded_path = self._load_with_backend_preference(path, YOLO)
+        self._model = model
+        self._runtime_backend = backend
 
         names = getattr(self._model, "names", {})
         if isinstance(names, dict):
@@ -130,8 +135,9 @@ class YOLOModel:
             self._class_names = {i: str(n) for i, n in enumerate(names)}
 
         logger.info(
-            "YOLOModel: loaded %s → device=%s half=%s",
-            self._model_path,
+            "YOLOModel: loaded %s via %s → device=%s half=%s",
+            loaded_path.name,
+            backend,
             _dev_label,
             self._use_half,
         )
@@ -141,6 +147,8 @@ class YOLOModel:
         self._model_path = ""
         self._weights_path = None
         self._class_names = {}
+        self._runtime_backend = "torch"
+        self._fixed_imgsz_override = None
 
     def load_pretrained(self, name: str = "yolov8n.pt") -> None:
         """
@@ -149,11 +157,13 @@ class YOLOModel:
         """
         from ultralytics import YOLO
 
-        self._model = YOLO(str(name))
         self._model_path = str(name)
         self._weights_path = None
 
         self._device, self._use_half, _dev_label = _resolve_yolo_device()
+        model, backend, loaded_path = self._load_with_backend_preference(Path(str(name)), YOLO)
+        self._model = model
+        self._runtime_backend = backend
 
         names = getattr(self._model, "names", {})
         if isinstance(names, dict):
@@ -162,8 +172,10 @@ class YOLOModel:
             self._class_names = {i: str(n) for i, n in enumerate(names)}
 
         logger.info(
-            "YOLOModel: loaded pretrained %s → device=%s half=%s",
+            "YOLOModel: loaded pretrained %s via %s (%s) → device=%s half=%s",
             self._model_path,
+            backend,
+            loaded_path.name,
             _dev_label,
             self._use_half,
         )
@@ -174,11 +186,21 @@ class YOLOModel:
             return []
 
         with self._infer_lock:
-            results = self._model(
-                frame, verbose=False, conf=conf,
-                device=self._device, half=self._use_half,
-                imgsz=settings.YOLO_IMGSZ,
-            )[0]
+            kwargs = self._runtime_infer_kwargs()
+            imgsz = self._effective_imgsz()
+            try:
+                results = self._model(frame, verbose=False, conf=conf, imgsz=imgsz, **kwargs)[0]
+            except Exception as e:
+                retry_imgsz = self._extract_engine_max_imgsz(e)
+                if retry_imgsz is None or retry_imgsz == imgsz:
+                    raise
+                self._fixed_imgsz_override = retry_imgsz
+                logger.warning(
+                    "YOLOModel: imgsz %s incompatible with engine, retry predict at %s",
+                    imgsz,
+                    retry_imgsz,
+                )
+                results = self._model(frame, verbose=False, conf=conf, imgsz=retry_imgsz, **kwargs)[0]
             return self._parse_boxes(results)
 
     def track(
@@ -204,16 +226,37 @@ class YOLOModel:
             return []
 
         with self._infer_lock:
-            results = self._model.track(
-                frame,
-                verbose=False,
-                conf=conf,
-                tracker=tracker,
-                persist=persist,
-                device=self._device,
-                half=self._use_half,
-                imgsz=settings.YOLO_IMGSZ,
-            )[0]
+            kwargs = self._runtime_infer_kwargs()
+            imgsz = self._effective_imgsz()
+            try:
+                results = self._model.track(
+                    frame,
+                    verbose=False,
+                    conf=conf,
+                    tracker=tracker,
+                    persist=persist,
+                    imgsz=imgsz,
+                    **kwargs,
+                )[0]
+            except Exception as e:
+                retry_imgsz = self._extract_engine_max_imgsz(e)
+                if retry_imgsz is None or retry_imgsz == imgsz:
+                    raise
+                self._fixed_imgsz_override = retry_imgsz
+                logger.warning(
+                    "YOLOModel: imgsz %s incompatible with engine, retry track at %s",
+                    imgsz,
+                    retry_imgsz,
+                )
+                results = self._model.track(
+                    frame,
+                    verbose=False,
+                    conf=conf,
+                    tracker=tracker,
+                    persist=persist,
+                    imgsz=retry_imgsz,
+                    **kwargs,
+                )[0]
             return self._parse_boxes(results)
 
     def reset_tracker(self) -> None:
@@ -222,6 +265,48 @@ class YOLOModel:
             predictor = self._model.predictor
             if predictor is not None and hasattr(predictor, "trackers"):
                 predictor.trackers = []
+
+    def export_engine(
+        self,
+        path: str | Path,
+        *,
+        fp16: bool | None = None,
+        workspace_gb: int | None = None,
+        imgsz: int | None = None,
+    ) -> Path:
+        """
+        Export a .pt model to TensorRT .engine and return output path.
+        """
+        from ultralytics import YOLO
+
+        src = Path(path)
+        if src.suffix.lower() != ".pt":
+            raise ValueError("TensorRT export requires a .pt model file")
+        if not src.exists():
+            raise FileNotFoundError(f"Model not found: {src}")
+
+        if self._device == "cpu":
+            raise RuntimeError("CUDA is required for TensorRT export")
+
+        use_fp16 = bool(getattr(settings, "YOLO_TRT_FP16", True) if fp16 is None else fp16)
+        workspace = int(getattr(settings, "YOLO_TRT_WORKSPACE_GB", 4) if workspace_gb is None else workspace_gb)
+        export_imgsz = int(getattr(settings, "YOLO_IMGSZ", 640) if imgsz is None else imgsz)
+
+        model = YOLO(str(src))
+        export_kwargs = {
+            "format": "engine",
+            "device": 0,
+            "imgsz": export_imgsz,
+            "half": use_fp16,
+        }
+        if workspace > 0:
+            export_kwargs["workspace"] = workspace
+
+        exported = model.export(**export_kwargs)
+        out = Path(str(exported)) if exported else src.with_suffix(".engine")
+        if not out.exists():
+            raise RuntimeError("TensorRT export finished but .engine file not found")
+        return out
 
     # ── Private ───────────────────────────────────────────────────────────────
 
@@ -250,6 +335,78 @@ class YOLOModel:
 
         return detections
 
+    def _runtime_infer_kwargs(self) -> dict:
+        if self._runtime_backend == "tensorrt":
+            # TensorRT runtime already binds execution device/precision.
+            return {}
+        return {"device": self._device, "half": self._use_half}
+
+    def _effective_imgsz(self) -> int:
+        """Preferred inference size; can be overridden when static TensorRT engine requires a fixed size."""
+        if self._fixed_imgsz_override is not None:
+            return int(self._fixed_imgsz_override)
+        return int(getattr(settings, "YOLO_IMGSZ", 640) or 640)
+
+    @staticmethod
+    def _extract_engine_max_imgsz(err: Exception) -> int | None:
+        """
+        Parse TensorRT static-shape mismatch errors like:
+          "input size torch.Size([1, 3, 320, 320]) not equal to max model size (1, 3, 416, 416)"
+        and return 416.
+        """
+        msg = str(err)
+        m = re.search(r"max model size\s*\(\s*1\s*,\s*3\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", msg)
+        if not m:
+            return None
+        h = int(m.group(1))
+        w = int(m.group(2))
+        return h if h == w else max(h, w)
+
+    def _load_with_backend_preference(self, src_path: Path, yolo_cls):
+        """
+        Load model with backend preference:
+          - TensorRT (engine) when requested and CUDA is available
+          - fallback to PyTorch (.pt)
+        """
+        backend_pref = str(getattr(settings, "YOLO_BACKEND", "auto") or "auto").strip().lower()
+        backend_pref = backend_pref if backend_pref in {"auto", "torch", "tensorrt"} else "auto"
+        cuda_enabled = self._device != "cpu"
+
+        want_trt = backend_pref in {"auto", "tensorrt"} and cuda_enabled
+        src = Path(src_path)
+        engine_path = src.with_suffix(".engine")
+
+        if want_trt:
+            if engine_path.exists():
+                try:
+                    return yolo_cls(str(engine_path)), "tensorrt", engine_path
+                except Exception as e:
+                    logger.warning("YOLOModel: load TensorRT sidecar failed (%s). Fallback to torch.", e)
+
+            auto_export = bool(getattr(settings, "YOLO_TRT_AUTO_EXPORT", False))
+            if auto_export and src.suffix.lower() == ".pt":
+                try:
+                    base = yolo_cls(str(src))
+                    export_kwargs = {
+                        "format": "engine",
+                        "device": 0,
+                        "imgsz": int(getattr(settings, "YOLO_IMGSZ", 640) or 640),
+                        "half": bool(getattr(settings, "YOLO_TRT_FP16", True)),
+                    }
+                    workspace = int(getattr(settings, "YOLO_TRT_WORKSPACE_GB", 4) or 4)
+                    if workspace > 0:
+                        export_kwargs["workspace"] = workspace
+                    exported = base.export(**export_kwargs)
+                    out_path = Path(str(exported)) if exported else engine_path
+                    if out_path.exists():
+                        return yolo_cls(str(out_path)), "tensorrt", out_path
+                    logger.warning("YOLOModel: TensorRT export done but engine not found, fallback torch.")
+                except Exception as e:
+                    logger.warning("YOLOModel: TensorRT export failed (%s). Fallback to torch.", e)
+
+        # Default torch path
+        return yolo_cls(str(src)), "torch", src
+
     # ── Properties ────────────────────────────────────────────────────────────
 
     @property
@@ -259,6 +416,18 @@ class YOLOModel:
     @property
     def model_path(self) -> str:
         return self._model_path
+
+    @property
+    def runtime_backend(self) -> str:
+        return self._runtime_backend
+
+    @property
+    def runtime_device(self):
+        return self._device
+
+    @property
+    def runtime_half(self) -> bool:
+        return bool(self._use_half)
 
     @property
     def weights_path(self) -> Path | None:

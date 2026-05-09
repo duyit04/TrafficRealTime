@@ -37,10 +37,21 @@ interface Props {
   columns?: 1 | 2 | 3;
 }
 
-const REFRESH_INTERVAL = 8000; // ms between thumbnail refreshes
+const REFRESH_INTERVAL = 10000; // ms between thumbnail refreshes
+const ACTIVE_TILE_REFRESH_INTERVAL = 30000; // ms for the stream currently in LIVE mode
+const INITIAL_STAGGER_MS = 550; // avoid burst requests when modal opens
 
-async function fetchThumbnail(url: string): Promise<{ ok: boolean; frame: string | null; error: string | null }> {
-  const res = await fetch(`/api/v1/stream/thumbnail?url=${encodeURIComponent(url)}`);
+async function fetchThumbnail(
+  url: string,
+  width: number,
+  fast: boolean,
+): Promise<{ ok: boolean; frame: string | null; error: string | null }> {
+  const qs = new URLSearchParams({
+    url,
+    width: String(width),
+    fast: fast ? 'true' : 'false',
+  });
+  const res = await fetch(`/api/v1/stream/thumbnail?${qs.toString()}`);
   if (!res.ok) return { ok: false, frame: null, error: `HTTP ${res.status}` };
   return res.json();
 }
@@ -62,11 +73,31 @@ export function CameraWall({
     Object.fromEntries(cameras.map((c) => [c.id, { frame: null, loading: true, error: null, lastUpdated: 0 }]))
   );
   const timersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const tileElsRef = useRef<Record<string, HTMLButtonElement | null>>({});
+  const visibleIdsRef = useRef<Set<string>>(new Set());
+  const observerRef = useRef<IntersectionObserver | null>(null);
+  const docVisibleRef = useRef<boolean>(typeof document === 'undefined' ? true : !document.hidden);
 
   const loadTile = useCallback(async (cam: CameraPreset) => {
+    if (!docVisibleRef.current) {
+      timersRef.current[cam.id] = setTimeout(() => void loadTile(cam), REFRESH_INTERVAL);
+      return;
+    }
+    if (!visibleIdsRef.current.has(cam.id)) {
+      // Skip offscreen tiles to avoid unnecessary RTSP opens.
+      timersRef.current[cam.id] = setTimeout(() => void loadTile(cam), REFRESH_INTERVAL);
+      return;
+    }
+    const isLiveTile = streamOn && activeUrl === cam.url;
+    if (isLiveTile) {
+      // Live stream is already decoded/processed elsewhere; keep this tile on slow refresh only.
+      timersRef.current[cam.id] = setTimeout(() => void loadTile(cam), ACTIVE_TILE_REFRESH_INTERVAL);
+      return;
+    }
+
     setTiles((prev) => ({ ...prev, [cam.id]: { ...prev[cam.id], loading: true, error: null } }));
     try {
-      const data = await fetchThumbnail(cam.url);
+      const data = await fetchThumbnail(cam.url, 320, true);
       setTiles((prev) => ({
         ...prev,
         [cam.id]: { frame: data.frame, loading: false, error: data.ok ? null : (data.error ?? 'No frame'), lastUpdated: Date.now() },
@@ -76,14 +107,68 @@ export function CameraWall({
     }
     // Schedule next refresh
     timersRef.current[cam.id] = setTimeout(() => loadTile(cam), REFRESH_INTERVAL);
-  }, []);
+  }, [activeUrl, streamOn]);
 
   useEffect(() => {
-    cameras.forEach((cam) => loadTile(cam));
+    const onVisibility = () => {
+      docVisibleRef.current = !document.hidden;
+      if (docVisibleRef.current) {
+        // Resume visible tiles quickly after tab becomes active again.
+        cameras.forEach((cam) => {
+          if (!visibleIdsRef.current.has(cam.id)) return;
+          const existing = timersRef.current[cam.id];
+          if (existing) clearTimeout(existing);
+          timersRef.current[cam.id] = setTimeout(() => void loadTile(cam), 150);
+        });
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
+  }, [cameras, loadTile]);
+
+  useEffect(() => {
+    observerRef.current?.disconnect();
+    observerRef.current = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          const id = (entry.target as HTMLElement).dataset.camid;
+          if (!id) return;
+          if (entry.isIntersecting) {
+            visibleIdsRef.current.add(id);
+            const cam = cameras.find((c) => c.id === id);
+            if (!cam || !docVisibleRef.current) return;
+            const existing = timersRef.current[id];
+            if (existing) clearTimeout(existing);
+            timersRef.current[id] = setTimeout(() => void loadTile(cam), 100);
+          } else {
+            visibleIdsRef.current.delete(id);
+          }
+        });
+      },
+      { root: null, rootMargin: '120px 0px 120px 0px', threshold: 0.05 },
+    );
+    cameras.forEach((cam) => {
+      const el = tileElsRef.current[cam.id];
+      if (el) observerRef.current?.observe(el);
+    });
+    return () => {
+      observerRef.current?.disconnect();
+      observerRef.current = null;
+      visibleIdsRef.current.clear();
+    };
+  }, [cameras, loadTile]);
+
+  useEffect(() => {
+    Object.values(timersRef.current).forEach(clearTimeout);
+    timersRef.current = {};
+    cameras.forEach((cam, idx) => {
+      const delay = idx * INITIAL_STAGGER_MS;
+      timersRef.current[cam.id] = setTimeout(() => void loadTile(cam), delay);
+    });
     return () => {
       Object.values(timersRef.current).forEach(clearTimeout);
     };
-  }, []);  // eslint-disable-line react-hooks/exhaustive-deps
+  }, [cameras, loadTile]);
 
   return (
     <div className="flex flex-col gap-2">
@@ -106,6 +191,10 @@ export function CameraWall({
             <button
               key={cam.id}
               type="button"
+              ref={(el) => {
+                tileElsRef.current[cam.id] = el;
+              }}
+              data-camid={cam.id}
               onClick={() => onSelect(cam.url)}
               onDoubleClick={() => onConnect(cam.url)}
               title={`${cam.label}\n${cam.url}\nDouble-click to connect`}

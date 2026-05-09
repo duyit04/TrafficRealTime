@@ -45,15 +45,16 @@ class ModelService:
 
     def list_models(self) -> list[ModelInfo]:
         """
-        List all available .pt models.
+        List all available .pt/.engine models.
 
         - Primary location: under MODELS_DIR (supports nested folders, e.g. yolov8/best.pt)
         - Legacy: root of UPLOADS_DIR
         """
         results: list[ModelInfo] = []
 
-        # Any .pt under MODELS_DIR (including yolov8/, yolov3/, yolov26/)
-        for f in settings.MODELS_DIR.glob("**/*.pt"):
+        # Any .pt/.engine under MODELS_DIR (including yolov8/, yolov3/, yolov26/)
+        model_files = list(settings.MODELS_DIR.glob("**/*.pt")) + list(settings.MODELS_DIR.glob("**/*.engine"))
+        for f in model_files:
             try:
                 rel = f.relative_to(settings.MODELS_DIR).as_posix()
             except ValueError:
@@ -67,7 +68,8 @@ class ModelService:
             )
 
         # Legacy: uploads root
-        for f in settings.UPLOADS_DIR.glob("*.pt"):
+        legacy_files = list(settings.UPLOADS_DIR.glob("*.pt")) + list(settings.UPLOADS_DIR.glob("*.engine"))
+        for f in legacy_files:
             results.append(
                 ModelInfo(
                     name=f.name,
@@ -82,6 +84,29 @@ class ModelService:
 
     def resolve(self, name: str) -> Path:
         return self._resolve(name)
+
+    def export_engine(
+        self,
+        name: str,
+        *,
+        fp16: bool | None = None,
+        workspace_gb: int | None = None,
+        imgsz: int | None = None,
+        load_after_export: bool = True,
+    ) -> Path:
+        src = self._resolve(name)
+        if not src.exists():
+            raise FileNotFoundError(f"Model '{name}' not found")
+        engine_path = self._yolo.export_engine(
+            src,
+            fp16=fp16,
+            workspace_gb=workspace_gb,
+            imgsz=imgsz,
+        )
+        logger.info("ModelService: exported TensorRT engine %s", engine_path.name)
+        if load_after_export:
+            self.load(engine_path)
+        return engine_path
 
     # ── Properties ────────────────────────────────────────────────────────────
 
