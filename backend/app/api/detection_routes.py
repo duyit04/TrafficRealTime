@@ -54,7 +54,7 @@ async def get_stats():
     s = stream_service.stats
     s.model_loaded = model_service.is_loaded
     s.model_name = model_service.name
-    s.roi_active = roi_service.active_for("primary")
+    # roi_active: đã gộp mọi slot trong merged_vehicle_stats
     return s
 
 

@@ -115,6 +115,12 @@ class StreamService:
         self._companion_fps: float = 0.0
         self._companion_counting_line_y: int | None = None
 
+        # Extra slots: per-slot tracker + counter (gộp vào GET /stats)
+        self._extra_trackers: dict[int, object] = {}
+        self._extra_counters: dict[int, VehicleCounter] = {}
+        self._extra_counting_line_y: dict[int, int] = {}
+        self._merge_lock = threading.RLock()
+
         # Extra live streams (screens 3/4): each has its own worker + latest payload
         self._extra_threads: dict[int, threading.Thread] = {}
         self._extra_running: dict[int, bool] = {}
@@ -336,6 +342,13 @@ class StreamService:
                 m.reset_tracker()
             except Exception:
                 pass
+        for tr in self._extra_trackers.values():
+            try:
+                tr.reset()
+            except Exception:
+                pass
+        for c in self._extra_counters.values():
+            c.reset()
         self._congestion.reset()
         self._companion_congestion.reset()
         self._stats.total = 0
@@ -384,6 +397,9 @@ class StreamService:
                 yolo_model.reset_tracker()
         if counting_mode is not None:
             self._counter.set_mode(counting_mode)
+            self._companion_counter.set_mode(counting_mode)
+            for c in self._extra_counters.values():
+                c.set_mode(counting_mode)
         self._congestion.update_settings(
             threshold=congestion_threshold,
             duration=congestion_duration,
@@ -510,9 +526,57 @@ class StreamService:
 
     # ── Properties ────────────────────────────────────────────────────────────
 
+    def _merged_total(self) -> int:
+        n = int(self._counter.total) + int(self._companion_counter.total)
+        for c in self._extra_counters.values():
+            n += int(c.total)
+        return n
+
+    @staticmethod
+    def _merge_class_maps(*maps: dict) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for m in maps:
+            if not m:
+                continue
+            for k, v in m.items():
+                key = str(k)
+                out[key] = out.get(key, 0) + int(v)
+        return out
+
+    def merged_vehicle_stats(self) -> VehicleStats:
+        """primary + companion + extra 2/3 — dùng cho API /stats."""
+        with self._merge_lock:
+            base = self._stats.model_copy(deep=True)
+            base.total = self._merged_total()
+            base.count_in = int(self._counter.count_in) + int(self._companion_counter.count_in)
+            base.count_out = int(self._counter.count_out) + int(self._companion_counter.count_out)
+            for c in self._extra_counters.values():
+                base.count_in += int(c.count_in)
+                base.count_out += int(c.count_out)
+            extra_maps = [c.by_class for c in self._extra_counters.values()]
+            base.classes = self._merge_class_maps(self._counter.by_class, self._companion_counter.by_class, *extra_maps)
+            extra_in = [c.by_class_in for c in self._extra_counters.values()]
+            base.classes_in = self._merge_class_maps(
+                self._counter.by_class_in, self._companion_counter.by_class_in, *extra_in
+            )
+            extra_out = [c.by_class_out for c in self._extra_counters.values()]
+            base.classes_out = self._merge_class_maps(
+                self._counter.by_class_out, self._companion_counter.by_class_out, *extra_out
+            )
+            base.counting_mode = self._counter.mode
+            try:
+                base.roi_active = bool(
+                    roi_service.active_for("primary")
+                    or roi_service.active_for("companion")
+                    or any(roi_service.active_for(str(k)) for k in self._extra_counters.keys())
+                )
+            except Exception:
+                base.roi_active = bool(roi_service.active_for("primary"))
+            return base
+
     @property
     def stats(self) -> VehicleStats:
-        return self._stats
+        return self.merged_vehicle_stats()
 
     @property
     def timeline(self) -> list[dict]:
@@ -789,7 +853,8 @@ class StreamService:
                 header = {
                     "v": 1,
                     "detections": [d.model_dump() for d in api_dets],
-                    "stats": self._stats.model_dump(),
+                    # Phải gộp primary + companion + extra — giống GET /stats (WS trước đây chỉ gửi primary).
+                    "stats": self.merged_vehicle_stats().model_dump(),
                 }
                 payload = None
 
@@ -1173,6 +1238,31 @@ class StreamService:
                 dets = []
 
             try:
+                if s not in self._extra_trackers:
+                    self._extra_trackers[s] = get_tracker(self._tracker_type)
+                if s not in self._extra_counters:
+                    ec = VehicleCounter()
+                    ec.set_mode(self._counter.mode)
+                    self._extra_counters[s] = ec
+                tracks = self._extra_trackers[s].update(dets)
+                frame_h = int(fr.shape[0])
+                slot_key = str(int(slot))
+                if roi_service.active_for(slot_key) and len(roi_service.points_for(slot_key)) >= 3:
+                    active_tracks = [
+                        t for t in tracks if roi_service.is_inside(t.cx, t.cy, slot=slot_key)
+                    ]
+                    roi_mid = roi_service.mid_y_for(slot_key)
+                    line_y = float(roi_mid if roi_mid is not None else frame_h * self.line_position)
+                else:
+                    active_tracks = tracks
+                    if self._extra_counting_line_y.get(s) is None:
+                        self._extra_counting_line_y[s] = int(frame_h * self.line_position)
+                    line_y = float(self._extra_counting_line_y[s])
+                self._extra_counters[s].update(active_tracks, line_y)
+            except Exception as xec:
+                logger.debug("extra slot %d VehicleCounter: %s", s, xec)
+
+            try:
                 from app.models.detection_model import Detection, BoundingBox
                 api_dets = [
                     Detection(
@@ -1234,6 +1324,10 @@ class StreamService:
         with self._extra_lock:
             self._extra_latest.pop(int(slot), None)
             self._extra_yolo.pop(int(slot), None)
+        self._extra_trackers.pop(int(slot), None)
+        self._extra_counters.pop(int(slot), None)
+        self._extra_counting_line_y.pop(int(slot), None)
+        logger.info("StreamService: extra slot %d worker exited", int(slot))
 
     def _compute_stopped_in_roi(self, slot_key: str, dets: list) -> tuple[int, int]:
         """
@@ -1295,7 +1389,6 @@ class StreamService:
 
         stopped_cnt = sum(1 for v in hist.values() if int(v.get("streak", 0)) >= min_frames)
         return int(stopped_cnt), int(len(in_roi))
-        logger.info("StreamService: extra slot %d worker exited", int(slot))
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1319,15 +1412,26 @@ class StreamService:
         self._timeline_last = 0
         self._companion_frame_count = 0
         self._companion_fps = 0.0
+        for tr in list(self._extra_trackers.values()):
+            try:
+                tr.reset()
+            except Exception:
+                pass
+        self._extra_trackers.clear()
+        for c in list(self._extra_counters.values()):
+            c.reset()
+        self._extra_counters.clear()
+        self._extra_counting_line_y.clear()
         with self._lock:
             self._latest = None
         with self._companion_lock:
             self._companion_latest = None
 
     def _push_timeline(self) -> None:
-        delta = self._stats.total - self._timeline_last
+        mt = self._merged_total()
+        delta = mt - self._timeline_last
         self._timeline.append({"t": int(time.time()), "v": max(0, delta)})
-        self._timeline_last = self._stats.total
+        self._timeline_last = mt
 
 
 # Singleton

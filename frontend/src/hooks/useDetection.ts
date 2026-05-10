@@ -329,7 +329,8 @@ export function useDetection() {
   const resetCount = useCallback(async () => {
     try {
       await detectionApi.resetStats();
-      setStats((s) => ({ ...s, total: 0, classes: {}, congestion: DEFAULT_STATS.congestion }));
+      const s = await detectionApi.getStats();
+      setStats(s);
     } catch (err) {
       console.error('[useDetection] reset failed:', err);
     }

@@ -1,9 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { trafficLightApi } from '../../services/api';
 import type { TLState } from '../../services/api';
 import { CameraWall } from '../CameraWall/CameraWall';
-
-const PHASE_LABELS = ['N-S', 'E-W'] as const;
 
 export type TrafficLightPanelProps = {
   phaseRoadLabels?: readonly [string, string];
@@ -33,60 +31,68 @@ function useOnEscape(onEscape: () => void, active: boolean) {
   }, [active, onEscape]);
 }
 
+/** Rút từ label đầy đủ → "Camera 6", "Camera 5", … */
+function shortCameraLabel(raw: string, fallbackIndex: number): string {
+  const s = raw.trim();
+  const m = s.match(/\bcamera\s*(\d+)\b/i);
+  if (m) return `Camera ${m[1]}`;
+  if (s.length > 0) return s.length <= 14 ? s : `${s.slice(0, 12)}…`;
+  return `Camera ${fallbackIndex + 1}`;
+}
+
 function TrafficLightVisual({
   phases,
-  activePhase,
-  getPhaseTitle,
   showAdvice,
+  phaseTitles,
 }: {
   phases: TLState['phases'];
-  activePhase: number;
-  getPhaseTitle: (phaseIndex: number) => string;
   showAdvice: boolean;
+  phaseTitles: readonly [string, string];
 }) {
   return (
     <div className="grid grid-cols-2 gap-3">
-      {phases.slice(0, 2).map((p, i) => {
-        const isActive = i === activePhase;
-        const title = getPhaseTitle(i).trim();
+      {phases.slice(0, 2).map((p, idx) => {
         const color = p.color;
+        const titleFull = (phaseTitles[idx] ?? '').trim();
+        const titleShort = shortCameraLabel(titleFull, idx);
+        const q = p.queue_length ?? 0;
+
+        const countdownRaw =
+          color === 'red' ? (p.time_until_green ?? 0) : (p.remaining ?? 0);
+        const countdownSec = Math.max(0, Math.floor(countdownRaw));
+
+        /** Chấm bên cạnh = màu đèn hiện tại (mô phỏng API) */
+        const badgeTone =
+          color === 'red' ? 'bg-red-500' : color === 'yellow' ? 'bg-amber-400' : 'bg-emerald-500';
+
+        /**
+         * Bật gợi ý: vẫn dùng đếm ngược thật (giảm dần ~250ms) nhưng tô màu theo vai trò —
+         * đang đỏ → xanh (tới lượt xanh); đang xanh/vàng → đỏ (còn lại của pha / tới đỏ).
+         */
+        const adviceNumCls =
+          color === 'red' ? 'text-emerald-400' : 'text-red-400';
 
         return (
-          <div
-            key={i}
-            className={`rounded-xl border bg-white px-3 py-3 shadow-sm ${
-              isActive ? 'border-accent/40 ring-1 ring-accent/15' : 'border-slate-200'
-            }`}
-          >
-            {title ? (
-              <div className="text-[11px] font-bold text-slate-800 leading-snug line-clamp-2" title={title}>
-                {title}
-              </div>
-            ) : null}
-            <div className={`text-[9px] text-slate-400 ${title ? 'mt-0.5' : 'mt-0'}`}>
-              Camera {i + 1} · {PHASE_LABELS[i]}
+          <div key={idx} className="rounded-xl border border-slate-200 bg-white px-2 py-3 shadow-sm">
+            <div
+              className="text-[11px] font-bold text-slate-800 text-center leading-none min-h-[1.25rem] px-0.5"
+              title={titleFull || titleShort}
+            >
+              {titleShort}
             </div>
-            {showAdvice ? (
-              <div className="mt-1 space-y-0.5 text-[10px] text-slate-600 tabular-nums">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="font-semibold">
-                    Gợi ý xanh: {(p.green_time ?? 30).toFixed(0)}s
-                  </span>
-                  <span className="text-slate-500">Dừng ROI: {p.queue_length ?? 0}</span>
-                </div>
-                {p.color === 'green' ? (
-                  <div className="text-slate-500">
-                    Gợi ý khối đỏ tiếp: {(p.red_time_hint ?? 0).toFixed(0)}s
-                  </div>
-                ) : null}
-              </div>
-            ) : (
-              <div className="h-2" />
-            )}
 
-            <div className="mt-3 flex justify-center">
-              <div className="bg-slate-900 rounded-2xl p-2.5 shadow-lg border border-slate-800">
-                <div className="flex flex-col gap-2.5">
+            <div className="mt-2 flex items-center justify-center gap-3">
+              <span
+                className={`h-5 w-5 shrink-0 rounded-full shadow-sm ring-2 ring-white ${badgeTone}`}
+                title={
+                  color === 'red' ? 'Đang đỏ' : color === 'yellow' ? 'Đang vàng' : 'Đang xanh'
+                }
+                aria-hidden
+              />
+              <div className="relative bg-slate-900 rounded-2xl p-2.5 shadow-lg border border-slate-800">
+                <div
+                  className={`flex flex-col gap-2.5 ${showAdvice ? 'opacity-[0.32]' : 'opacity-100'}`}
+                >
                   {(['red', 'yellow', 'green'] as const).map((c) => {
                     const on = color === c;
                     const base =
@@ -106,13 +112,20 @@ function TrafficLightVisual({
                     );
                   })}
                 </div>
+                <div className="pointer-events-none absolute inset-0 flex items-center justify-center rounded-2xl">
+                  <span
+                    className={`font-black tabular-nums text-[28px] leading-none drop-shadow-[0_2px_10px_rgba(0,0,0,0.95)] ${
+                      showAdvice ? adviceNumCls : 'text-white'
+                    }`}
+                  >
+                    {countdownSec}
+                  </span>
+                </div>
               </div>
             </div>
 
             <div className="mt-2 text-center text-[10px] font-semibold text-slate-600 tabular-nums">
-              {p.color === 'red'
-                ? `Đỏ: ${(p.time_until_green ?? 0).toFixed(0)}s`
-                : `${p.color === 'green' ? 'Xanh' : 'Vàng'}: ${(p.remaining ?? 0).toFixed(0)}s`}
+              Dừng ROI: {q}
             </div>
           </div>
         );
@@ -226,32 +239,30 @@ function RtspAssignModalBody({
   );
 }
 
-export function TrafficLightPanel({ phaseRoadLabels, activeUrls, cameraOptions, selectedUrls, onSelectUrl }: TrafficLightPanelProps = {}) {
+export function TrafficLightPanel({
+  phaseRoadLabels,
+  activeUrls,
+  cameraOptions,
+  selectedUrls,
+  onSelectUrl,
+}: TrafficLightPanelProps = {}) {
   const [state, setState] = useState<TLState | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval>>();
   const [adviceEnabled, setAdviceEnabled] = useState(false);
 
-  const selectedTitleFor = useCallback(
-    (i: 0 | 1): string => {
+  const phaseTitles = useMemo((): [string, string] => {
+    const labelFor = (i: 0 | 1): string => {
       const url = selectedUrls?.[i]?.trim() ?? '';
-      if (!url) return '';
+      if (!url) return (phaseRoadLabels?.[i] ?? '').trim();
       const opt = cameraOptions?.find((c) => c.url === url);
-      return (opt?.label ?? url).trim();
-    },
-    [cameraOptions, selectedUrls],
-  );
+      const fromOpt = (opt?.label ?? '').trim();
+      if (fromOpt) return fromOpt;
+      return (phaseRoadLabels?.[i] ?? '').trim() || url;
+    };
+    return [labelFor(0), labelFor(1)];
+  }, [selectedUrls, cameraOptions, phaseRoadLabels]);
 
-  const getPhaseTitle = useCallback(
-    (i: number) => {
-      const idx = (i & 1) as 0 | 1;
-      const t = selectedTitleFor(idx);
-      if (t) return t;
-      return phaseRoadLabels?.[idx]?.trim() ?? '';
-    },
-    [phaseRoadLabels, selectedTitleFor],
-  );
-
-  // Poll state
+  // Poll ~4×/s để đếm ngược trong đèn mượt hơn (backend tick ~250ms).
   useEffect(() => {
     const poll = async () => {
       try {
@@ -263,7 +274,7 @@ export function TrafficLightPanel({ phaseRoadLabels, activeUrls, cameraOptions, 
       }
     };
     poll();
-    pollRef.current = setInterval(poll, 1000);
+    pollRef.current = setInterval(poll, 250);
     return () => clearInterval(pollRef.current);
   }, []);
 
@@ -369,7 +380,11 @@ export function TrafficLightPanel({ phaseRoadLabels, activeUrls, cameraOptions, 
 
       {state ? (
         <div className={!anyRtspSelected ? 'opacity-50 pointer-events-none' : ''}>
-          <TrafficLightVisual phases={state.phases} activePhase={state.active_phase} getPhaseTitle={getPhaseTitle} showAdvice={adviceEnabled} />
+          <TrafficLightVisual
+            phases={state.phases}
+            showAdvice={adviceEnabled}
+            phaseTitles={phaseTitles}
+          />
         </div>
       ) : null}
     </div>

@@ -853,7 +853,7 @@ export function Dashboard() {
             />
 
             <div className="flex items-center justify-between">
-              <h2 className="text-xs font-bold uppercase tracking-wider text-slate-500">Thong Ke</h2>
+              <h2 className="text-xs font-bold uppercase tracking-wider text-slate-500">Thống kê</h2>
               <span className={`w-2 h-2 rounded-full ${streamOn ? 'bg-accent animate-pulse' : 'bg-slate-300'}`} />
             </div>
             <CounterPanel

@@ -114,7 +114,7 @@ class Settings(BaseSettings):
     TLC_STOPPED_GREEN_COEFF: float = 2.5
     # Joint two-ROI advice: baseline when queues empty (replaces TLC_MIN_GREEN for the formula base)
     TLC_ADVICE_DEFAULT_SECONDS: float = 30.0
-    # Seconds added per stopped vehicle in the *other* approach's ROI (cross demand)
+    # Subtract from coupled green G per stopped vehicle on the approach holding ROW (density on green side ⇒ red block shrinks).
     TLC_ADVICE_CROSS_QUEUE_COEFF: float = 1.5
     # After all-red: if the scheduled green phase has no queue/approaching but the other does, serve the other first
     TLC_ACTUATED_PREFER_DEMAND_PHASE: bool = True
