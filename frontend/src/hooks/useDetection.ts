@@ -8,7 +8,7 @@
  * The hook exposes `wsConnected` and `usingFallback` so the UI can show connection status.
  */
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { detectionApi, streamApi, getWebSocketUrl } from '../services/api';
 import { useWebSocket } from './useWebSocket';
 import type { Detection, FramePayload, VehicleStats, Settings } from '../types/detection';
@@ -47,6 +47,19 @@ const DEFAULT_STATS: VehicleStats = {
 const WS_URL = getWebSocketUrl('/ws/stream');
 const WS_COMPANION_URL = getWebSocketUrl('/ws/companion');
 const DETECTION_HOLD_MS = 120; // giữ rất ngắn để hạn chế cảm giác box "đuổi theo" vật thể
+
+/** FPS / frame / infer từ API có thể là phiên backend trước — không hiển thị khi tab chưa bật stream. */
+function zeroLiveThroughput(stats: VehicleStats): VehicleStats {
+  return {
+    ...stats,
+    fps: 0,
+    fps_capture: 0,
+    fps_inference: 0,
+    fps_sent: 0,
+    frame_count: 0,
+    avg_inference_ms: 0,
+  };
+}
 
 export function useDetection() {
   const [currentFrame, setCurrentFrame] = useState<string | Blob | null>(null);
@@ -346,11 +359,16 @@ export function useDetection() {
     []
   );
 
+  const statsForUi = useMemo(
+    () => (streamActive ? stats : zeroLiveThroughput(stats)),
+    [streamActive, stats],
+  );
+
   return {
     // State
     currentFrame,
     detections,
-    stats,
+    stats: statsForUi,
     companionFrame,
     companionDetections,
     companionFps,

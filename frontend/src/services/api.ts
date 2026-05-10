@@ -64,6 +64,34 @@ export const modelApi = {
     apiFetch<SuccessResponse>(`/models/${encodeURIComponent(name)}`, {
       method: 'DELETE',
     }),
+
+  /** Bắt đầu export .pt → TensorRT .engine (chạy nền trên server). */
+  exportEngine: (body: {
+    name: string;
+    fp16?: boolean | null;
+    workspace_gb?: number | null;
+    imgsz?: number | null;
+    load_after_export?: boolean;
+  }) =>
+    apiFetch<SuccessResponse>('/models/export-engine', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  getExportEngineStatus: () =>
+    apiFetch<{
+      running: boolean;
+      done: boolean;
+      ok: boolean;
+      error: string | null;
+      model: string | null;
+      engine: string | null;
+      started_at: number | null;
+      ended_at: number | null;
+      /** 0–100, ước lượng từ backend trong lúc build */
+      progress?: number;
+      progress_message?: string | null;
+    }>('/models/export-engine/status'),
 };
 
 // ── Stream ────────────────────────────────────────────────────────────────────

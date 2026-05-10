@@ -6,6 +6,7 @@
 
 import { useRef, useState, useEffect, useCallback, type MouseEvent } from 'react';
 import { drawRoi } from '../../utils/canvas';
+import { IconPencil, IconCheck, IconUndo, IconTrash } from '../icons/Icons';
 
 export type RoiPoint = { x: number; y: number };
 
@@ -97,33 +98,41 @@ export function RoiDrawer({ onApply, onClear, active, points: controlledPoints, 
       <div className="flex gap-2 flex-wrap">
         <button
           onClick={() => setIsDrawing(!isDrawing)}
-          className={`px-3 py-1.5 text-xs font-semibold rounded-lg border transition-all ${
+          className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border transition-all ${
             isDrawing
               ? 'bg-accent text-white border-accent'
               : 'bg-white text-slate-600 border-slate-200 hover:border-accent hover:text-accent'
           }`}
         >
-          {isDrawing ? '✓ Done' : '✏ Draw'}
+          {isDrawing ? (
+            <>
+              <IconCheck className="h-3.5 w-3.5 shrink-0" aria-hidden /> Done
+            </>
+          ) : (
+            <>
+              <IconPencil className="h-3.5 w-3.5 shrink-0" aria-hidden /> Draw
+            </>
+          )}
         </button>
         <button
           onClick={undo}
           disabled={points.length === 0}
-          className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-slate-200 text-slate-600 hover:border-accent hover:text-accent transition-all disabled:opacity-30"
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-slate-200 text-slate-600 hover:border-accent hover:text-accent transition-all disabled:opacity-30"
         >
-          ↩ Undo
+          <IconUndo className="h-3.5 w-3.5 shrink-0" aria-hidden /> Undo
         </button>
         <button
           onClick={clear}
-          className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-slate-200 text-slate-600 hover:border-danger hover:text-danger transition-all"
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-slate-200 text-slate-600 hover:border-danger hover:text-danger transition-all"
         >
-          🗑 Clear
+          <IconTrash className="h-3.5 w-3.5 shrink-0" aria-hidden /> Clear
         </button>
         <button
           onClick={apply}
           disabled={points.length < 3}
-          className="px-3 py-1.5 text-xs font-bold rounded-lg bg-accent text-white border border-accent transition-all hover:bg-blue-700 disabled:opacity-30"
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold rounded-lg bg-accent text-white border border-accent transition-all hover:bg-blue-700 disabled:opacity-30"
         >
-          ✓ Apply ROI
+          <IconCheck className="h-3.5 w-3.5 shrink-0" aria-hidden /> Apply ROI
         </button>
       </div>
 

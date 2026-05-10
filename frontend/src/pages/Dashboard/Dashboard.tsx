@@ -4,6 +4,7 @@
  */
 
 import { useState, useEffect, useCallback, useMemo, useRef, type ReactNode } from 'react';
+import { IconAlertJam, IconCameraCctv, IconRoiFrame, IconTune } from '../../components/icons/Icons';
 import { useDetection } from '../../hooks/useDetection';
 import { VideoPlayer, H264LivePlayer } from '../../components/VideoPlayer';
 import { RoiDrawer, RoiCanvasOverlay } from '../../components/RoiDrawer';
@@ -45,7 +46,7 @@ let toastId = 0;
 export function Dashboard() {
   const {
     currentFrame, detections, stats, wsConnected, usingFallback,
-    companionFrame, companionDetections, companionFps, companionLinePosition,
+    companionFrame, companionDetections, companionLinePosition,
     extraLive,
     startStream, startCompanion, stopCompanion, stopStream, reloadStats, setRoi, clearRoi, setRoiSlot, clearRoiSlot, resetCount, updateSettings,
   } = useDetection();
@@ -293,17 +294,17 @@ export function Dashboard() {
       try {
         // Start companion without restarting primary stream.
         await startCompanion(picked);
-        addToast('Camera 2 đã bật LIVE', 'success');
+        addToast('Đã kết nối luồng Camera 2', 'success');
       } catch {
-        addToast('Đã gán Camera 2 nhưng không bật được LIVE.', 'error');
+        addToast('Đã gán Camera 2 nhưng không kết nối được luồng.', 'error');
       }
     } else if ((idx === 1 || idx === 2) && picked) {
       const slot = idx + 1; // idx 1=>slot2 (màn3), idx 2=>slot3 (màn4)
       try {
         await streamApi.startExtra(slot, picked);
-        addToast(`Camera ${idx + 2} đã bật LIVE`, 'success');
+        addToast(`Đã kết nối luồng Camera ${idx + 2}`, 'success');
       } catch {
-        addToast(`Không bật được LIVE cho Camera ${idx + 2}`, 'error');
+        addToast(`Không kết nối được luồng Camera ${idx + 2}`, 'error');
       }
     } else {
       addToast(`Đã gán Camera ${idx + 2}`, 'info');
@@ -543,6 +544,35 @@ export function Dashboard() {
           <span className="hidden lg:inline text-slate-500 tabular-nums" title="Average YOLO inference time (ms)">
             Infer: {stats.avg_inference_ms.toFixed(1)}ms
           </span>
+          {congestion && congestion.is_congested && (
+            <>
+              <span className="shrink-0">·</span>
+              <div
+                className={`
+                  shrink-0 flex items-center gap-1.5 px-2.5 py-1 rounded-lg border shadow-md
+                  text-[11px] font-bold max-w-[min(18rem,calc(100vw-14rem))] sm:max-w-[min(22rem,calc(100vw-16rem))]
+                  animate-bounce
+                  ${congestion.level === 'critical'
+                    ? 'bg-red-600 text-white border-red-400 shadow-red-500/30'
+                    : 'bg-amber-500 text-white border-amber-300 shadow-amber-500/30'}
+                `}
+                title={
+                  congestion.level === 'critical'
+                    ? `Kẹt xe nghiêm trọng: ${congestion.vehicle_count} xe trong ${congestion.duration_seconds.toFixed(0)}s`
+                    : `Mật độ cao: ${congestion.vehicle_count} xe trong ${congestion.duration_seconds.toFixed(0)}s`
+                }
+              >
+                <span className="shrink-0" aria-hidden>
+                  {congestion.level === 'critical' ? '🚨' : '⚠️'}
+                </span>
+                <span className="truncate">
+                  {congestion.level === 'critical' ? 'KẸT XE NGHIÊM TRỌNG' : 'MẬT ĐỘ CAO'}
+                  {' — '}
+                  {congestion.vehicle_count} xe / {congestion.duration_seconds.toFixed(0)}s
+                </span>
+              </div>
+            </>
+          )}
           {streamOn && (
             <>
               <span>·</span>
@@ -677,25 +707,6 @@ export function Dashboard() {
                     active={roiBySlot.primary.active}
                     canvasRefExternal={roiCanvasPrimaryRef}
                   />
-
-                  {congestion && congestion.is_congested && (
-                    <div className={`
-                      fixed bottom-6 left-1/2 -translate-x-1/2 z-50
-                      flex items-center gap-2 px-5 py-2.5 rounded-full
-                      shadow-2xl border backdrop-blur-sm
-                      text-sm font-bold pointer-events-none select-none
-                      animate-bounce
-                      ${congestion.level === 'critical'
-                        ? 'bg-red-600/95 border-red-400 text-white'
-                        : 'bg-amber-500/95 border-amber-300 text-white'}
-                    `}>
-                      <span>{congestion.level === 'critical' ? '🚨' : '⚠️'}</span>
-                      <span>
-                        {congestion.level === 'critical' ? 'KẸT XE NGHIÊM TRỌNG' : 'MẬT ĐỘ CAO'}
-                        {' — '}{congestion.vehicle_count} xe / {congestion.duration_seconds.toFixed(0)}s
-                      </span>
-                    </div>
-                  )}
                 </div>
               </div>
 
@@ -762,9 +773,6 @@ export function Dashboard() {
                         active={roiBySlot.companion.active}
                         canvasRefExternal={roiCanvasCompanionRef}
                       />
-                      <div className="mt-1 flex items-center gap-2">
-                        <TbBadge color="text-emerald-700" label={`LIVE: ${companionFps.toFixed(1)} FPS`} />
-                      </div>
                     </div>
                       );
                     }
@@ -816,9 +824,6 @@ export function Dashboard() {
                         active={(extraSlot === 2 ? roiBySlot['2'] : roiBySlot['3']).active}
                         canvasRefExternal={extraSlot === 2 ? roiCanvasExtra2Ref : roiCanvasExtra3Ref}
                       />
-                      <div className="mt-1 flex items-center gap-2">
-                        <TbBadge color="text-emerald-700" label={`LIVE: ${(live.fps ?? 0).toFixed(1)} FPS`} />
-                      </div>
                     </div>
                       );
                     }
@@ -869,29 +874,29 @@ export function Dashboard() {
                 <button
                   type="button"
                   onClick={() => setCameraOpen(true)}
-                  className="h-10 w-full inline-flex items-center justify-center rounded-lg border border-slate-200 bg-white hover:bg-slate-50 transition-colors"
+                  className="h-10 w-full inline-flex items-center justify-center rounded-lg border border-slate-200 bg-white hover:bg-slate-50 transition-colors text-slate-500 hover:text-accent"
                   title="Camera / Stream"
                   aria-label="Camera / Stream"
                 >
-                  <span className="text-base">📡</span>
+                  <IconCameraCctv className="h-[1.125rem] w-[1.125rem]" aria-hidden />
                 </button>
                 <button
                   type="button"
                   onClick={() => setRoiOpen(true)}
-                  className="h-10 w-full inline-flex items-center justify-center rounded-lg border border-slate-200 bg-white hover:bg-slate-50 transition-colors"
+                  className="h-10 w-full inline-flex items-center justify-center rounded-lg border border-slate-200 bg-white hover:bg-slate-50 transition-colors text-slate-500 hover:text-accent"
                   title="ROI"
                   aria-label="ROI"
                 >
-                  <span className="text-base">🎯</span>
+                  <IconRoiFrame className="h-[1.125rem] w-[1.125rem]" aria-hidden />
                 </button>
                 <button
                   type="button"
                   onClick={() => setSettingsOpen(true)}
-                  className="h-10 w-full inline-flex items-center justify-center rounded-lg border border-slate-200 bg-white hover:bg-slate-50 transition-colors shadow-sm"
+                  className="h-10 w-full inline-flex items-center justify-center rounded-lg border border-slate-200 bg-white hover:bg-slate-50 transition-colors shadow-sm text-slate-500 hover:text-accent"
                   title="Cài đặt"
                   aria-label="Cài đặt"
                 >
-                  <span className="text-base">⚙️</span>
+                  <IconTune className="h-[1.125rem] w-[1.125rem]" aria-hidden />
                 </button>
               </div>
             </div>
@@ -920,7 +925,10 @@ export function Dashboard() {
             <div className="w-[min(38rem,calc(100vw-2rem))] max-h-[min(80vh,42rem)] rounded-2xl border border-slate-200 bg-white shadow-2xl overflow-hidden flex flex-col">
               <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-slate-100">
                 <div className="min-w-0">
-                  <div className="text-sm font-extrabold text-slate-800 truncate">🎯 ROI</div>
+                  <div className="flex items-center gap-2 min-w-0">
+                    <IconRoiFrame className="h-5 w-5 shrink-0 text-accent" aria-hidden />
+                    <span className="text-sm font-extrabold text-slate-800 truncate">ROI</span>
+                  </div>
                   <div className="text-[11px] text-slate-500 truncate">Vẽ vùng quan tâm trên khung video để lọc/đếm.</div>
                 </div>
                 <button
@@ -987,7 +995,10 @@ export function Dashboard() {
             <div className="w-[min(48rem,calc(100vw-2rem))] max-h-[min(85vh,48rem)] rounded-2xl border border-slate-200 bg-white shadow-2xl overflow-hidden flex flex-col">
               <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-slate-100">
                 <div className="min-w-0">
-                  <div className="text-sm font-extrabold text-slate-800 truncate">📡 Camera / Stream</div>
+                  <div className="flex items-center gap-2 min-w-0">
+                    <IconCameraCctv className="h-5 w-5 shrink-0 text-accent" aria-hidden />
+                    <span className="text-sm font-extrabold text-slate-800 truncate">Camera / Stream</span>
+                  </div>
                   {assignExtraIndex != null ? (
                     <div className="text-[11px] text-slate-500 truncate">
                       Đang chọn cho <span className="font-semibold text-slate-700">Camera {assignExtraIndex + 2}</span> — double-click để gán camera.
@@ -1116,7 +1127,10 @@ export function Dashboard() {
             <div className="w-[min(42rem,calc(100vw-2rem))] max-h-[min(80vh,42rem)] rounded-2xl border border-slate-200 bg-white shadow-2xl overflow-hidden flex flex-col">
               <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-slate-100">
                 <div className="min-w-0">
-                  <div className="text-sm font-extrabold text-slate-800 truncate">⚙️ Cài đặt</div>
+                  <div className="flex items-center gap-2 min-w-0">
+                    <IconTune className="h-5 w-5 shrink-0 text-accent" aria-hidden />
+                    <span className="text-sm font-extrabold text-slate-800 truncate">Cài đặt</span>
+                  </div>
                   <div className="text-[11px] text-slate-500 truncate">Chỉnh thông số nhận diện, đếm xe và cảnh báo kẹt xe.</div>
                 </div>
                 <button
@@ -1136,6 +1150,7 @@ export function Dashboard() {
                     onModelsChange={reloadModels}
                     onToast={addToast}
                     onReloadStats={reloadStats}
+                    cudaAvailable={deviceInfo.cuda_available}
                   />
                 </div>
 
@@ -1227,7 +1242,9 @@ export function Dashboard() {
                 <div className="mt-4 rounded-xl border border-slate-200 bg-white p-3">
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-[11px] font-bold text-slate-600 uppercase tracking-wide">Cảnh báo kẹt xe</span>
-                    <span className="text-[10px] text-slate-400">🚨</span>
+                    <span title="Cảnh báo mật độ / kẹt xe" className="inline-flex shrink-0 text-amber-500">
+                      <IconAlertJam className="h-4 w-4" aria-hidden />
+                    </span>
                   </div>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <SliderField
@@ -1329,14 +1346,6 @@ function SliderField({ label, value, min, max, step, display, onChange }: {
         style={{ accentColor: '#2563eb' }}
       />
     </div>
-  );
-}
-
-function TbBadge({ label, color = 'text-slate-500' }: { label: string; color?: string }) {
-  return (
-    <span className={`px-3 py-1 rounded-full text-[11px] font-semibold bg-slate-100 border border-slate-200 ${color}`}>
-      {label}
-    </span>
   );
 }
 

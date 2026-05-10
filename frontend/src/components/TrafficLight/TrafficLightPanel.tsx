@@ -59,15 +59,22 @@ function TrafficLightVisual({
 
         const countdownRaw =
           color === 'red' ? (p.time_until_green ?? 0) : (p.remaining ?? 0);
-        const countdownSec = Math.max(0, Math.floor(countdownRaw));
+        const countdownSec = showAdvice
+          ? Math.max(0, Math.floor(countdownRaw))
+          : 0;
 
-        /** Chấm bên cạnh = màu đèn hiện tại (mô phỏng API) */
-        const badgeTone =
-          color === 'red' ? 'bg-red-500' : color === 'yellow' ? 'bg-amber-400' : 'bg-emerald-500';
+        /** Chấm bên cạnh: chỉ báo phase khi bật gợi ý; tắt gợi ý → xám (không nhảy theo đỏ/vàng/xanh). */
+        const badgeTone = showAdvice
+          ? color === 'red'
+            ? 'bg-red-500'
+            : color === 'yellow'
+              ? 'bg-amber-400'
+              : 'bg-emerald-500'
+          : 'bg-slate-400';
 
         /**
-         * Bật gợi ý: vẫn dùng đếm ngược thật (giảm dần ~250ms) nhưng tô màu theo vai trò —
-         * đang đỏ → xanh (tới lượt xanh); đang xanh/vàng → đỏ (còn lại của pha / tới đỏ).
+         * Tắt gợi ý: cả ba bóng sáng full (đỏ/vàng/xanh), không đếm ngược.
+         * Bật gợi ý: một bóng theo phase + đếm ngược ~250ms, số màu theo vai trò pha đỏ↔xanh.
          */
         const adviceNumCls =
           color === 'red' ? 'text-emerald-400' : 'text-red-400';
@@ -85,7 +92,13 @@ function TrafficLightVisual({
               <span
                 className={`h-5 w-5 shrink-0 rounded-full shadow-sm ring-2 ring-white ${badgeTone}`}
                 title={
-                  color === 'red' ? 'Đang đỏ' : color === 'yellow' ? 'Đang vàng' : 'Đang xanh'
+                  showAdvice
+                    ? color === 'red'
+                      ? 'Đang đỏ'
+                      : color === 'yellow'
+                        ? 'Đang vàng'
+                        : 'Đang xanh'
+                    : 'Tắt gợi ý — không chỉ báo phase'
                 }
                 aria-hidden
               />
@@ -94,7 +107,7 @@ function TrafficLightVisual({
                   className={`flex flex-col gap-2.5 ${showAdvice ? 'opacity-[0.32]' : 'opacity-100'}`}
                 >
                   {(['red', 'yellow', 'green'] as const).map((c) => {
-                    const on = color === c;
+                    const on = showAdvice ? color === c : true;
                     const base =
                       c === 'red'
                         ? 'bg-red-500 border-red-300 shadow-[0_0_16px_rgba(239,68,68,0.55)]'
@@ -112,15 +125,15 @@ function TrafficLightVisual({
                     );
                   })}
                 </div>
-                <div className="pointer-events-none absolute inset-0 flex items-center justify-center rounded-2xl">
-                  <span
-                    className={`font-black tabular-nums text-[28px] leading-none drop-shadow-[0_2px_10px_rgba(0,0,0,0.95)] ${
-                      showAdvice ? adviceNumCls : 'text-white'
-                    }`}
-                  >
-                    {countdownSec}
-                  </span>
-                </div>
+                {showAdvice ? (
+                  <div className="pointer-events-none absolute inset-0 flex items-center justify-center rounded-2xl">
+                    <span
+                      className={`font-black tabular-nums text-[28px] leading-none drop-shadow-[0_2px_10px_rgba(0,0,0,0.95)] ${adviceNumCls}`}
+                    >
+                      {countdownSec}
+                    </span>
+                  </div>
+                ) : null}
               </div>
             </div>
 

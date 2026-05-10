@@ -3,6 +3,7 @@ Model routes – upload, list, load, delete YOLO .pt/.engine files.
 """
 
 from __future__ import annotations
+import math
 import threading
 import time
 from fastapi import APIRouter, UploadFile, File, HTTPException
@@ -25,6 +26,9 @@ _engine_job: dict = {
     "engine": None,
     "started_at": None,
     "ended_at": None,
+    # 0–100: ước lượng trong lúc Ultralytics/TensorRT build (blocking); kết thúc ép 100
+    "progress": 0,
+    "progress_message": "",
 }
 
 
@@ -80,6 +84,7 @@ async def export_engine(body: ModelExportEngineRequest):
     with _engine_job_lock:
         if _engine_job.get("running"):
             raise HTTPException(status_code=409, detail="An engine export is already running")
+        now = time.time()
         _engine_job.update(
             {
                 "running": True,
@@ -88,12 +93,31 @@ async def export_engine(body: ModelExportEngineRequest):
                 "error": None,
                 "model": body.name,
                 "engine": None,
-                "started_at": time.time(),
+                "started_at": now,
                 "ended_at": None,
+                "progress": 2,
+                "progress_message": "Đang chuẩn bị export TensorRT…",
             }
         )
 
+    stop_progress = threading.Event()
+
+    def _progress_loop():
+        """Tiến độ ước lượng (export là một call blocking — không có hook % thực)."""
+        started = time.time()
+        while not stop_progress.wait(timeout=1.25):
+            with _engine_job_lock:
+                if not _engine_job.get("running"):
+                    return
+                elapsed = time.time() - started
+                # Tiệm cận ~93% sau ~2–3 phút; không đạt 100 cho tới khi export xong
+                p = 3 + 93 * (1 - math.exp(-elapsed / 55.0))
+                _engine_job["progress"] = min(96, int(round(p)))
+                _engine_job["progress_message"] = "Đang build TensorRT engine (có thể vài phút)…"
+
     def _job():
+        prog_thread = threading.Thread(target=_progress_loop, daemon=True)
+        prog_thread.start()
         try:
             out = model_service.export_engine(
                 body.name,
@@ -102,6 +126,8 @@ async def export_engine(body: ModelExportEngineRequest):
                 imgsz=body.imgsz,
                 load_after_export=body.load_after_export,
             )
+            stop_progress.set()
+            prog_thread.join(timeout=2)
             with _engine_job_lock:
                 _engine_job.update(
                     {
@@ -111,9 +137,13 @@ async def export_engine(body: ModelExportEngineRequest):
                         "error": None,
                         "engine": str(out),
                         "ended_at": time.time(),
+                        "progress": 100,
+                        "progress_message": "Export hoàn thành",
                     }
                 )
         except Exception as exc:
+            stop_progress.set()
+            prog_thread.join(timeout=2)
             with _engine_job_lock:
                 _engine_job.update(
                     {
@@ -122,6 +152,7 @@ async def export_engine(body: ModelExportEngineRequest):
                         "ok": False,
                         "error": str(exc),
                         "ended_at": time.time(),
+                        "progress_message": "Export thất bại",
                     }
                 )
 
