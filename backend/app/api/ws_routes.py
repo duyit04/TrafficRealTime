@@ -173,8 +173,8 @@ async def websocket_companion(ws: WebSocket) -> None:
 @router.websocket("/ws/stream-h264")
 async def websocket_stream_h264(ws: WebSocket) -> None:
     """
-    WebSocket endpoint for MPEG-TS(H264) low-CPU live stream.
-    Byte chunks are pushed by FFmpeg relay service.
+    WebSocket endpoint for MPEG-TS(H264) live stream.
+    Byte chunks are produced from the OpenCV/YOLO frame path (BGR burn-in + NVENC).
     """
     mgr = ws_h264_manager
     await mgr.connect(ws)

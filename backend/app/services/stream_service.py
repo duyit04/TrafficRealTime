@@ -29,12 +29,14 @@ from app.ml.congestion_monitor import CongestionMonitor
 
 # ── Service Layer ─────────────────────────────────────────────────────────────
 from app.services.roi_service import roi_service
-from app.services.ffmpeg_relay_service import (
-    ffmpeg_relay_service,
-    ffmpeg_relay_companion_service,
-    ffmpeg_relay_extra2_service,
-    ffmpeg_relay_extra3_service,
+from app.services.ffmpeg_h264_bgr_pipe_service import (
+    h264_bgr_primary,
+    h264_bgr_companion,
+    h264_bgr_extra2,
+    h264_bgr_extra3,
 )
+from app.utils.frame_overlay import overlay_traffic_ui
+from app.utils.image_utils import resize_bgr_max_width
 from app.utils.video_utils import is_youtube_url, resolve_youtube_url, validate_youtube_url
 from app.api.ws_routes import ws_manager, ws_companion_manager, pack_frame_message
 
@@ -171,17 +173,13 @@ class StreamService:
             daemon=True,
         )
         self._companion_thread.start()
-        try:
-            ffmpeg_relay_companion_service.start(self._companion_url)
-        except Exception as re:
-            logger.debug("FFmpeg companion relay start skipped: %s", re)
         logger.info("StreamService: companion started (no restart) → %s", self._companion_url[:80])
 
     def stop_companion(self) -> None:
         """Stop companion stream without stopping primary."""
         self._companion_running = False
         try:
-            ffmpeg_relay_companion_service.stop()
+            h264_bgr_companion.stop()
         except Exception:
             pass
         if self._companion_thread:
@@ -206,21 +204,14 @@ class StreamService:
         t = threading.Thread(target=self._extra_worker, args=(s, u), daemon=True)
         self._extra_threads[s] = t
         t.start()
-        try:
-            if s == 2:
-                ffmpeg_relay_extra2_service.start(u)
-            elif s == 3:
-                ffmpeg_relay_extra3_service.start(u)
-        except Exception as re:
-            logger.debug("FFmpeg extra relay start skipped(slot=%s): %s", s, re)
 
     def stop_extra(self, slot: int) -> None:
         s = int(slot)
         try:
             if s == 2:
-                ffmpeg_relay_extra2_service.stop()
+                h264_bgr_extra2.stop()
             elif s == 3:
-                ffmpeg_relay_extra3_service.stop()
+                h264_bgr_extra3.stop()
         except Exception:
             pass
         with self._extra_lock:
@@ -261,18 +252,9 @@ class StreamService:
                     daemon=True,
                 )
                 self._companion_thread.start()
-                try:
-                    ffmpeg_relay_companion_service.start(self._companion_url)
-                except Exception as re:
-                    logger.debug("FFmpeg companion relay start skipped: %s", re)
                 logger.info("StreamService: companion TLC lane → %s", self._companion_url[:80])
             self._thread = threading.Thread(target=self._worker, args=(effective_url,), daemon=True)
             self._thread.start()
-            # Start low-CPU H264 relay path in parallel (frontend can opt-in).
-            try:
-                ffmpeg_relay_service.start(effective_url)
-            except Exception as re:
-                logger.debug("FFmpeg relay start skipped: %s", re)
             logger.info("StreamService: worker started")
         except Exception as e:
             self._last_error = str(e)
@@ -284,19 +266,19 @@ class StreamService:
         self._running = False
         self._companion_running = False
         try:
-            ffmpeg_relay_service.stop()
+            h264_bgr_primary.stop()
         except Exception:
             pass
         try:
-            ffmpeg_relay_companion_service.stop()
+            h264_bgr_companion.stop()
         except Exception:
             pass
         try:
-            ffmpeg_relay_extra2_service.stop()
+            h264_bgr_extra2.stop()
         except Exception:
             pass
         try:
-            ffmpeg_relay_extra3_service.stop()
+            h264_bgr_extra3.stop()
         except Exception:
             pass
         # Stop extra streams
@@ -473,53 +455,131 @@ class StreamService:
             return False
 
     @staticmethod
-    def _rtsp_ffmpeg_options() -> str:
+    def _use_rtsp_cuda_decode() -> bool:
+        """
+        CUDA FFmpeg decode for OpenCV RTSP (JPEG + detection pipeline).
+        RTSP_HWACCEL: request GPU decode when CUDA is available (still false on CPU-only torch).
+        If RTSP_HWACCEL is False, RTSP_HWACCEL_AUTO enables the same when torch.cuda.is_available().
+        """
+        try:
+            import torch
+
+            cuda_ok = bool(torch.cuda.is_available())
+        except Exception:
+            cuda_ok = False
+        if bool(getattr(settings, "RTSP_HWACCEL", False)):
+            return cuda_ok
+        if not bool(getattr(settings, "RTSP_HWACCEL_AUTO", True)):
+            return False
+        return cuda_ok
+
+    @classmethod
+    def _rtsp_ffmpeg_options_base(cls) -> str:
+        return "rtsp_transport;tcp|buffer_size;4096000|max_delay;500000|stimeout;5000000"
+
+    @classmethod
+    def _rtsp_ffmpeg_options(cls) -> str:
         """
         Build FFmpeg capture options for OpenCV.
-        Enable CUDA hwaccel optionally to move decode load from CPU to GPU when supported.
+        When CUDA decode is enabled: hwaccel cuda + device + extra_hw_frames (more work on GPU, less CPU).
         """
-        base = "rtsp_transport;tcp|buffer_size;4096000|max_delay;500000|stimeout;5000000"
-        if bool(getattr(settings, "RTSP_HWACCEL", False)):
-            return base + "|hwaccel;cuda|hwaccel_output_format;cuda"
-        return base
+        base = cls._rtsp_ffmpeg_options_base()
+        if not cls._use_rtsp_cuda_decode():
+            return base
+        dev = max(0, int(getattr(settings, "RTSP_CUDA_DEVICE", 0) or 0))
+        try:
+            extra = int(getattr(settings, "RTSP_CUDA_EXTRA_FRAMES", 16) or 0)
+        except (TypeError, ValueError):
+            extra = 16
+        extra = max(0, min(extra, 64))
+        opts = base + f"|hwaccel;cuda|hwaccel_device;{dev}|hwaccel_output_format;cuda"
+        if extra > 0:
+            opts += f"|extra_hw_frames;{extra}"
+        return opts
+
+    @classmethod
+    def _rtsp_ffmpeg_options_d3d11(cls) -> str:
+        return cls._rtsp_ffmpeg_options_base() + "|hwaccel;d3d11va"
+
+    @classmethod
+    def warm_rtsp_ffmpeg_env(cls) -> None:
+        """Set OPENCV_FFMPEG_CAPTURE_OPTIONS once at startup (before any capture thread)."""
+        import os
+
+        opts = cls._rtsp_ffmpeg_options()
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = opts
+        if cls._use_rtsp_cuda_decode():
+            logger.info(
+                "RTSP: CUDA decode hints active (torch CUDA; see RTSP_CUDA_DEVICE / RTSP_CUDA_EXTRA_FRAMES). "
+                "If open/read fails, set RTSP_HWACCEL=false and RTSP_HWACCEL_AUTO=false."
+            )
+        else:
+            logger.info(
+                "RTSP: software decode (no torch CUDA, or RTSP_HWACCEL/RTSP_HWACCEL_AUTO disabled)."
+            )
 
     def _open_video_capture(self, url: str, *, is_rtsp: bool) -> cv2.VideoCapture:
         """
-        Open capture with best-effort HW decode and CPU fallback.
+        Open capture with best-effort HW decode (CUDA then D3D11 on Windows) and CPU fallback.
         """
         if not is_rtsp:
             return cv2.VideoCapture(url)
 
         import os
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self._rtsp_ffmpeg_options()
+        import sys
 
-        if bool(getattr(settings, "RTSP_HWACCEL", False)):
-            cap_prop_hw_accel = getattr(cv2, "CAP_PROP_HW_ACCELERATION", None)
-            cap_prop_hw_device = getattr(cv2, "CAP_PROP_HW_DEVICE", None)
-            video_accel_any = getattr(cv2, "VIDEO_ACCELERATION_ANY", None)
+        base = self._rtsp_ffmpeg_options_base()
+
+        cap_prop_hw_accel = getattr(cv2, "CAP_PROP_HW_ACCELERATION", None)
+        cap_prop_hw_device = getattr(cv2, "CAP_PROP_HW_DEVICE", None)
+        video_accel_any = getattr(cv2, "VIDEO_ACCELERATION_ANY", None)
+        video_accel_d3d11 = getattr(cv2, "VIDEO_ACCELERATION_D3D11", None)
+
+        def _try_hw_video_capture(hw_flag: int, label: str) -> cv2.VideoCapture | None:
             if (
-                cap_prop_hw_accel is not None
-                and cap_prop_hw_device is not None
-                and video_accel_any is not None
+                cap_prop_hw_accel is None
+                or cap_prop_hw_device is None
+                or hw_flag is None
             ):
-                try:
-                    cap = cv2.VideoCapture(
-                        url,
-                        cv2.CAP_FFMPEG,
-                        [
-                            int(cap_prop_hw_accel),
-                            int(video_accel_any),
-                            int(cap_prop_hw_device),
-                            0,
-                        ],
-                    )
-                    if cap.isOpened():
-                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                        return cap
-                    cap.release()
-                except Exception:
-                    pass
+                return None
+            try:
+                cap = cv2.VideoCapture(
+                    url,
+                    cv2.CAP_FFMPEG,
+                    [
+                        int(cap_prop_hw_accel),
+                        int(hw_flag),
+                        int(cap_prop_hw_device),
+                        0,
+                    ],
+                )
+                if cap.isOpened():
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    logger.debug("VideoCapture opened with %s hw acceleration", label)
+                    return cap
+                cap.release()
+            except Exception as e:
+                logger.debug("VideoCapture %s hw failed: %s", label, e)
+            return None
 
+        if self._use_rtsp_cuda_decode() and video_accel_any is not None:
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self._rtsp_ffmpeg_options()
+            cap = _try_hw_video_capture(int(video_accel_any), "CUDA/ANY")
+            if cap is not None:
+                return cap
+
+        if (
+            sys.platform == "win32"
+            and bool(getattr(settings, "RTSP_D3D11_FALLBACK", True))
+            and video_accel_d3d11 is not None
+        ):
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self._rtsp_ffmpeg_options_d3d11()
+            cap = _try_hw_video_capture(int(video_accel_d3d11), "D3D11")
+            if cap is not None:
+                logger.info("RTSP: using D3D11VA hardware decode (CUDA capture path unavailable or failed).")
+                return cap
+
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = base
         cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return cap
@@ -715,9 +775,11 @@ class StreamService:
                 try:
                     max_w = int(self.max_width or 0)
                     if max_w > 0 and frame is not None and frame.shape[1] > max_w:
-                        h, w = frame.shape[:2]
-                        new_h = max(1, int(h * (max_w / float(w))))
-                        frame = cv2.resize(frame, (max_w, new_h), interpolation=cv2.INTER_AREA)
+                        frame = resize_bgr_max_width(
+                            frame,
+                            max_w,
+                            use_cuda=bool(getattr(settings, "STREAM_CUDA_RESIZE", False)),
+                        )
                 except Exception:
                     pass
 
@@ -839,6 +901,18 @@ class StreamService:
                     tls.update_lane_observation("primary", stopped_cnt, total_cnt)
                 except Exception:
                     pass
+
+                # 5.2 H264 WebSocket — cùng khung + box (burn-in) rồi NVENC
+                try:
+                    vis_h264 = overlay_traffic_ui(
+                        frame,
+                        [d.model_dump() for d in api_dets],
+                        line_y_px=int(line_y),
+                        show_line=True,
+                    )
+                    h264_bgr_primary.write_frame(vis_h264, fps=max(1, int(self.max_fps)))
+                except Exception as he:
+                    logger.debug("H264 BGR primary skipped: %s", he)
 
                 # 6. Encode frame only when there is an active consumer.
                 primary_http_active = self._is_http_poll_active(self._http_primary_last_poll_ts)
@@ -1017,9 +1091,11 @@ class StreamService:
                 try:
                     max_w = int(self.max_width or 0)
                     if max_w > 0 and fr is not None and fr.shape[1] > max_w:
-                        h, w = fr.shape[:2]
-                        new_h = max(1, int(h * (max_w / float(w))))
-                        fr = cv2.resize(fr, (max_w, new_h), interpolation=cv2.INTER_AREA)
+                        fr = resize_bgr_max_width(
+                            fr,
+                            max_w,
+                            use_cuda=bool(getattr(settings, "STREAM_CUDA_RESIZE", False)),
+                        )
                 except Exception:
                     pass
 
@@ -1111,6 +1187,17 @@ class StreamService:
                         tls.update_lane_observation("companion", stopped_cnt, total_cnt)
                     except Exception:
                         pass
+                    try:
+                        vis_h264 = overlay_traffic_ui(
+                            fr,
+                            [d.model_dump() for d in api_dets],
+                            line_y_px=int(companion_line_y),
+                            show_line=True,
+                        )
+                        c_fps = max(1, int(getattr(settings, "COMPANION_MAX_FPS", 12)))
+                        h264_bgr_companion.write_frame(vis_h264, fps=c_fps)
+                    except Exception as he:
+                        logger.debug("H264 BGR companion skipped: %s", he)
                     companion_http_active = self._is_http_poll_active(self._http_companion_last_poll_ts)
                     companion_ws_active = bool(ws_companion_manager.has_clients)
                     need_jpeg = companion_http_active or companion_ws_active
@@ -1215,6 +1302,17 @@ class StreamService:
                 if ret2 and fresh is not None:
                     fr = fresh
 
+            try:
+                max_w = int(self.max_width or 0)
+                if max_w > 0 and fr is not None and fr.shape[1] > max_w:
+                    fr = resize_bgr_max_width(
+                        fr,
+                        max_w,
+                        use_cuda=bool(getattr(settings, "STREAM_CUDA_RESIZE", False)),
+                    )
+            except Exception:
+                pass
+
             fps_cnt += 1
             elapsed = time.time() - t0
             fps_val = 0.0
@@ -1280,6 +1378,17 @@ class StreamService:
                     tls.update_lane_observation(str(int(slot)), stopped_cnt, total_cnt)
                 except Exception:
                     pass
+                try:
+                    vis_h264 = overlay_traffic_ui(
+                        fr,
+                        [d.model_dump() for d in api_dets],
+                        line_y_px=int(line_y),
+                        show_line=False,
+                    )
+                    xf = max(1, int(getattr(settings, "EXTRA_MAX_FPS", 12)))
+                    (h264_bgr_extra2 if s == 2 else h264_bgr_extra3).write_frame(vis_h264, fps=xf)
+                except Exception as he:
+                    logger.debug("H264 BGR extra slot %d skipped: %s", s, he)
                 extra_http_active = self._is_http_poll_active(self._http_extra_last_poll_ts.get(int(slot), 0.0))
                 extra_ws_active = bool(ws_manager.has_clients)
                 need_jpeg = extra_http_active or extra_ws_active

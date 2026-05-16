@@ -675,19 +675,7 @@ export function Dashboard() {
                 ) : null}
                 <div className="relative overflow-hidden flex-1 min-h-0">
                   {h264Mode && streamOn && !h264FailedSlots.primary ? (
-                    <>
-                      <H264LivePlayer enabled={true} onError={() => markH264Failed('primary')} />
-                      <div className="absolute inset-0 z-20 pointer-events-none">
-                        <VideoPlayer
-                          frame={currentFrame}
-                          detections={detections}
-                          stats={statsForView}
-                          showLine={countingEnabled}
-                          overlayOnly={true}
-                          showLiveBadge={false}
-                        />
-                      </div>
-                    </>
+                    <H264LivePlayer enabled={true} onError={() => markH264Failed('primary')} />
                   ) : (
                     <VideoPlayer
                       frame={currentFrame}
@@ -741,19 +729,7 @@ export function Dashboard() {
                       return (
                     <div className="relative overflow-hidden flex-1 min-h-0">
                       {h264Mode && streamOn && !h264FailedSlots.companion ? (
-                        <>
-                          <H264LivePlayer enabled={true} wsPath="/ws/stream-h264/companion" onError={() => markH264Failed('companion')} />
-                          <div className="absolute inset-0 z-20 pointer-events-none">
-                            <VideoPlayer
-                              frame={companionFrame}
-                              detections={companionDetections}
-                              stats={companionStatsForView}
-                              showLine={countingEnabled}
-                              overlayOnly={true}
-                              showLiveBadge={false}
-                            />
-                          </div>
-                        </>
+                        <H264LivePlayer enabled={true} wsPath="/ws/stream-h264/companion" onError={() => markH264Failed('companion')} />
                       ) : (
                         <VideoPlayer
                           frame={companionFrame}
@@ -780,23 +756,11 @@ export function Dashboard() {
                       return (
                     <div className="relative overflow-hidden flex-1 min-h-0">
                       {h264Mode && streamOn && !(extraSlot === 2 ? h264FailedSlots.extra2 : h264FailedSlots.extra3) ? (
-                        <>
-                          <H264LivePlayer
-                            enabled={true}
-                            wsPath={extraSlot === 2 ? '/ws/stream-h264/extra2' : '/ws/stream-h264/extra3'}
-                            onError={() => markH264Failed(extraSlot === 2 ? 'extra2' : 'extra3')}
-                          />
-                          <div className="absolute inset-0 z-20 pointer-events-none">
-                            <VideoPlayer
-                              frame={live.frame}
-                              detections={live.dets}
-                              stats={statsForView}
-                              showLine={false}
-                              overlayOnly={true}
-                              showLiveBadge={false}
-                            />
-                          </div>
-                        </>
+                        <H264LivePlayer
+                          enabled={true}
+                          wsPath={extraSlot === 2 ? '/ws/stream-h264/extra2' : '/ws/stream-h264/extra3'}
+                          onError={() => markH264Failed(extraSlot === 2 ? 'extra2' : 'extra3')}
+                        />
                       ) : (
                         <VideoPlayer
                           frame={live.frame}

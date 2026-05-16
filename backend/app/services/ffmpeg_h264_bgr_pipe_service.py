@@ -1,0 +1,346 @@
+"""
+H264 MPEG-TS over WebSocket from BGR frames (same pipeline as OpenCV/YOLO).
+
+BGR (CPU RAM) -> FFmpeg [optional hwupload_cuda] -> h264_nvenc (GPU) -> MPEG-TS bytes.
+Boxes are drawn on the frame before encode so video matches detections.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import threading
+import time
+from collections import deque
+from typing import Optional
+
+import numpy as np
+
+from app.core.config import settings
+from app.core.logger import logger
+from app.api.ws_routes import get_h264_manager
+
+
+def _resolve_ffmpeg_bin() -> str:
+    ffmpeg_bin = os.environ.get("FFMPEG_BIN", "").strip()
+    if not ffmpeg_bin:
+        ffmpeg_bin = shutil.which("ffmpeg") or ""
+    if not ffmpeg_bin:
+        user = os.environ.get("USERNAME", "")
+        candidate = os.path.join(
+            "C:\\Users",
+            user,
+            "AppData",
+            "Local",
+            "Microsoft",
+            "WinGet",
+            "Links",
+            "ffmpeg.exe",
+        )
+        if os.path.exists(candidate):
+            ffmpeg_bin = candidate
+    return ffmpeg_bin
+
+
+def _nvenc_output_args() -> list[str]:
+    gpu = (os.environ.get("H264_FFMPEG_GPU") or "").strip() or str(max(0, int(getattr(settings, "H264_FFMPEG_GPU", 0))))
+    try:
+        surfaces = int(os.environ.get("H264_NVENC_SURFACES") or getattr(settings, "H264_NVENC_SURFACES", 32))
+    except ValueError:
+        surfaces = int(getattr(settings, "H264_NVENC_SURFACES", 32))
+    surfaces = max(0, min(surfaces, 64))
+    return [
+        "-an",
+        "-c:v",
+        "h264_nvenc",
+        "-gpu",
+        gpu,
+        "-surfaces",
+        str(surfaces),
+        "-preset",
+        "p1",
+        "-tune",
+        "ull",
+        "-rc",
+        "vbr",
+        "-b:v",
+        "2500k",
+        "-maxrate",
+        "3500k",
+        "-bufsize",
+        "2500k",
+        "-g",
+        "30",
+        "-rc-lookahead",
+        "0",
+        "-delay",
+        "0",
+        "-zerolatency",
+        "1",
+        "-b_ref_mode",
+        "0",
+        "-multipass",
+        "0",
+        "-f",
+        "mpegts",
+        "pipe:1",
+    ]
+
+
+def _build_cmd(ffmpeg_bin: str, w: int, h: int, fps: int) -> list[str]:
+    fps = max(1, min(int(fps), 120))
+    gpu_raw = (os.environ.get("H264_FFMPEG_GPU") or "").strip() or str(max(0, int(getattr(settings, "H264_FFMPEG_GPU", 0))))
+    try:
+        gi = int(gpu_raw)
+    except ValueError:
+        gi = 0
+    gi = max(0, gi)
+
+    cmd: list[str] = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-video_size",
+        f"{w}x{h}",
+        "-framerate",
+        str(fps),
+        "-thread_queue_size",
+        "512",
+        "-i",
+        "pipe:0",
+    ]
+    if bool(getattr(settings, "H264_CUDA_PIPE_UPLOAD", True)):
+        cmd += ["-vf", f"hwupload_cuda=device={gi}"]
+    cmd.extend(_nvenc_output_args())
+    return cmd
+
+
+class H264BgrMpegTsPipe:
+    """
+    stdin raw BGR24 frames -> h264_nvenc -> stdout MPEG-TS.
+    stdin.write is outside the mutex so the stdout reader thread never deadlocks.
+    """
+
+    def __init__(self, slot: str = "primary") -> None:
+        self._slot = (slot or "primary").strip().lower()
+        self._proc: Optional[subprocess.Popen] = None
+        self._reader_t: Optional[threading.Thread] = None
+        self._stderr_t: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+        self._dims: Optional[tuple[int, int, int]] = None
+        self._bytes_sent = 0
+        self._started_at = 0.0
+        self._last_error: str | None = None
+        self._stderr_tail: deque[str] = deque(maxlen=12)
+
+    def stop(self) -> None:
+        with self._lock:
+            proc = self._proc
+            self._proc = None
+            self._dims = None
+        if proc is not None:
+            try:
+                if proc.stdin:
+                    try:
+                        proc.stdin.close()
+                    except Exception:
+                        pass
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        if self._reader_t:
+            self._reader_t.join(timeout=2)
+            self._reader_t = None
+        if self._stderr_t:
+            self._stderr_t.join(timeout=1.5)
+            self._stderr_t = None
+
+    def status(self) -> dict:
+        with self._lock:
+            running = bool(self._proc is not None and self._proc.poll() is None)
+            elapsed = max(0.001, time.time() - self._started_at) if self._started_at else 0.0
+            throughput_kbps = (self._bytes_sent * 8.0 / elapsed / 1000.0) if elapsed > 0 else 0.0
+            return {
+                "running": running,
+                "url_set": bool(self._dims),
+                "bytes_sent": int(self._bytes_sent),
+                "throughput_kbps": round(float(throughput_kbps), 1),
+                "last_error": self._last_error,
+                "pipeline": "opencv_bgr_nvenc",
+                "cuda_pipe_upload": bool(getattr(settings, "H264_CUDA_PIPE_UPLOAD", True)),
+            }
+
+    def _drain_stderr(self, stream) -> None:
+        try:
+            while True:
+                line = stream.readline()
+                if not line:
+                    break
+                msg = line.decode("utf-8", errors="ignore").strip()
+                if not msg:
+                    continue
+                with self._lock:
+                    self._stderr_tail.append(msg)
+                    self._last_error = msg
+        except Exception:
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    def _reader_loop(self, proc: subprocess.Popen) -> None:
+        try:
+            if proc.stdout is None:
+                return
+            while True:
+                chunk = proc.stdout.read(188 * 7)
+                if not chunk:
+                    if proc.poll() is not None:
+                        break
+                    continue
+                with self._lock:
+                    if self._proc is not proc:
+                        break
+                    self._bytes_sent += len(chunk)
+                try:
+                    get_h264_manager(self._slot).broadcast_bytes_threadsafe(chunk)
+                except Exception:
+                    pass
+        except Exception as e:
+            with self._lock:
+                self._last_error = str(e)
+            logger.debug("H264BgrPipe reader: %s", e)
+
+    def _shutdown_proc(self, proc: subprocess.Popen) -> None:
+        try:
+            if proc.stdin:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _spawn(self, w: int, h: int, fps: int) -> bool:
+        ffmpeg_bin = _resolve_ffmpeg_bin()
+        if not ffmpeg_bin:
+            with self._lock:
+                self._last_error = "ffmpeg not found (set FFMPEG_BIN or add ffmpeg to PATH)"
+            return False
+
+        cmd = _build_cmd(ffmpeg_bin, w, h, fps)
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+        except Exception as e:
+            with self._lock:
+                self._last_error = f"spawn ffmpeg failed: {e}"
+            logger.warning("H264BgrPipe: spawn failed: %s", e)
+            return False
+
+        if proc.stdin is None or proc.stdout is None:
+            with self._lock:
+                self._last_error = "ffmpeg stdio unavailable"
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return False
+
+        with self._lock:
+            self._proc = proc
+            self._dims = (w, h, fps)
+            self._started_at = time.time()
+            self._bytes_sent = 0
+            self._last_error = None
+
+        if proc.stderr is not None:
+            self._stderr_t = threading.Thread(target=self._drain_stderr, args=(proc.stderr,), daemon=True)
+            self._stderr_t.start()
+
+        self._reader_t = threading.Thread(target=self._reader_loop, args=(proc,), daemon=True)
+        self._reader_t.start()
+        logger.info("H264BgrPipe(%s): started %dx%d @ %dfps", self._slot, w, h, fps)
+        return True
+
+    def _restart_if_needed(self, w: int, h: int, fps: int) -> subprocess.Popen | None:
+        """Return live proc for (w,h,fps); restart encoder under lock when dimensions or process invalid."""
+        with self._lock:
+            if (
+                self._proc is not None
+                and self._dims == (w, h, fps)
+                and self._proc.poll() is None
+            ):
+                return self._proc
+            old = self._proc
+            self._proc = None
+            self._dims = None
+
+        if old is not None:
+            self._shutdown_proc(old)
+            if self._reader_t:
+                self._reader_t.join(timeout=2)
+                self._reader_t = None
+            if self._stderr_t:
+                self._stderr_t.join(timeout=1.5)
+                self._stderr_t = None
+
+        if not self._spawn(w, h, fps):
+            return None
+        with self._lock:
+            return self._proc
+
+    def write_frame(self, bgr: np.ndarray, *, fps: int) -> None:
+        if bgr.ndim != 3 or bgr.shape[2] != 3:
+            return
+        h0, w0 = int(bgr.shape[0]), int(bgr.shape[1])
+        w = w0 - (w0 % 2)
+        h = h0 - (h0 % 2)
+        if w < 32 or h < 32:
+            return
+        if w != w0 or h != h0:
+            bgr = np.ascontiguousarray(bgr[:h, :w])
+        else:
+            bgr = np.ascontiguousarray(bgr)
+
+        proc = self._restart_if_needed(w, h, fps)
+        if proc is None or proc.stdin is None:
+            return
+        try:
+            proc.stdin.write(bgr.tobytes())
+        except (BrokenPipeError, OSError) as e:
+            with self._lock:
+                self._last_error = str(e)
+            self._shutdown_proc(proc)
+            with self._lock:
+                if self._proc is proc:
+                    self._proc = None
+                    self._dims = None
+
+
+h264_bgr_primary = H264BgrMpegTsPipe("primary")
+h264_bgr_companion = H264BgrMpegTsPipe("companion")
+h264_bgr_extra2 = H264BgrMpegTsPipe("extra2")
+h264_bgr_extra3 = H264BgrMpegTsPipe("extra3")

@@ -16,7 +16,7 @@ from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 
 from app.models.detection_model import StreamStartRequest, SuccessResponse, CompanionFramePayload
-from app.services.stream_service import stream_service
+from app.services.stream_service import StreamService, stream_service
 from app.services.ffmpeg_relay_service import (
     ffmpeg_relay_service,
     ffmpeg_relay_companion_service,
@@ -140,6 +140,13 @@ async def stream_runtime():
         "stream_tuning": {
             "yolo_device": str(getattr(settings, "YOLO_DEVICE", "auto")),
             "rtsp_hwaccel": bool(getattr(settings, "RTSP_HWACCEL", False)),
+            "rtsp_hwaccel_auto": bool(getattr(settings, "RTSP_HWACCEL_AUTO", True)),
+            "rtsp_cuda_decode_wanted": bool(StreamService._use_rtsp_cuda_decode()),
+            "rtsp_cuda_device": int(getattr(settings, "RTSP_CUDA_DEVICE", 0)),
+            "rtsp_cuda_extra_frames": int(getattr(settings, "RTSP_CUDA_EXTRA_FRAMES", 16)),
+            "rtsp_d3d11_fallback": bool(getattr(settings, "RTSP_D3D11_FALLBACK", True)),
+            "stream_cuda_resize": bool(getattr(settings, "STREAM_CUDA_RESIZE", False)),
+            "h264_cuda_pipe_upload": bool(getattr(settings, "H264_CUDA_PIPE_UPLOAD", True)),
             "yolo_imgsz": int(getattr(settings, "YOLO_IMGSZ", 640)),
             # Effective runtime knobs (can diverge from .env after PATCH /settings).
             "inference_skip_frames": int(getattr(stream_service, "skip_frames", getattr(settings, "INFERENCE_SKIP_FRAMES", 0))),
@@ -172,7 +179,7 @@ async def stream_streams():
 async def stream_h264_status(
     slot: Annotated[str, Query(description="H264 relay slot: primary|companion|extra2|extra3")] = "primary",
 ):
-    """Status of FFmpeg NVENC relay (MPEG-TS over WebSocket) per slot."""
+    """Status of H264 NVENC pipe (BGR burn-in + MPEG-TS over WebSocket) per slot."""
     s = (slot or "primary").strip().lower()
     if s in {"primary", "1", "main"}:
         return ffmpeg_relay_service.status()

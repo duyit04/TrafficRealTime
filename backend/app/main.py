@@ -19,12 +19,43 @@ from app.services.stream_service import stream_service
 from app.ml.tracker import get_tracker
 
 
+def _log_gpu_startup_profile() -> None:
+    """One-shot log: torch CUDA + effective stream/YOLO GPU flags from settings."""
+    try:
+        import torch
+
+        cuda_ok = bool(torch.cuda.is_available())
+        name = torch.cuda.get_device_name(0) if cuda_ok else None
+    except Exception:
+        cuda_ok = False
+        name = None
+    try:
+        from app.services.stream_service import StreamService
+
+        rtsp_cuda_decode = bool(StreamService._use_rtsp_cuda_decode())
+    except Exception:
+        rtsp_cuda_decode = False
+    logger.info(
+        "GPU profile: torch.cuda=%s device=%s | YOLO_DEVICE=%s RTSP_hw_decode=%s "
+        "STREAM_CUDA_RESIZE=%s H264_CUDA_PIPE_UPLOAD=%s",
+        cuda_ok,
+        name or "n/a",
+        str(getattr(settings, "YOLO_DEVICE", "?")),
+        rtsp_cuda_decode,
+        bool(getattr(settings, "STREAM_CUDA_RESIZE", False)),
+        bool(getattr(settings, "H264_CUDA_PIPE_UPLOAD", False)),
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("═══ Traffic Monitor API starting on :%d ═══", settings.PORT)
+    _log_gpu_startup_profile()
 
     # Store the running event loop so StreamService worker thread can broadcast via WebSocket
     stream_service.set_event_loop(asyncio.get_event_loop())
+    # RTSP: set FFmpeg capture options early so primary/companion/extra threads share GPU decode hints.
+    stream_service.warm_rtsp_ffmpeg_env()
     logger.info("Docs: http://localhost:%d/docs", settings.PORT)
 
     # Validate tracker type at startup

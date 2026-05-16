@@ -32,9 +32,8 @@ class Settings(BaseSettings):
     MAX_FPS: int = 30
     TRACKER_TYPE: str = "bytetrack"  # bytetrack | botsort
 
-    # YOLO: auto uses GPU if PyTorch is built with CUDA and a GPU is visible; otherwise CPU.
-    # Set to "cpu" to force CPU, or "cuda" / "0" to prefer GPU (logs a warning and falls back if CUDA missing).
-    YOLO_DEVICE: str = "auto"
+    # YOLO: prefer GPU (cuda:0). Falls back to CPU with a log line if CUDA is unavailable.
+    YOLO_DEVICE: str = "cuda"
     # Runtime backend preference: auto | torch | tensorrt.
     # - auto: use TensorRT engine if available on CUDA, otherwise PyTorch.
     # - torch: force PyTorch runtime.
@@ -70,8 +69,24 @@ class Settings(BaseSettings):
     INFERENCE_SKIP_FRAMES: int = 0
     # RTSP buffer flush: grab this many extra frames before retrieve() to get freshest frame.
     RTSP_FLUSH_FRAMES: int = 2
-    # Try FFmpeg hardware decode on CUDA for RTSP (reduces CPU decode load on supported setups).
-    RTSP_HWACCEL: bool = False
+    # RTSP: FFmpeg CUDA decode hints for OpenCV (JPEG + YOLO + H264 source). Gated on torch.cuda when RTSP_HWACCEL=True.
+    RTSP_HWACCEL: bool = True
+    # When RTSP_HWACCEL is False: enable CUDA RTSP decode only if torch.cuda.is_available().
+    RTSP_HWACCEL_AUTO: bool = True
+    # FFmpeg hwaccel_device index (CUDA) for OpenCV RTSP — same GPU as typical single-GPU setups.
+    RTSP_CUDA_DEVICE: int = 0
+    # Extra hardware decode surfaces (0–64). Higher can smooth GPU decode under load; 0 omits the option.
+    RTSP_CUDA_EXTRA_FRAMES: int = 16
+    # Windows: if CUDA hw capture fails, try D3D11VA (GPU) with matching FFmpeg options.
+    RTSP_D3D11_FALLBACK: bool = True
+
+    # Prefer cv2.cuda.resize when STREAM_MAX_WIDTH applies (falls back to CPU if OpenCV has no CUDA devices).
+    STREAM_CUDA_RESIZE: bool = True
+    # BGR pipe -> NVENC: FFmpeg hwupload_cuda before encoder (BGR stays in RAM; upload+encode on GPU on supported builds).
+    H264_CUDA_PIPE_UPLOAD: bool = True
+    # NVENC GPU index and surface count (.env: H264_FFMPEG_GPU, H264_NVENC_SURFACES)
+    H264_FFMPEG_GPU: int = 0
+    H264_NVENC_SURFACES: int = 32
 
     # ── YOLO inference size ────────────────────────────────────────────────────
     # Input image size for YOLO inference. Valid values: 320, 416, 480, 640.
