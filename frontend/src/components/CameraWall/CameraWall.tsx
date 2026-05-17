@@ -37,9 +37,9 @@ interface Props {
   columns?: 1 | 2 | 3;
 }
 
-const REFRESH_INTERVAL = 10000; // ms between thumbnail refreshes
-const ACTIVE_TILE_REFRESH_INTERVAL = 30000; // ms for the stream currently in LIVE mode
-const INITIAL_STAGGER_MS = 550; // avoid burst requests when modal opens
+const REFRESH_INTERVAL = 18000; // ms between thumbnail refreshes (less RTSP churn)
+const ACTIVE_TILE_REFRESH_INTERVAL = 45000; // ms for the stream currently in LIVE mode
+const VISIBLE_STAGGER_MS = 450; // delay between visible tiles when modal opens
 
 async function fetchThumbnail(
   url: string,
@@ -75,8 +75,11 @@ export function CameraWall({
   const timersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const tileElsRef = useRef<Record<string, HTMLButtonElement | null>>({});
   const visibleIdsRef = useRef<Set<string>>(new Set());
+  const visibleLoadSeqRef = useRef(0);
   const observerRef = useRef<IntersectionObserver | null>(null);
   const docVisibleRef = useRef<boolean>(typeof document === 'undefined' ? true : !document.hidden);
+  const tilesRef = useRef(tiles);
+  tilesRef.current = tiles;
 
   const loadTile = useCallback(async (cam: CameraPreset) => {
     if (!docVisibleRef.current) {
@@ -95,9 +98,14 @@ export function CameraWall({
       return;
     }
 
-    setTiles((prev) => ({ ...prev, [cam.id]: { ...prev[cam.id], loading: true, error: null } }));
+    const hadFrame = Boolean(tilesRef.current[cam.id]?.frame);
+    setTiles((prev) => ({
+      ...prev,
+      [cam.id]: { ...prev[cam.id], loading: !hadFrame, error: null },
+    }));
     try {
-      const data = await fetchThumbnail(cam.url, 320, true);
+      // First load: more HEVC warmup on server; later refreshes use fast=true
+      const data = await fetchThumbnail(cam.url, 320, hadFrame);
       setTiles((prev) => ({
         ...prev,
         [cam.id]: { frame: data.frame, loading: false, error: data.ok ? null : (data.error ?? 'No frame'), lastUpdated: Date.now() },
@@ -139,9 +147,13 @@ export function CameraWall({
             if (!cam || !docVisibleRef.current) return;
             const existing = timersRef.current[id];
             if (existing) clearTimeout(existing);
-            timersRef.current[id] = setTimeout(() => void loadTile(cam), 100);
+            const seq = visibleLoadSeqRef.current++;
+            timersRef.current[id] = setTimeout(() => void loadTile(cam), 120 + seq * VISIBLE_STAGGER_MS);
           } else {
             visibleIdsRef.current.delete(id);
+            const existing = timersRef.current[id];
+            if (existing) clearTimeout(existing);
+            delete timersRef.current[id];
           }
         });
       },
@@ -159,16 +171,12 @@ export function CameraWall({
   }, [cameras, loadTile]);
 
   useEffect(() => {
-    Object.values(timersRef.current).forEach(clearTimeout);
-    timersRef.current = {};
-    cameras.forEach((cam, idx) => {
-      const delay = idx * INITIAL_STAGGER_MS;
-      timersRef.current[cam.id] = setTimeout(() => void loadTile(cam), delay);
-    });
+    visibleLoadSeqRef.current = 0;
     return () => {
       Object.values(timersRef.current).forEach(clearTimeout);
+      timersRef.current = {};
     };
-  }, [cameras, loadTile]);
+  }, [cameras]);
 
   return (
     <div className="flex flex-col gap-2">
@@ -177,7 +185,7 @@ export function CameraWall({
           <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold">
             Camera presets — {cameras.length} cameras
           </p>
-          <span className="text-[10px] text-slate-400">auto-refresh 8s</span>
+          <span className="text-[10px] text-slate-400">auto-refresh ~18s · chỉ ô đang thấy</span>
         </div>
       ) : null}
 
@@ -230,13 +238,6 @@ export function CameraWall({
                     <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />
                     LIVE
                   </span>
-                )}
-
-                {/* Loading spinner overlay */}
-                {tile?.loading && tile?.frame && (
-                  <div className="absolute inset-0 bg-black/20 flex items-center justify-center">
-                    <span className="text-white text-[9px] animate-pulse">Refreshing...</span>
-                  </div>
                 )}
 
                 {/* Error badge */}

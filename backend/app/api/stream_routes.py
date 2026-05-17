@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import concurrent.futures
+import contextlib
 import os
 import time
 import cv2
@@ -26,12 +27,18 @@ from app.services.ffmpeg_relay_service import (
 from app.core.config import settings
 from app.ml.yolo_model import yolo_model
 
-# Thread pool for thumbnail grabs (non-blocking)
-_thumb_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="thumb")
+# Thread pool for thumbnail grabs — low concurrency limits parallel RTSP opens
+_thumb_workers = max(1, min(int(getattr(settings, "THUMB_MAX_CONCURRENT", 2) or 2), 4))
+_thumb_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_thumb_workers, thread_name_prefix="thumb"
+)
 _thumb_cache: dict[tuple[str, int, bool], tuple[dict, float]] = {}
 _thumb_cache_lock = Lock()
 _ffmpeg_env_lock = Lock()
-THUMB_CACHE_TTL = 6.0
+
+_THUMB_FFMPEG_EXTRA = (
+    "|fflags;discardcorrupt|flags;low_delay|err_detect;ignore_err|loglevel;quiet"
+)
 
 router = APIRouter(prefix="/api/v1/stream", tags=["stream"])
 
@@ -202,7 +209,10 @@ async def stream_h264_status(
 async def stream_thumbnail(
     url: Annotated[str, Query(description="RTSP or video URL")],
     width: Annotated[int, Query(description="Max JPEG width (px); larger = sharper but heavier", ge=160, le=960)] = 320,
-    fast: Annotated[bool, Query(description="Bớt vòng discard HEVC — nhanh hơn nhưng vài camera có artefact")] = False,
+    fast: Annotated[
+        bool,
+        Query(description="Ít vòng grab sau flush — nhanh hơn; HEVC vẫn flush buffer trước khi lấy khung"),
+    ] = False,
 ):
     """
     Grab a single frame from any RTSP/video URL and return as base64 JPEG.
@@ -216,43 +226,112 @@ async def stream_thumbnail(
     return JSONResponse(result)
 
 
+@contextlib.contextmanager
+def _suppress_ffmpeg_stderr():
+    """Hide OpenCV FFmpeg + libav HEVC noise during short thumbnail captures."""
+    prev_av = os.environ.get("AV_LOG_LEVEL")
+    os.environ["AV_LOG_LEVEL"] = "error"
+    prev_cv_log = None
+    try:
+        log_mod = cv2.utils.logging
+        prev_cv_log = log_mod.getLogLevel()
+        log_mod.setLogLevel(log_mod.LOG_LEVEL_SILENT)
+    except Exception:
+        pass
+    try:
+        with open(os.devnull, "w") as devnull:
+            with contextlib.redirect_stderr(devnull):
+                yield
+    finally:
+        if prev_av is None:
+            os.environ.pop("AV_LOG_LEVEL", None)
+        else:
+            os.environ["AV_LOG_LEVEL"] = prev_av
+        if prev_cv_log is not None:
+            try:
+                cv2.utils.logging.setLogLevel(prev_cv_log)
+            except Exception:
+                pass
+
+
+def _valid_bgr_frame(frame: cv2.typing.MatLike | None) -> bool:
+    if frame is None:
+        return False
+    try:
+        if frame.size <= 0:
+            return False
+        h, w = frame.shape[:2]
+        return w > 0 and h > 0
+    except Exception:
+        return False
+
+
+def _read_thumbnail_frame(cap: cv2.VideoCapture, *, fast_decode: bool) -> cv2.typing.MatLike | None:
+    """Flush RTSP buffer then grab/retrieve until a decodable HEVC frame appears."""
+    try:
+        flush_n = int(getattr(settings, "THUMB_FLUSH_FRAMES", 12) or 12)
+    except (TypeError, ValueError):
+        flush_n = 12
+    flush_n = max(10, min(flush_n, 24)) if fast_decode else max(flush_n, 16)
+    flush_n = max(6, min(flush_n, 28))
+    if not fast_decode:
+        flush_n = max(flush_n, 18)
+
+    for _ in range(flush_n):
+        cap.grab()
+
+    max_attempts = 12 if fast_decode else 20
+    frame: cv2.typing.MatLike | None = None
+    for _ in range(max_attempts):
+        if not cap.grab():
+            break
+        ret, f = cap.retrieve()
+        if ret and _valid_bgr_frame(f):
+            frame = f
+            if fast_decode:
+                break
+
+    if frame is not None:
+        return frame
+
+    fallback_reads = 8 if fast_decode else 12
+    min_idx = 3 if fast_decode else 5
+    for i in range(fallback_reads):
+        ret, f = cap.read()
+        if ret and _valid_bgr_frame(f) and i >= min_idx:
+            return f
+    return None
+
+
 def _grab_thumbnail(url: str, max_width: int = 320, *, fast_decode: bool = False) -> dict:
     """Synchronous: open stream, grab 1 frame, close immediately."""
     cache_key = (url, int(max_width), bool(fast_decode))
+    ttl = float(getattr(settings, "THUMB_CACHE_TTL", 25.0) or 25.0)
     now = time.time()
     with _thumb_cache_lock:
         cached = _thumb_cache.get(cache_key)
-        if cached and (now - cached[1]) < THUMB_CACHE_TTL:
+        if cached and (now - cached[1]) < ttl:
             return cached[0]
 
     cap = None
     try:
-        thumb_ffmpeg_opts = "rtsp_transport;tcp|buffer_size;2048000|max_delay;1000000|stimeout;8000000"
-        if bool(getattr(settings, "RTSP_HWACCEL", False)):
-            thumb_ffmpeg_opts += "|hwaccel;cuda|hwaccel_output_format;cuda"
-        with _ffmpeg_env_lock:
-            old_opts = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = thumb_ffmpeg_opts
-            cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-            if old_opts is not None:
-                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = old_opts
-            else:
-                os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 8000)
-        cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 8000)
+        is_rtsp = str(url).strip().lower().startswith("rtsp://")
+        with _suppress_ffmpeg_stderr():
+            with _ffmpeg_env_lock:
+                if is_rtsp:
+                    cap = stream_service._open_video_capture(
+                        url, is_rtsp=True, ffmpeg_extra=_THUMB_FFMPEG_EXTRA
+                    )
+                else:
+                    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-        if not cap.isOpened():
-            return {"ok": False, "frame": None, "error": "Cannot open stream"}
+            if cap is None or not cap.isOpened():
+                return {"ok": False, "frame": None, "error": "Cannot open stream"}
 
-        # HEVC: bỏ vài khung đầu để decoder ổn; fast_decode bớt vòng chờ → giảm trễ khi nhiều preview
-        frame: cv2.typing.MatLike | None = None
-        max_iter, take_from = (10, 5) if fast_decode else (15, 8)
-        for i in range(max_iter):
-            ret, f = cap.read()
-            if ret and f is not None and i >= take_from:
-                frame = f
-                break
+            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 8000)
+            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 8000)
+            frame = _read_thumbnail_frame(cap, fast_decode=fast_decode)
 
         if frame is None:
             return {"ok": False, "frame": None, "error": "No frame"}

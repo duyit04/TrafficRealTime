@@ -518,9 +518,21 @@ class StreamService:
                 "RTSP: software decode (no torch CUDA, or RTSP_HWACCEL/RTSP_HWACCEL_AUTO disabled)."
             )
 
-    def _open_video_capture(self, url: str, *, is_rtsp: bool) -> cv2.VideoCapture:
+    @staticmethod
+    def _append_ffmpeg_opts(opts: str, extra: str) -> str:
+        extra = (extra or "").strip()
+        if not extra:
+            return opts
+        if extra.startswith("|"):
+            return opts + extra
+        return opts + "|" + extra
+
+    def _open_video_capture(
+        self, url: str, *, is_rtsp: bool, ffmpeg_extra: str = ""
+    ) -> cv2.VideoCapture:
         """
-        Open capture with best-effort HW decode (CUDA then D3D11 on Windows) and CPU fallback.
+        Open RTSP with HW decode: FFmpeg hwaccel (CUDA, then D3D11 on Windows), then CPU.
+        Avoids OpenCV VIDEO_ACCELERATION_ANY + CAP_PROP_HW_DEVICE (invalid combo on Windows builds).
         """
         if not is_rtsp:
             return cv2.VideoCapture(url)
@@ -528,57 +540,72 @@ class StreamService:
         import os
         import sys
 
-        base = self._rtsp_ffmpeg_options_base()
+        base = self._append_ffmpeg_opts(self._rtsp_ffmpeg_options_base(), ffmpeg_extra)
 
-        cap_prop_hw_accel = getattr(cv2, "CAP_PROP_HW_ACCELERATION", None)
-        cap_prop_hw_device = getattr(cv2, "CAP_PROP_HW_DEVICE", None)
-        video_accel_any = getattr(cv2, "VIDEO_ACCELERATION_ANY", None)
-        video_accel_d3d11 = getattr(cv2, "VIDEO_ACCELERATION_D3D11", None)
-
-        def _try_hw_video_capture(hw_flag: int, label: str) -> cv2.VideoCapture | None:
-            if (
-                cap_prop_hw_accel is None
-                or cap_prop_hw_device is None
-                or hw_flag is None
-            ):
-                return None
+        def _try_ffmpeg_capture(ffmpeg_opts: str) -> cv2.VideoCapture | None:
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = ffmpeg_opts
             try:
-                cap = cv2.VideoCapture(
-                    url,
-                    cv2.CAP_FFMPEG,
-                    [
-                        int(cap_prop_hw_accel),
-                        int(hw_flag),
-                        int(cap_prop_hw_device),
-                        0,
-                    ],
-                )
+                cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 if cap.isOpened():
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    logger.debug("VideoCapture opened with %s hw acceleration", label)
                     return cap
                 cap.release()
             except Exception as e:
-                logger.debug("VideoCapture %s hw failed: %s", label, e)
+                logger.debug("FFmpeg VideoCapture failed (%s): %s", ffmpeg_opts[:48], e)
             return None
 
-        if self._use_rtsp_cuda_decode() and video_accel_any is not None:
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self._rtsp_ffmpeg_options()
-            cap = _try_hw_video_capture(int(video_accel_any), "CUDA/ANY")
+        cap_prop_hw_accel = getattr(cv2, "CAP_PROP_HW_ACCELERATION", None)
+        cap_prop_hw_device = getattr(cv2, "CAP_PROP_HW_DEVICE", None)
+        video_accel_d3d11 = getattr(cv2, "VIDEO_ACCELERATION_D3D11", None)
+
+        def _try_opencv_hw_capture(hw_flag: int, label: str) -> cv2.VideoCapture | None:
+            """OpenCV HW API: D3D11 only — do not pass HW_DEVICE with ANY."""
+            if cap_prop_hw_accel is None or hw_flag is None:
+                return None
+            params: list[int] = [int(cap_prop_hw_accel), int(hw_flag)]
+            if cap_prop_hw_device is not None:
+                dev = max(0, int(getattr(settings, "RTSP_CUDA_DEVICE", 0) or 0))
+                params.extend([int(cap_prop_hw_device), dev])
+            try:
+                cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG, params)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                if cap.isOpened():
+                    logger.debug("VideoCapture opened with OpenCV %s hw acceleration", label)
+                    return cap
+                cap.release()
+            except Exception as e:
+                logger.debug("OpenCV %s hw capture failed: %s", label, e)
+            return None
+
+        if self._use_rtsp_cuda_decode():
+            cap = _try_ffmpeg_capture(
+                self._append_ffmpeg_opts(self._rtsp_ffmpeg_options(), ffmpeg_extra)
+            )
             if cap is not None:
+                logger.debug("RTSP: FFmpeg CUDA hwaccel decode")
                 return cap
 
-        if (
-            sys.platform == "win32"
-            and bool(getattr(settings, "RTSP_D3D11_FALLBACK", True))
-            and video_accel_d3d11 is not None
-        ):
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self._rtsp_ffmpeg_options_d3d11()
-            cap = _try_hw_video_capture(int(video_accel_d3d11), "D3D11")
+        if sys.platform == "win32" and bool(getattr(settings, "RTSP_D3D11_FALLBACK", True)):
+            cap = _try_ffmpeg_capture(
+                self._append_ffmpeg_opts(self._rtsp_ffmpeg_options_d3d11(), ffmpeg_extra)
+            )
             if cap is not None:
-                logger.info("RTSP: using D3D11VA hardware decode (CUDA capture path unavailable or failed).")
+                logger.debug(
+                    "RTSP: D3D11VA decode via FFmpeg (CUDA hwaccel open failed or unavailable)."
+                )
                 return cap
+            if video_accel_d3d11 is not None:
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self._append_ffmpeg_opts(
+                    self._rtsp_ffmpeg_options_d3d11(), ffmpeg_extra
+                )
+                cap = _try_opencv_hw_capture(int(video_accel_d3d11), "D3D11")
+                if cap is not None:
+                    logger.debug("RTSP: D3D11VA decode via OpenCV capture API.")
+                    return cap
 
+        cap = _try_ffmpeg_capture(base)
+        if cap is not None:
+            return cap
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = base
         cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)

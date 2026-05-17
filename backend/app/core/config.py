@@ -88,6 +88,11 @@ class Settings(BaseSettings):
     H264_FFMPEG_GPU: int = 0
     H264_NVENC_SURFACES: int = 32
 
+    # Camera wall thumbnails (/stream/thumbnail) — avoid opening many RTSP at once
+    THUMB_CACHE_TTL: float = 25.0
+    THUMB_MAX_CONCURRENT: int = 2
+    THUMB_FLUSH_FRAMES: int = 12
+
     # ── YOLO inference size ────────────────────────────────────────────────────
     # Input image size for YOLO inference. Valid values: 320, 416, 480, 640.
     # Smaller = faster but less accurate. Invalid values fall back to 640.

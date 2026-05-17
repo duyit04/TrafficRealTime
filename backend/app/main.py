@@ -5,6 +5,7 @@ Traffic Monitor – YOLOv8 Vehicle Detection & Counting API
 
 from __future__ import annotations
 import asyncio
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -49,6 +50,9 @@ def _log_gpu_startup_profile() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Quieter libav when opening short RTSP grabs (camera wall thumbnails).
+    os.environ.setdefault("AV_LOG_LEVEL", "error")
+    os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
     logger.info("═══ Traffic Monitor API starting on :%d ═══", settings.PORT)
     _log_gpu_startup_profile()
 
