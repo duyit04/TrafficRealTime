@@ -142,6 +142,8 @@ class YOLOModel:
         self._runtime_backend: str = "torch"
         self._infer_lock = threading.Lock()
         self._fixed_imgsz_override: int | None = None
+        self._tracker_err_log_ts: float = 0.0
+        self._tracker_broken_until: float = 0.0
 
     # ── Public ────────────────────────────────────────────────────────────────
 
@@ -253,10 +255,17 @@ class YOLOModel:
         Returns:
             List of RawDetection with track_id populated
         """
+        import time as _time
+
         if not self.is_loaded:
             return []
         if not _frame_ok_for_track(frame):
             return []
+
+        # During cooldown after tracker failure, fall back to predict() to avoid per-frame overhead
+        now = _time.monotonic()
+        if now < self._tracker_broken_until:
+            return self.predict(frame, conf)
 
         with self._infer_lock:
             kwargs = self._runtime_infer_kwargs()
@@ -273,30 +282,25 @@ class YOLOModel:
                     **kwargs,
                 )
                 if not result_list:
-                    # ultralytics returns [] when tracker state is corrupt after reset
                     raise IndexError("model.track() returned empty list")
                 return result_list[0]
 
             try:
                 results = _run_track(imgsz)
+                # Successful run — clear any broken state
+                self._tracker_broken_until = 0.0
             except Exception as e:
                 if is_tracker_state_error(e):
-                    logger.info(
-                        "YOLOModel: tracker state error (%s), resetting and retrying once",
-                        e,
-                    )
+                    now2 = _time.monotonic()
+                    if now2 - self._tracker_err_log_ts > 5.0:
+                        self._tracker_err_log_ts = now2
+                        logger.warning(
+                            "YOLOModel: tracker state error (%s), resetting — will use predict() for 3s",
+                            e,
+                        )
                     self.reset_tracker()
-                    try:
-                        results = _run_track(imgsz)
-                    except Exception as e2:
-                        if is_tracker_state_error(e2):
-                            # Still broken after reset — return empty rather than crashing
-                            logger.warning(
-                                "YOLOModel: tracker still broken after reset (%s), skipping frame",
-                                e2,
-                            )
-                            return []
-                        raise
+                    self._tracker_broken_until = _time.monotonic() + 3.0
+                    return self.predict(frame, conf)
                 else:
                     retry_imgsz = self._extract_engine_max_imgsz(e)
                     if retry_imgsz is None or retry_imgsz == imgsz:
@@ -311,11 +315,24 @@ class YOLOModel:
             return self._parse_boxes(results)
 
     def reset_tracker(self) -> None:
-        """Reset the internal tracker state (new IDs on next track() call)."""
-        if self._model is not None and hasattr(self._model, "predictor"):
-            predictor = self._model.predictor
-            if predictor is not None and hasattr(predictor, "trackers"):
-                predictor.trackers = []
+        """Reset tracker stracks without destroying the tracker list (avoids IndexError on next call)."""
+        if self._model is None:
+            return
+        predictor = getattr(self._model, "predictor", None)
+        if predictor is None:
+            return
+        trackers = getattr(predictor, "trackers", None)
+        if not trackers:
+            return
+        for t in trackers:
+            try:
+                for attr in ("tracked_stracks", "lost_stracks", "removed_stracks"):
+                    if hasattr(t, attr):
+                        setattr(t, attr, [])
+                if hasattr(t, "frame_id"):
+                    t.frame_id = 0
+            except Exception:
+                pass
 
     def export_engine(
         self,

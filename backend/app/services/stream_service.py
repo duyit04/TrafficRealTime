@@ -957,24 +957,30 @@ class StreamService:
         _next_deadline = time.perf_counter()
         _last_good_frame: np.ndarray | None = None
         _holdover_count = 0
-        _max_holdover = max(self.max_fps * 3, 15)  # max 3 s of holdover
         try:
             while self._running:
                 frame, backlog = self._drain_latest_frame(
-                    frame_q, timeout=min(frame_interval * 2, 0.10)
+                    frame_q, timeout=min(frame_interval * 2, 0.15)
                 )
                 _is_holdover = False
                 if frame is None:
                     if stop_evt.is_set():
                         break
-                    # RTSP jitter: repeat last frame so H264 pipe stays live
-                    if _last_good_frame is not None and _holdover_count < _max_holdover:
+                    if _last_good_frame is not None:
+                        # Keep stream alive while RTSP reconnects; stop only if
+                        # capture thread has fully given up.
+                        if not cap_thread.is_alive():
+                            break
                         frame = _last_good_frame
                         _holdover_count += 1
                         _is_holdover = True
                     else:
+                        # No frame received yet at all — just wait
                         continue
                 else:
+                    if _holdover_count > 0:
+                        # Stream just recovered — reset deadline to avoid burst catch-up
+                        _next_deadline = time.perf_counter()
                     _last_good_frame = frame
                     _holdover_count = 0
                 t_start = time.time()
@@ -1189,9 +1195,9 @@ class StreamService:
                     time.sleep(_wait - 0.001)
                 while time.perf_counter() < _next_deadline:
                     pass
-                # If we fell more than 3 frames behind (e.g. after a long stall), reset
+                # If we fell behind (e.g. slow inference or long stall), reset
                 # to avoid a burst of back-to-back frames trying to catch up.
-                if time.perf_counter() - _next_deadline > frame_interval * 3:
+                if time.perf_counter() - _next_deadline > frame_interval:
                     _next_deadline = time.perf_counter()
         except Exception as e:
             logger.exception("StreamService: worker crashed: %s", e)

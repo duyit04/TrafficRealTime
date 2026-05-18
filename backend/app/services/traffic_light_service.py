@@ -137,7 +137,18 @@ class DisplayOnlyTrafficLightService:
 
     def set_advice_enabled(self, enabled: bool) -> None:
         with self._state_lock:
+            prev = self._advice_enabled
             self._advice_enabled = bool(enabled)
+            if prev != self._advice_enabled:
+                # Reset cycle so toggling always starts fresh
+                self._movement_substate = "green"
+                self._active_phase = 0
+                self._pending_next_green = 1
+                self._phase_started_at = time.monotonic()
+                self._green_seconds = 30.0
+                self._phase_green_seconds = [30.0, 30.0]
+                self._prev_demand_green_queues = None
+                self._cycle_count = 0
             self._sync_state_locked()
 
     def advice_enabled(self) -> bool:
@@ -240,7 +251,7 @@ class DisplayOnlyTrafficLightService:
                         now = time.monotonic()
                         elapsed = now - self._phase_started_at
 
-                        if self._stream_live:
+                        if self._stream_live and self._advice_enabled:
                             if self._movement_substate != "green":
                                 self._prev_demand_green_queues = None
 
@@ -365,12 +376,13 @@ class DisplayOnlyTrafficLightService:
             p.green_time = float(geff_ui)
             p.red_time_hint = 0.0
 
-        if not self._stream_live:
+        if not self._stream_live or not self._advice_enabled:
             self._state.intersection_state = "green"
             self._state.yellow_phase_id = None
             for p in self._state.phases[:2]:
                 p.color = "red"
                 p.remaining = 0.0
+                p.time_until_green = 0.0
             self._state.ui_hint = ""
             return
 
