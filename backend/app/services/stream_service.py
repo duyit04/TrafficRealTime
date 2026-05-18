@@ -6,7 +6,6 @@ Pipeline per frame:
 """
 
 from __future__ import annotations
-import base64
 import asyncio
 import json
 import threading
@@ -22,23 +21,29 @@ from app.core.logger import logger
 from app.models.detection_model import VehicleStats, CongestionInfo
 
 # ── ML Layer ──────────────────────────────────────────────────────────────────
-from app.ml.yolo_model import yolo_model
+from app.ml.yolo_model import yolo_model, is_tracker_kalman_error, is_tracker_state_error
 from app.ml.tracker import get_tracker
 from app.ml.vehicle_counter import VehicleCounter
 from app.ml.congestion_monitor import CongestionMonitor
 
 # ── Service Layer ─────────────────────────────────────────────────────────────
 from app.services.roi_service import roi_service
-from app.services.ffmpeg_h264_bgr_pipe_service import (
+from app.services.ffmpeg_relay_service import (
+    ffmpeg_relay_service,
+    ffmpeg_relay_companion_service,
+    ffmpeg_relay_extra2_service,
+    ffmpeg_relay_extra3_service,
     h264_bgr_primary,
     h264_bgr_companion,
     h264_bgr_extra2,
     h264_bgr_extra3,
+    should_h264_burnin,
+    use_h264_rtsp_relay,
 )
 from app.utils.frame_overlay import overlay_traffic_ui
 from app.utils.image_utils import resize_bgr_max_width
 from app.utils.video_utils import is_youtube_url, resolve_youtube_url, validate_youtube_url
-from app.api.ws_routes import ws_manager, ws_companion_manager, pack_frame_message
+from app.api.ws_routes import ws_manager, ws_companion_manager, stats_message_json
 
 
 class StreamService:
@@ -100,6 +105,7 @@ class StreamService:
         # For inference skipping (keep last detections to reuse on skipped frames)
         self._skip_counter: int = 0
         self._last_api_dets: list[dict] = []
+        self._pipe_err_log_ts: float = 0.0
         # Stop detection inside ROI (per slot) for traffic-light inference
         self._stop_hist: dict[str, dict[int, dict]] = {
             "primary": {},
@@ -131,6 +137,67 @@ class StreamService:
         self._extra_lock = threading.Lock()
 
     # ── Public API ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _drain_latest_frame(frame_q: Queue, timeout: float = 1.0) -> tuple[np.ndarray | None, int]:
+        """Take the newest frame; drop older queued frames when the worker falls behind."""
+        try:
+            frame = frame_q.get(timeout=timeout)
+        except Empty:
+            return None, 0
+        dropped = 0
+        while True:
+            try:
+                frame = frame_q.get_nowait()
+                dropped += 1
+            except Empty:
+                break
+        return frame, dropped
+
+    @staticmethod
+    def _h264_relay_for_slot(slot: int | str):
+        s = str(slot).strip().lower()
+        if s in {"companion", "cam2"}:
+            return ffmpeg_relay_companion_service
+        if s in {"2", "extra2", "cam3"}:
+            return ffmpeg_relay_extra2_service
+        if s in {"3", "extra3", "cam4"}:
+            return ffmpeg_relay_extra3_service
+        return ffmpeg_relay_service
+
+    @staticmethod
+    def _h264_bgr_for_slot(slot: int | str):
+        s = str(slot).strip().lower()
+        if s in {"2", "extra2", "cam3"}:
+            return h264_bgr_extra2
+        if s in {"3", "extra3", "cam4"}:
+            return h264_bgr_extra3
+        if s in {"companion", "cam2"}:
+            return h264_bgr_companion
+        return h264_bgr_primary
+
+    @classmethod
+    def _start_h264_relay(cls, slot: int | str, url: str) -> None:
+        if not use_h264_rtsp_relay():
+            return
+        u = (url or "").strip()
+        if not u.lower().startswith("rtsp://"):
+            return
+        try:
+            cls._h264_relay_for_slot(slot).start(u)
+        except Exception as re:
+            logger.debug("H264 RTSP relay start skipped (%s): %s", slot, re)
+
+    @classmethod
+    def _stop_h264_slot(cls, slot: int | str) -> None:
+        try:
+            cls._h264_relay_for_slot(slot).stop()
+        except Exception:
+            pass
+        try:
+            cls._h264_bgr_for_slot(slot).stop()
+        except Exception:
+            pass
 
     def set_event_loop(self, loop: asyncio.AbstractEventLoop | None) -> None:
         """
@@ -173,15 +240,13 @@ class StreamService:
             daemon=True,
         )
         self._companion_thread.start()
+        self._start_h264_relay("companion", self._companion_url)
         logger.info("StreamService: companion started (no restart) → %s", self._companion_url[:80])
 
     def stop_companion(self) -> None:
         """Stop companion stream without stopping primary."""
         self._companion_running = False
-        try:
-            h264_bgr_companion.stop()
-        except Exception:
-            pass
+        self._stop_h264_slot("companion")
         if self._companion_thread:
             self._companion_thread.join(timeout=3)
             self._companion_thread = None
@@ -204,16 +269,11 @@ class StreamService:
         t = threading.Thread(target=self._extra_worker, args=(s, u), daemon=True)
         self._extra_threads[s] = t
         t.start()
+        self._start_h264_relay(s, u)
 
     def stop_extra(self, slot: int) -> None:
         s = int(slot)
-        try:
-            if s == 2:
-                h264_bgr_extra2.stop()
-            elif s == 3:
-                h264_bgr_extra3.stop()
-        except Exception:
-            pass
+        self._stop_h264_slot(s)
         with self._extra_lock:
             self._extra_running[s] = False
             self._extra_urls.pop(s, None)
@@ -252,9 +312,11 @@ class StreamService:
                     daemon=True,
                 )
                 self._companion_thread.start()
+                self._start_h264_relay("companion", self._companion_url)
                 logger.info("StreamService: companion TLC lane → %s", self._companion_url[:80])
             self._thread = threading.Thread(target=self._worker, args=(effective_url,), daemon=True)
             self._thread.start()
+            self._start_h264_relay("primary", effective_url)
             logger.info("StreamService: worker started")
         except Exception as e:
             self._last_error = str(e)
@@ -265,22 +327,8 @@ class StreamService:
     def stop(self) -> None:
         self._running = False
         self._companion_running = False
-        try:
-            h264_bgr_primary.stop()
-        except Exception:
-            pass
-        try:
-            h264_bgr_companion.stop()
-        except Exception:
-            pass
-        try:
-            h264_bgr_extra2.stop()
-        except Exception:
-            pass
-        try:
-            h264_bgr_extra3.stop()
-        except Exception:
-            pass
+        for slot in ("primary", "companion", 2, 3):
+            self._stop_h264_slot(slot)
         # Stop extra streams
         with self._extra_lock:
             for k in list(self._extra_running.keys()):
@@ -474,8 +522,60 @@ class StreamService:
         return cuda_ok
 
     @classmethod
+    def _prefer_ffmpeg_rtsp_decode(cls, is_rtsp: bool) -> bool:
+        if not is_rtsp:
+            return False
+        if bool(getattr(settings, "RTSP_FFMPEG_PIPE_DECODE", False)):
+            return True
+        from app.services.ffmpeg_relay_service import use_h264_ffmpeg_burnin
+
+        return use_h264_ffmpeg_burnin()
+
+    @classmethod
+    def _reopen_ffmpeg_rtsp_capture(
+        cls,
+        cap,
+        url: str,
+        *,
+        capture_label: str,
+    ):
+        from app.services.ffmpeg_rtsp_capture import FFmpegRtspCapture
+
+        try:
+            cap.release()
+        except Exception:
+            pass
+        cap = cls._open_video_capture(
+            url,
+            is_rtsp=True,
+            prefer_ffmpeg=True,
+            capture_label=capture_label,
+        )
+        return cap, isinstance(cap, FFmpegRtspCapture)
+
+    @classmethod
+    def _read_capture_frame(cls, cap, *, is_rtsp: bool) -> tuple[bool, np.ndarray | None]:
+        from app.services.ffmpeg_rtsp_capture import FFmpegRtspCapture
+
+        if is_rtsp and isinstance(cap, FFmpegRtspCapture):
+            return cap.read_fresh(int(getattr(settings, "RTSP_FLUSH_FRAMES", 0) or 0))
+        ret, fr = cap.read()
+        if not ret or fr is None or not is_rtsp:
+            return ret, fr
+        for _ in range(max(0, int(settings.RTSP_FLUSH_FRAMES))):
+            if not cap.grab():
+                break
+        ret2, fresh = cap.retrieve()
+        if ret2 and fresh is not None:
+            return True, fresh
+        return ret, fr
+
+    @classmethod
     def _rtsp_ffmpeg_options_base(cls) -> str:
-        return "rtsp_transport;tcp|buffer_size;4096000|max_delay;500000|stimeout;5000000"
+        return (
+            "rtsp_transport;tcp|buffer_size;4096000|max_delay;500000|stimeout;5000000"
+            "|fflags;discardcorrupt|flags;low_delay|err_detect;ignore_err"
+        )
 
     @classmethod
     def _rtsp_ffmpeg_options(cls) -> str:
@@ -528,7 +628,13 @@ class StreamService:
         return opts + "|" + extra
 
     def _open_video_capture(
-        self, url: str, *, is_rtsp: bool, ffmpeg_extra: str = ""
+        self,
+        url: str,
+        *,
+        is_rtsp: bool,
+        ffmpeg_extra: str = "",
+        prefer_ffmpeg: bool | None = None,
+        capture_label: str = "primary",
     ) -> cv2.VideoCapture:
         """
         Open RTSP with HW decode: FFmpeg hwaccel (CUDA, then D3D11 on Windows), then CPU.
@@ -539,6 +645,53 @@ class StreamService:
 
         import os
         import sys
+
+        use_ffmpeg = (
+            self._prefer_ffmpeg_rtsp_decode(is_rtsp)
+            if prefer_ffmpeg is None
+            else bool(prefer_ffmpeg)
+        )
+        if use_ffmpeg and is_rtsp:
+            from app.services.ffmpeg_rtsp_capture import FFmpegRtspCapture
+
+            cap_ff: FFmpegRtspCapture | None = None
+            try:
+                cap_ff = FFmpegRtspCapture(url, label=capture_label)
+                if cap_ff.isOpened():
+                    logger.info("StreamService: RTSP via FFmpeg BGR pipe [%s]", capture_label)
+                    return cap_ff
+            except Exception as e:
+                logger.warning("FFmpeg RTSP capture failed: %s", e)
+            from app.services.ffmpeg_rtsp_decode import ffmpeg_cuda_required
+
+            err = getattr(cap_ff, "_last_error", None) if cap_ff is not None else str(
+                "FFmpegRtspCapture init failed"
+            )
+            if cap_ff is not None and cap_ff.isOpened():
+                pass
+            elif ffmpeg_cuda_required() and prefer_ffmpeg is not False:
+                logger.error(
+                    "StreamService: [CUDA FAILED] [%s] %s — no OpenCV/CPU fallback",
+                    capture_label,
+                    err,
+                )
+                return cap_ff if cap_ff is not None else cv2.VideoCapture()
+            elif cap_ff is not None and not cap_ff.isOpened():
+                logger.warning(
+                    "FFmpeg RTSP not opened [%s]: %s — trying OpenCV",
+                    capture_label,
+                    err,
+                )
+
+        from app.services.ffmpeg_rtsp_decode import ffmpeg_cuda_required
+
+        # Thumbnails / preview (prefer_ffmpeg=False): OpenCV OK — not live CUDA pipe.
+        if is_rtsp and ffmpeg_cuda_required() and prefer_ffmpeg is not False:
+            logger.error(
+                "StreamService: CUDA RTSP required — skip OpenCV/D3D11/CPU capture [%s]",
+                capture_label,
+            )
+            return cv2.VideoCapture()
 
         base = self._append_ffmpeg_opts(self._rtsp_ffmpeg_options_base(), ffmpeg_extra)
 
@@ -685,7 +838,10 @@ class StreamService:
         def _capture_loop() -> None:
             rtsp_url = url
             # ── RTSP tuning: reduce buffering + proper HEVC handling ──────────────
-            cap = self._open_video_capture(rtsp_url, is_rtsp=is_rtsp)
+            cap = self._open_video_capture(rtsp_url, is_rtsp=is_rtsp, capture_label="primary")
+            from app.services.ffmpeg_rtsp_capture import FFmpegRtspCapture
+
+            using_ffmpeg_cap = isinstance(cap, FFmpegRtspCapture)
 
             if not cap.isOpened():
                 logger.error("StreamService: cannot open %s", rtsp_url)
@@ -698,15 +854,34 @@ class StreamService:
             MAX_RTSP_RETRIES = 30
             try:
                 while self._running and not stop_evt.is_set():
-                    ret, fr = cap.read()
+                    ret, fr = self._read_capture_frame(cap, is_rtsp=is_rtsp)
                     if not ret or fr is None:
                         if is_rtsp:
                             consecutive_failures += 1
+                            if using_ffmpeg_cap and consecutive_failures == 3:
+                                logger.warning(
+                                    "StreamService: FFmpeg RTSP read failing, reopening FFmpeg (no OpenCV fallback)"
+                                )
+                                cap, using_ffmpeg_cap = self._reopen_ffmpeg_rtsp_capture(
+                                    cap, rtsp_url, capture_label="primary"
+                                )
+                                consecutive_failures = 0
+                                if not cap.isOpened():
+                                    self._last_error = "Không mở được stream (FFmpeg)."
+                                    self._stats.stream_error = self._last_error
+                                    break
+                                continue
                             if consecutive_failures <= MAX_RTSP_RETRIES:
                                 time.sleep(0.1)
                                 continue
                             cap.release()
-                            cap = self._open_video_capture(rtsp_url, is_rtsp=True)
+                            cap = self._open_video_capture(
+                                rtsp_url,
+                                is_rtsp=True,
+                                prefer_ffmpeg=using_ffmpeg_cap,
+                                capture_label="primary",
+                            )
+                            using_ffmpeg_cap = isinstance(cap, FFmpegRtspCapture)
                             if not cap.isOpened():
                                 self._last_error = "RTSP stream đã kết thúc."
                                 self._stats.stream_error = self._last_error
@@ -723,15 +898,6 @@ class StreamService:
                         fr = fr2
 
                     consecutive_failures = 0
-
-                    # Flush RTSP buffer lag so we always process the freshest frame.
-                    if is_rtsp:
-                        for _ in range(max(0, int(settings.RTSP_FLUSH_FRAMES))):
-                            if not cap.grab():
-                                break
-                        ret2, fresh = cap.retrieve()
-                        if ret2 and fresh is not None:
-                            fr = fresh
 
                     # Drop-frame: keep only latest in queue
                     try:
@@ -752,6 +918,22 @@ class StreamService:
         cap_thread = threading.Thread(target=_capture_loop, daemon=True)
         cap_thread.start()
 
+        # Wait for capture thread: abort only if it exited without any frame.
+        open_deadline = time.time() + 15.0
+        while time.time() < open_deadline and self._running and not stop_evt.is_set():
+            if not cap_thread.is_alive():
+                break
+            if not frame_q.empty():
+                break
+            time.sleep(0.15)
+        if stop_evt.is_set() or not self._running:
+            return
+        if frame_q.empty() and not cap_thread.is_alive():
+            err = self._stats.stream_error or self._last_error or "Không mở được stream."
+            self._stats.stream_error = str(err)
+            logger.error("StreamService: capture failed — %s", err)
+            return
+
         self._stats.stream_active = True
         try:
             from app.services.traffic_light_service import traffic_light_service as tls
@@ -770,17 +952,34 @@ class StreamService:
         infer_ms_hist: deque[float] = deque(maxlen=10)
         frame_interval = 1.0 / max(self.max_fps, 1)
         last_dets: list = []
+        # Deadline-based frame pacing: advances by exactly frame_interval each iteration
+        # so timing errors don't accumulate. Replaces the old sleep(frame_interval - elapsed).
+        _next_deadline = time.perf_counter()
+        _last_good_frame: np.ndarray | None = None
+        _holdover_count = 0
+        _max_holdover = max(self.max_fps * 3, 15)  # max 3 s of holdover
         try:
             while self._running:
-                t_start = time.time()
-                # Always process freshest available frame
-                try:
-                    frame = frame_q.get(timeout=1.0)
-                except Empty:
+                frame, backlog = self._drain_latest_frame(
+                    frame_q, timeout=min(frame_interval * 2, 0.10)
+                )
+                _is_holdover = False
+                if frame is None:
                     if stop_evt.is_set():
                         break
-                    continue
-                cap_fps_cnt += 1
+                    # RTSP jitter: repeat last frame so H264 pipe stays live
+                    if _last_good_frame is not None and _holdover_count < _max_holdover:
+                        frame = _last_good_frame
+                        _holdover_count += 1
+                        _is_holdover = True
+                    else:
+                        continue
+                else:
+                    _last_good_frame = frame
+                    _holdover_count = 0
+                t_start = time.time()
+                if not _is_holdover:
+                    cap_fps_cnt += 1
 
                 self._stats.frame_count += 1
                 fps_cnt += 1
@@ -813,8 +1012,8 @@ class StreamService:
                 # ── Pipeline ─────────────────────────────────────────────────
                 try:
                     skip_n = max(0, int(self.skip_frames or 0))
-                    do_infer = True
-                    if skip_n > 0:
+                    do_infer = not _is_holdover and not (backlog > 0)
+                    if skip_n > 0 and do_infer:
                         # infer on 1 frame, then reuse last detections for next N frames
                         if self._skip_counter > 0:
                             do_infer = False
@@ -846,7 +1045,13 @@ class StreamService:
                         raw_dets = list(last_dets)
                         tracks = []
                 except Exception as pipe_err:
-                    logger.warning("Pipeline error (skipping frame): %s", pipe_err)
+                    if is_tracker_state_error(pipe_err):
+                        yolo_model.reset_tracker()
+                        self._tracker.reset()
+                    now = time.time()
+                    if now - self._pipe_err_log_ts >= 5.0:
+                        logger.warning("Pipeline error (skipping frame): %s", pipe_err)
+                        self._pipe_err_log_ts = now
                     raw_dets = []
                     tracks = []
 
@@ -929,55 +1134,35 @@ class StreamService:
                 except Exception:
                     pass
 
-                # 5.2 H264 WebSocket — cùng khung + box (burn-in) rồi NVENC
-                try:
-                    vis_h264 = overlay_traffic_ui(
-                        frame,
-                        [d.model_dump() for d in api_dets],
-                        line_y_px=int(line_y),
-                        show_line=True,
-                    )
-                    h264_bgr_primary.write_frame(vis_h264, fps=max(1, int(self.max_fps)))
-                except Exception as he:
-                    logger.debug("H264 BGR primary skipped: %s", he)
-
-                # 6. Encode frame only when there is an active consumer.
-                primary_http_active = self._is_http_poll_active(self._http_primary_last_poll_ts)
-                primary_ws_active = bool(ws_manager.has_clients)
-                need_jpeg = primary_http_active or primary_ws_active
-                jpeg_bytes = b""
-                if need_jpeg:
-                    jpeg_q = max(30, min(95, int(self.jpeg_quality or 75)))
-                    ok_jpg, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
-                    jpeg_bytes = buf.tobytes() if ok_jpg else b""
+                # 5.2 H264 bgr_burnin — box vẽ sẵn trên video (rtsp_relay dùng FFmpeg relay riêng)
+                if should_h264_burnin():
+                    try:
+                        vis_h264 = overlay_traffic_ui(
+                            frame,
+                            [d.model_dump() for d in api_dets],
+                            line_y_px=int(line_y),
+                            show_line=True,
+                            in_place=True,
+                        )
+                        h264_bgr_primary.write_frame(vis_h264, fps=max(1, int(self.max_fps)))
+                    except Exception as he:
+                        logger.warning("H264 burn-in primary skipped: %s", he)
 
                 header = {
-                    "v": 1,
                     "detections": [d.model_dump() for d in api_dets],
-                    # Phải gộp primary + companion + extra — giống GET /stats (WS trước đây chỉ gửi primary).
                     "stats": self.merged_vehicle_stats().model_dump(),
                 }
-                payload = None
 
                 with self._lock:
-                    # Keep a JSON-compatible latest snapshot for /frame fallback endpoint.
-                    # (Frame stays base64 here to avoid changing HTTP API shape.)
-                    frame_b64 = ""
-                    if jpeg_bytes and primary_http_active:
-                        frame_b64 = base64.b64encode(jpeg_bytes).decode()
                     self._latest = {
-                        "frame": frame_b64,
+                        "frame": None,
                         "detections": header["detections"],
                         "stats": header["stats"],
                     }
 
-                # Broadcast via WebSocket when clients are connected
                 try:
-                    if ws_manager.has_clients and self._event_loop is not None:
-                        msg = pack_frame_message(header, jpeg_bytes)
-                        self._event_loop.call_soon_threadsafe(
-                            lambda: asyncio.create_task(ws_manager.broadcast_bytes(msg))
-                        )
+                    if ws_manager.has_clients:
+                        ws_manager.broadcast_text_threadsafe(stats_message_json(header))
                         sent_fps_cnt += 1
                 except Exception:
                     pass
@@ -996,10 +1181,18 @@ class StreamService:
                     infer_fps_cnt = 0
                     t0_infer = time.time()
 
-                # Throttle
-                sleep_t = frame_interval - (time.time() - t_start)
-                if sleep_t > 0:
-                    time.sleep(sleep_t)
+                # Deadline-based throttle — avoids error accumulation and works around
+                # Windows time.sleep ~15ms granularity via a short busy-wait at the end.
+                _next_deadline += frame_interval
+                _wait = _next_deadline - time.perf_counter()
+                if _wait > 0.002:
+                    time.sleep(_wait - 0.001)
+                while time.perf_counter() < _next_deadline:
+                    pass
+                # If we fell more than 3 frames behind (e.g. after a long stall), reset
+                # to avoid a burst of back-to-back frames trying to catch up.
+                if time.perf_counter() - _next_deadline > frame_interval * 3:
+                    _next_deadline = time.perf_counter()
         except Exception as e:
             logger.exception("StreamService: worker crashed: %s", e)
             self._last_error = f"Worker error: {e}"
@@ -1033,7 +1226,10 @@ class StreamService:
 
         def _capture_loop() -> None:
             rtsp_url = url
-            cap = self._open_video_capture(rtsp_url, is_rtsp=is_rtsp)
+            cap = self._open_video_capture(rtsp_url, is_rtsp=is_rtsp, capture_label="companion")
+            from app.services.ffmpeg_rtsp_capture import FFmpegRtspCapture
+
+            using_ffmpeg_cap = isinstance(cap, FFmpegRtspCapture)
 
             if not cap.isOpened():
                 logger.warning("StreamService: companion cannot open stream")
@@ -1044,15 +1240,31 @@ class StreamService:
             max_rtsp_retries = 30
             try:
                 while self._companion_running and not stop_evt.is_set():
-                    ret, fr = cap.read()
+                    ret, fr = self._read_capture_frame(cap, is_rtsp=is_rtsp)
                     if not ret or fr is None:
                         if is_rtsp:
                             consecutive_failures += 1
+                            if using_ffmpeg_cap and consecutive_failures == 3:
+                                logger.warning(
+                                    "StreamService: companion FFmpeg read failing, reopening FFmpeg"
+                                )
+                                cap, using_ffmpeg_cap = self._reopen_ffmpeg_rtsp_capture(
+                                    cap, rtsp_url, capture_label="companion"
+                                )
+                                consecutive_failures = 0
+                                if not cap.isOpened():
+                                    break
+                                continue
                             if consecutive_failures <= max_rtsp_retries:
                                 time.sleep(0.1)
                                 continue
                             cap.release()
-                            cap = self._open_video_capture(rtsp_url, is_rtsp=True)
+                            cap = self._open_video_capture(
+                                rtsp_url,
+                                is_rtsp=True,
+                                capture_label="companion",
+                            )
+                            using_ffmpeg_cap = isinstance(cap, FFmpegRtspCapture)
                             if not cap.isOpened():
                                 break
                             consecutive_failures = 0
@@ -1064,14 +1276,6 @@ class StreamService:
                         fr = fr2
 
                     consecutive_failures = 0
-
-                    if is_rtsp:
-                        for _ in range(max(0, int(settings.RTSP_FLUSH_FRAMES))):
-                            if not cap.grab():
-                                break
-                        ret2, fresh = cap.retrieve()
-                        if ret2 and fresh is not None:
-                            fr = fresh
 
                     try:
                         frame_q.put(fr, block=False)
@@ -1100,9 +1304,8 @@ class StreamService:
         try:
             while self._companion_running:
                 t_start = time.time()
-                try:
-                    fr = frame_q.get(timeout=1.0)
-                except Empty:
+                fr, backlog = self._drain_latest_frame(frame_q, timeout=1.0)
+                if fr is None:
                     if stop_evt.is_set():
                         break
                     continue
@@ -1129,9 +1332,17 @@ class StreamService:
                 dets = []
                 tracks = []
                 if bool(getattr(settings, "COMPANION_DETECT_ENABLED", True)):
-                    do_infer = True
-                    skip_n = max(0, int(self.skip_frames or 0))
-                    if skip_n > 0:
+                    do_infer = not (backlog > 0)
+                    comp_skip = getattr(settings, "COMPANION_SKIP_FRAMES", None)
+                    skip_n = max(
+                        0,
+                        int(
+                            comp_skip
+                            if comp_skip is not None
+                            else (self.skip_frames or 0)
+                        ),
+                    )
+                    if skip_n > 0 and do_infer:
                         if skip_counter > 0:
                             do_infer = False
                             skip_counter -= 1
@@ -1152,6 +1363,9 @@ class StreamService:
                                 dets = []
                                 tracks = []
                         except Exception as ce:
+                            if is_tracker_state_error(ce):
+                                self._companion_yolo.reset_tracker()
+                                self._companion_tracker.reset()
                             logger.debug("Companion lane track skipped: %s", ce)
                             dets = []
                             tracks = []
@@ -1214,28 +1428,20 @@ class StreamService:
                         tls.update_lane_observation("companion", stopped_cnt, total_cnt)
                     except Exception:
                         pass
-                    try:
-                        vis_h264 = overlay_traffic_ui(
-                            fr,
-                            [d.model_dump() for d in api_dets],
-                            line_y_px=int(companion_line_y),
-                            show_line=True,
-                        )
-                        c_fps = max(1, int(getattr(settings, "COMPANION_MAX_FPS", 12)))
-                        h264_bgr_companion.write_frame(vis_h264, fps=c_fps)
-                    except Exception as he:
-                        logger.debug("H264 BGR companion skipped: %s", he)
-                    companion_http_active = self._is_http_poll_active(self._http_companion_last_poll_ts)
-                    companion_ws_active = bool(ws_companion_manager.has_clients)
-                    need_jpeg = companion_http_active or companion_ws_active
-                    jpeg_bytes = b""
-                    if need_jpeg:
-                        jpeg_q = max(30, min(95, int(self.jpeg_quality or 75)))
-                        ok_jpg, buf = cv2.imencode(".jpg", fr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
-                        jpeg_bytes = buf.tobytes() if ok_jpg else b""
-
+                    if should_h264_burnin():
+                        try:
+                            vis_h264 = overlay_traffic_ui(
+                                fr,
+                                [d.model_dump() for d in api_dets],
+                                line_y_px=int(companion_line_y),
+                                show_line=True,
+                                in_place=True,
+                            )
+                            c_fps = max(1, int(getattr(settings, "COMPANION_MAX_FPS", 12)))
+                            h264_bgr_companion.write_frame(vis_h264, fps=c_fps)
+                        except Exception as he:
+                            logger.debug("H264 burn-in companion skipped: %s", he)
                     header = {
-                        "v": 1,
                         "detections": [d.model_dump() for d in api_dets],
                         "fps": float(self._companion_fps),
                         "frame_count": int(self._companion_frame_count),
@@ -1255,29 +1461,20 @@ class StreamService:
                         },
                     }
                     with self._companion_lock:
-                        # Keep HTTP polling shape (base64)
-                        frame_b64 = ""
-                        if jpeg_bytes and companion_http_active:
-                            frame_b64 = base64.b64encode(jpeg_bytes).decode()
                         self._companion_latest = {
-                            "frame": frame_b64,
+                            "frame": None,
                             "detections": header["detections"],
                             "fps": header["fps"],
                             "frame_count": header["frame_count"],
                             "stream_active": True,
                         }
+                    try:
+                        if ws_companion_manager.has_clients:
+                            ws_companion_manager.broadcast_text_threadsafe(stats_message_json(header))
+                    except Exception:
+                        pass
                 except Exception as e:
                     logger.debug("Companion publish skipped: %s", e)
-
-                # Broadcast companion via WebSocket
-                try:
-                    if ws_companion_manager.has_clients and self._event_loop is not None:
-                        msg = pack_frame_message(header, jpeg_bytes)
-                        self._event_loop.call_soon_threadsafe(
-                            lambda: asyncio.create_task(ws_companion_manager.broadcast_bytes(msg))
-                        )
-                except Exception:
-                    pass
 
                 sleep_t = frame_interval - (time.time() - t_start)
                 if sleep_t > 0:
@@ -1302,7 +1499,9 @@ class StreamService:
             self._extra_yolo[s] = YOLOModel()
         self._sync_secondary_model(self._extra_yolo[s])
         is_rtsp = str(url).lower().startswith("rtsp://")
-        cap = self._open_video_capture(url, is_rtsp=is_rtsp)
+        cap = self._open_video_capture(
+            url, is_rtsp=is_rtsp, capture_label=f"extra{int(slot)}"
+        )
         if not cap.isOpened():
             logger.warning("StreamService: extra slot %d cannot open stream", int(slot))
             with self._extra_lock:
@@ -1318,16 +1517,9 @@ class StreamService:
                 if not self._extra_running.get(int(slot), False):
                     break
             t_start = time.time()
-            ok, fr = cap.read()
+            ok, fr = self._read_capture_frame(cap, is_rtsp=is_rtsp)
             if not ok or fr is None:
                 continue
-            if is_rtsp:
-                for _ in range(max(0, int(settings.RTSP_FLUSH_FRAMES))):
-                    if not cap.grab():
-                        break
-                ret2, fresh = cap.retrieve()
-                if ret2 and fresh is not None:
-                    fr = fresh
 
             try:
                 max_w = int(self.max_width or 0)
@@ -1405,50 +1597,34 @@ class StreamService:
                     tls.update_lane_observation(str(int(slot)), stopped_cnt, total_cnt)
                 except Exception:
                     pass
-                try:
-                    vis_h264 = overlay_traffic_ui(
-                        fr,
-                        [d.model_dump() for d in api_dets],
-                        line_y_px=int(line_y),
-                        show_line=False,
-                    )
-                    xf = max(1, int(getattr(settings, "EXTRA_MAX_FPS", 12)))
-                    (h264_bgr_extra2 if s == 2 else h264_bgr_extra3).write_frame(vis_h264, fps=xf)
-                except Exception as he:
-                    logger.debug("H264 BGR extra slot %d skipped: %s", s, he)
-                extra_http_active = self._is_http_poll_active(self._http_extra_last_poll_ts.get(int(slot), 0.0))
-                extra_ws_active = bool(ws_manager.has_clients)
-                need_jpeg = extra_http_active or extra_ws_active
-                jpeg_bytes = b""
-                if need_jpeg:
-                    jpeg_q = max(30, min(95, int(self.jpeg_quality or 75)))
-                    ok_jpg, buf = cv2.imencode(".jpg", fr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
-                    jpeg_bytes = buf.tobytes() if ok_jpg else b""
+                if should_h264_burnin():
+                    try:
+                        vis_h264 = overlay_traffic_ui(
+                            fr,
+                            [d.model_dump() for d in api_dets],
+                            line_y_px=int(line_y),
+                            show_line=False,
+                        )
+                        xf = max(1, int(getattr(settings, "EXTRA_MAX_FPS", 12)))
+                        (h264_bgr_extra2 if s == 2 else h264_bgr_extra3).write_frame(vis_h264, fps=xf)
+                    except Exception as he:
+                        logger.debug("H264 burn-in extra slot %d skipped: %s", s, he)
                 header = {
-                    "v": 1,
                     "slot": int(slot),
                     "detections": [d.model_dump() for d in api_dets],
                     "fps": float(fps_val),
                     "stream_active": True,
                 }
                 with self._extra_lock:
-                    # Keep HTTP polling shape (base64)
-                    frame_b64 = ""
-                    if jpeg_bytes and extra_http_active:
-                        frame_b64 = base64.b64encode(jpeg_bytes).decode()
                     self._extra_latest[int(slot)] = {
                         "slot": int(slot),
-                        "frame": frame_b64,
+                        "frame": None,
                         "detections": header["detections"],
                         "fps": header["fps"],
                         "stream_active": True,
                     }
-                # Broadcast on main WS with slot tag (reuse ws_manager)
-                if ws_manager.has_clients and self._event_loop is not None:
-                    msg = pack_frame_message(header, jpeg_bytes)
-                    self._event_loop.call_soon_threadsafe(
-                        lambda: asyncio.create_task(ws_manager.broadcast_bytes(msg))
-                    )
+                if ws_manager.has_clients:
+                    ws_manager.broadcast_text_threadsafe(stats_message_json(header))
             except Exception:
                 pass
 

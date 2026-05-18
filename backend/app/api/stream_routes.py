@@ -24,6 +24,7 @@ from app.services.ffmpeg_relay_service import (
     ffmpeg_relay_extra2_service,
     ffmpeg_relay_extra3_service,
 )
+from app.services.ffmpeg_rtsp_decode import cuda_decode_enabled, ffmpeg_cuda_required
 from app.core.config import settings
 from app.ml.yolo_model import yolo_model
 
@@ -173,6 +174,10 @@ async def stream_status():
         "fps": s.fps,
         "frame_count": s.frame_count,
         "error": s.stream_error or None,
+        "rtsp_decode": {
+            "cuda_wanted": cuda_decode_enabled(),
+            "cuda_required_no_cpu_fallback": ffmpeg_cuda_required(),
+        },
     }
 
 
@@ -266,8 +271,23 @@ def _valid_bgr_frame(frame: cv2.typing.MatLike | None) -> bool:
         return False
 
 
+def _thumb_use_cuda_decode() -> bool:
+    if not bool(getattr(settings, "THUMB_CUDA_DECODE", True)):
+        return False
+    from app.services.ffmpeg_rtsp_decode import cuda_decode_enabled
+
+    return cuda_decode_enabled()
+
+
 def _read_thumbnail_frame(cap: cv2.VideoCapture, *, fast_decode: bool) -> cv2.typing.MatLike | None:
-    """Flush RTSP buffer then grab/retrieve until a decodable HEVC frame appears."""
+    """One frame for camera wall — CUDA FFmpeg pipe when cap is FFmpegRtspCapture."""
+    from app.services.ffmpeg_rtsp_capture import FFmpegRtspCapture
+
+    if isinstance(cap, FFmpegRtspCapture):
+        flush_n = 1 if fast_decode else 2
+        ok, fr = cap.read_fresh(flush_n)
+        return fr if ok and _valid_bgr_frame(fr) else None
+
     try:
         flush_n = int(getattr(settings, "THUMB_FLUSH_FRAMES", 12) or 12)
     except (TypeError, ValueError):
@@ -314,44 +334,66 @@ def _grab_thumbnail(url: str, max_width: int = 320, *, fast_decode: bool = False
             return cached[0]
 
     cap = None
+    decode_mode = "cpu"
+    mw = max(160, min(int(max_width), 960))
     try:
         is_rtsp = str(url).strip().lower().startswith("rtsp://")
         with _suppress_ffmpeg_stderr():
             with _ffmpeg_env_lock:
-                if is_rtsp:
-                    cap = stream_service._open_video_capture(
-                        url, is_rtsp=True, ffmpeg_extra=_THUMB_FFMPEG_EXTRA
+                if is_rtsp and _thumb_use_cuda_decode():
+                    from app.services.ffmpeg_rtsp_capture import FFmpegRtspCapture
+
+                    cap = FFmpegRtspCapture(
+                        url,
+                        label="thumb",
+                        use_live_slot=False,
+                        pipe_max_width=mw,
                     )
+                    decode_mode = getattr(cap, "decode_backend", "") or "cuda"
+                elif is_rtsp:
+                    cap = stream_service._open_video_capture(
+                        url,
+                        is_rtsp=True,
+                        ffmpeg_extra=_THUMB_FFMPEG_EXTRA,
+                        prefer_ffmpeg=False,
+                    )
+                    decode_mode = "opencv"
                 else:
                     cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
                     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    decode_mode = "opencv"
 
             if cap is None or not cap.isOpened():
-                return {"ok": False, "frame": None, "error": "Cannot open stream"}
+                err = getattr(cap, "_last_error", None) if cap is not None else None
+                return {"ok": False, "frame": None, "error": err or "Cannot open stream"}
 
-            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 8000)
-            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 8000)
+            from app.services.ffmpeg_rtsp_capture import FFmpegRtspCapture
+
+            if not isinstance(cap, FFmpegRtspCapture):
+                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 8000)
+                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 8000)
             frame = _read_thumbnail_frame(cap, fast_decode=fast_decode)
 
         if frame is None:
             return {"ok": False, "frame": None, "error": "No frame"}
 
-        mw = max(160, min(int(max_width), 960))
         h, w = frame.shape[:2]
         if w <= 0:
             return {"ok": False, "frame": None, "error": "Bad frame size"}
-        scale = min(1.0, mw / float(w))
-        thumb_w = max(1, int(w * scale))
-        thumb_h = max(1, int(h * scale))
-        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-        thumb = cv2.resize(frame, (thumb_w, thumb_h), interpolation=interp)
+        from app.utils.image_utils import resize_bgr_max_width
 
-        quality = 82 if thumb_w >= 480 else 76
+        thumb = resize_bgr_max_width(
+            frame,
+            mw,
+            use_cuda=bool(getattr(settings, "STREAM_CUDA_RESIZE", False)),
+        )
+
+        quality = 82 if mw >= 480 else 76
         ok, buf = cv2.imencode(".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, quality])
         if not ok:
             return {"ok": False, "frame": None, "error": "Encode failed"}
         b64 = base64.b64encode(buf.tobytes()).decode()
-        result = {"ok": True, "frame": b64, "error": None}
+        result = {"ok": True, "frame": b64, "error": None, "decode": decode_mode}
         with _thumb_cache_lock:
             _thumb_cache[cache_key] = (result, time.time())
         return result

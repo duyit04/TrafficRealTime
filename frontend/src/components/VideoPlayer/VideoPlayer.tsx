@@ -6,6 +6,7 @@
 import { useEffect, useMemo, useRef, useCallback } from 'react';
 import type { Detection, VehicleStats } from '../../types/detection';
 import { drawDetections, drawCountingLine } from '../../utils/canvas';
+import { IconCameraCctv } from '../icons/Icons';
 
 type WorkerEntry = { worker: Worker; releaseTimer?: ReturnType<typeof setTimeout> };
 const workerByCanvas = new WeakMap<HTMLCanvasElement, WorkerEntry>();
@@ -393,10 +394,8 @@ export function VideoPlayer({
           style={{ cursor: onEmptyClick ? 'pointer' : 'default' }}
           aria-label="Chọn camera / kết nối stream"
         >
-          <div className="w-20 h-20 rounded-full border-2 border-slate-300 flex items-center justify-center animate-pulse-slow">
-            <span className="text-4xl">📹</span>
-          </div>
-          <p className="text-sm font-medium">Kết nối stream để xem camera</p>
+          <IconCameraCctv className="h-10 w-10 text-slate-400" aria-hidden />
+          <p className="text-sm font-medium text-slate-600">Kết nối stream để xem camera</p>
         </button>
       )}
       {!overlayOnly && showLiveBadge && frame && (

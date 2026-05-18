@@ -22,15 +22,12 @@ router = APIRouter(tags=["websocket"])
 WS_BINARY_MAGIC = b"TMWS"
 
 
-def pack_frame_message(header: dict[str, Any], jpeg_bytes: bytes) -> bytes:
-    """
-    Pack a single binary WS message:
-      magic(4) + json_len(uint32 LE) + json_utf8 + jpeg_bytes
-    """
+def stats_message_json(header: dict[str, Any]) -> str:
+    """JSON-only WS payload (detections + stats). Video is H264 on /ws/stream-h264/*."""
     import json as _json
 
-    header_bytes = _json.dumps(header, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    return WS_BINARY_MAGIC + struct.pack("<I", len(header_bytes)) + header_bytes + jpeg_bytes
+    body = {"v": 1, **header}
+    return _json.dumps(body, ensure_ascii=False, separators=(",", ":"))
 
 
 class ConnectionManager:
@@ -91,6 +88,18 @@ class ConnectionManager:
             return
         try:
             loop.call_soon_threadsafe(lambda: asyncio.create_task(self.broadcast_bytes(data)))
+        except Exception:
+            pass
+
+    def broadcast_text_threadsafe(self, text: str) -> None:
+        """Thread-safe JSON/text broadcast (stats/detections, no JPEG)."""
+        if not self.active or not text:
+            return
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(lambda: asyncio.create_task(self.broadcast(text)))
         except Exception:
             pass
 

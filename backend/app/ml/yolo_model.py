@@ -21,6 +21,38 @@ from app.core.config import settings
 from app.core.logger import logger
 
 
+def is_tracker_kalman_error(exc: BaseException) -> bool:
+    """ByteTrack/BoT-SORT Kalman filter can throw when covariance goes singular."""
+    if isinstance(exc, np.linalg.LinAlgError):
+        return True
+    msg = str(exc).lower()
+    return (
+        "positive definite" in msg
+        or "leading minor" in msg
+        or "singular matrix" in msg
+    )
+
+
+def is_tracker_state_error(exc: BaseException) -> bool:
+    """Tracker internal state corruption — requires tracker reset to recover."""
+    if is_tracker_kalman_error(exc):
+        return True
+    # model.track() returns [] after partial Kalman reset → [][0] = IndexError
+    if isinstance(exc, IndexError):
+        return True
+    msg = str(exc).lower()
+    return "list index out of range" in msg or "index out of range" in msg
+
+
+def _frame_ok_for_track(frame: np.ndarray | None) -> bool:
+    if frame is None or not hasattr(frame, "shape"):
+        return False
+    if frame.size == 0 or frame.ndim < 2:
+        return False
+    h, w = int(frame.shape[0]), int(frame.shape[1])
+    return h >= 32 and w >= 32
+
+
 def _resolve_yolo_device():
     """
     Pick Ultralytics device + half precision from settings and torch capabilities.
@@ -223,39 +255,59 @@ class YOLOModel:
         """
         if not self.is_loaded:
             return []
+        if not _frame_ok_for_track(frame):
+            return []
 
         with self._infer_lock:
             kwargs = self._runtime_infer_kwargs()
             imgsz = self._effective_imgsz()
-            try:
-                results = self._model.track(
+
+            def _run_track(imgsz_val: int):
+                result_list = self._model.track(
                     frame,
                     verbose=False,
                     conf=conf,
                     tracker=tracker,
                     persist=persist,
-                    imgsz=imgsz,
+                    imgsz=imgsz_val,
                     **kwargs,
-                )[0]
-            except Exception as e:
-                retry_imgsz = self._extract_engine_max_imgsz(e)
-                if retry_imgsz is None or retry_imgsz == imgsz:
-                    raise
-                self._fixed_imgsz_override = retry_imgsz
-                logger.warning(
-                    "YOLOModel: imgsz %s incompatible with engine, retry track at %s",
-                    imgsz,
-                    retry_imgsz,
                 )
-                results = self._model.track(
-                    frame,
-                    verbose=False,
-                    conf=conf,
-                    tracker=tracker,
-                    persist=persist,
-                    imgsz=retry_imgsz,
-                    **kwargs,
-                )[0]
+                if not result_list:
+                    # ultralytics returns [] when tracker state is corrupt after reset
+                    raise IndexError("model.track() returned empty list")
+                return result_list[0]
+
+            try:
+                results = _run_track(imgsz)
+            except Exception as e:
+                if is_tracker_state_error(e):
+                    logger.info(
+                        "YOLOModel: tracker state error (%s), resetting and retrying once",
+                        e,
+                    )
+                    self.reset_tracker()
+                    try:
+                        results = _run_track(imgsz)
+                    except Exception as e2:
+                        if is_tracker_state_error(e2):
+                            # Still broken after reset — return empty rather than crashing
+                            logger.warning(
+                                "YOLOModel: tracker still broken after reset (%s), skipping frame",
+                                e2,
+                            )
+                            return []
+                        raise
+                else:
+                    retry_imgsz = self._extract_engine_max_imgsz(e)
+                    if retry_imgsz is None or retry_imgsz == imgsz:
+                        raise
+                    self._fixed_imgsz_override = retry_imgsz
+                    logger.warning(
+                        "YOLOModel: imgsz %s incompatible with engine, retry track at %s",
+                        imgsz,
+                        retry_imgsz,
+                    )
+                    results = _run_track(retry_imgsz)
             return self._parse_boxes(results)
 
     def reset_tracker(self) -> None:
@@ -313,9 +365,22 @@ class YOLOModel:
         """Parse ultralytics Results into RawDetection list."""
         detections: List[RawDetection] = []
 
+        if results.boxes is None:
+            return detections
+
+        fh = int(getattr(results, "orig_shape", (0, 0))[0] or 0)
+        fw = int(getattr(results, "orig_shape", (0, 0))[1] or 0)
+
         for box in results.boxes:
             cls_id = int(box.cls[0])
             x1, y1, x2, y2 = map(int, box.xyxy[0])
+            if x2 <= x1 or y2 <= y1:
+                continue
+            if (x2 - x1) * (y2 - y1) < 4:
+                continue
+            if fw > 0 and fh > 0:
+                if x1 < -2 or y1 < -2 or x2 > fw + 2 or y2 > fh + 2:
+                    continue
 
             # track_id is available when using model.track()
             tid = None

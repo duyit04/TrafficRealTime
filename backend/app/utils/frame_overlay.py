@@ -14,9 +14,10 @@ def overlay_traffic_ui(
     *,
     line_y_px: int,
     show_line: bool,
+    in_place: bool = False,
 ) -> np.ndarray:
-    """Return a BGR copy of frame with boxes + optional counting line."""
-    out = frame_bgr.copy()
+    """Draw boxes + optional counting line on BGR frame (copy unless in_place)."""
+    out = frame_bgr if in_place else frame_bgr.copy()
     h, w = out.shape[:2]
     for d in detections or []:
         bb = d.get("bbox") if isinstance(d, dict) else None

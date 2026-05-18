@@ -185,7 +185,7 @@ export function CameraWall({
           <p className="text-[10px] text-slate-500 uppercase tracking-wider font-semibold">
             Camera presets — {cameras.length} cameras
           </p>
-          <span className="text-[10px] text-slate-400">auto-refresh ~18s · chỉ ô đang thấy</span>
+          <span className="text-[10px] text-slate-400">auto-refresh ~18s · CUDA decode · chỉ ô đang thấy</span>
         </div>
       ) : null}
 

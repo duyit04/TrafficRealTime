@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 from collections import deque
+from queue import Empty, Full, Queue
 from typing import Optional
 
 import numpy as np
@@ -50,6 +51,15 @@ def _nvenc_output_args() -> list[str]:
     except ValueError:
         surfaces = int(getattr(settings, "H264_NVENC_SURFACES", 32))
     surfaces = max(0, min(surfaces, 64))
+    preset = (os.environ.get("H264_NVENC_PRESET") or "").strip() or str(
+        getattr(settings, "H264_NVENC_PRESET", "p1") or "p1"
+    )
+    bitrate = (os.environ.get("H264_NVENC_BITRATE") or "").strip() or str(
+        getattr(settings, "H264_NVENC_BITRATE", "2500k") or "2500k"
+    )
+    maxrate = (os.environ.get("H264_NVENC_MAXRATE") or "").strip() or str(
+        getattr(settings, "H264_NVENC_MAXRATE", "3500k") or "3500k"
+    )
     return [
         "-an",
         "-c:v",
@@ -59,17 +69,17 @@ def _nvenc_output_args() -> list[str]:
         "-surfaces",
         str(surfaces),
         "-preset",
-        "p1",
+        preset,
         "-tune",
         "ull",
         "-rc",
         "vbr",
         "-b:v",
-        "2500k",
+        bitrate,
         "-maxrate",
-        "3500k",
+        maxrate,
         "-bufsize",
-        "2500k",
+        bitrate,
         "-g",
         "30",
         "-rc-lookahead",
@@ -116,9 +126,50 @@ def _build_cmd(ffmpeg_bin: str, w: int, h: int, fps: int) -> list[str]:
         "pipe:0",
     ]
     if bool(getattr(settings, "H264_CUDA_PIPE_UPLOAD", True)):
-        cmd += ["-vf", f"hwupload_cuda=device={gi}"]
+        # bgr24 must be converted to nv12 on CPU before hwupload_cuda can accept it
+        cmd += ["-vf", f"format=nv12,hwupload_cuda=device={gi}"]
     cmd.extend(_nvenc_output_args())
     return cmd
+
+
+def _build_cpu_cmd(ffmpeg_bin: str, w: int, h: int, fps: int) -> list[str]:
+    """libx264 CPU fallback — used when NVENC is unavailable or crashes immediately."""
+    fps = max(1, min(int(fps), 120))
+    bitrate = (os.environ.get("H264_NVENC_BITRATE") or "").strip() or str(
+        getattr(settings, "H264_NVENC_BITRATE", "2500k") or "2500k"
+    )
+    return [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-video_size",
+        f"{w}x{h}",
+        "-framerate",
+        str(fps),
+        "-thread_queue_size",
+        "512",
+        "-i",
+        "pipe:0",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-tune",
+        "zerolatency",
+        "-b:v",
+        bitrate,
+        "-g",
+        "30",
+        "-f",
+        "mpegts",
+        "pipe:1",
+    ]
 
 
 class H264BgrMpegTsPipe:
@@ -138,6 +189,9 @@ class H264BgrMpegTsPipe:
         self._started_at = 0.0
         self._last_error: str | None = None
         self._stderr_tail: deque[str] = deque(maxlen=12)
+        self._write_q: Queue[bytes | None] = Queue(maxsize=4)
+        self._writer_t: Optional[threading.Thread] = None
+        self._nvenc_failed: bool = False
 
     def stop(self) -> None:
         with self._lock:
@@ -164,6 +218,18 @@ class H264BgrMpegTsPipe:
         if self._stderr_t:
             self._stderr_t.join(timeout=1.5)
             self._stderr_t = None
+        if self._writer_t:
+            while True:
+                try:
+                    self._write_q.get_nowait()
+                except Empty:
+                    break
+            try:
+                self._write_q.put_nowait(None)
+            except Full:
+                pass
+            self._writer_t.join(timeout=2)
+            self._writer_t = None
 
     def status(self) -> dict:
         with self._lock:
@@ -201,15 +267,41 @@ class H264BgrMpegTsPipe:
                 pass
 
     def _reader_loop(self, proc: subprocess.Popen) -> None:
+        first_chunk = True
         try:
             if proc.stdout is None:
+                logger.warning("H264BgrPipe(%s): stdout is None — no output will be produced", self._slot)
                 return
             while True:
                 chunk = proc.stdout.read(188 * 7)
                 if not chunk:
                     if proc.poll() is not None:
+                        rc = proc.returncode
+                        with self._lock:
+                            err = self._last_error
+                            tail = list(self._stderr_tail)
+                            uptime = time.time() - (self._started_at or 0)
+                        detail = " | ".join(tail[-3:]) if tail else (err or "")
+                        logger.warning(
+                            "H264BgrPipe(%s): encoder exited rc=%d%s",
+                            self._slot, rc,
+                            f" — {detail}" if detail else "",
+                        )
+                        # first_chunk=True means this process never produced MPEG-TS output.
+                        # If it also exited non-zero quickly, NVENC likely failed on first frame;
+                        # flag it so subsequent _spawn calls fall back to libx264.
+                        if rc != 0 and first_chunk and uptime < 30.0:
+                            with self._lock:
+                                self._nvenc_failed = True
+                            logger.warning(
+                                "H264BgrPipe(%s): NVENC produced no output — future spawns will use libx264",
+                                self._slot,
+                            )
                         break
                     continue
+                if first_chunk:
+                    first_chunk = False
+                    logger.info("H264BgrPipe(%s): first MPEG-TS bytes flowing (%d B)", self._slot, len(chunk))
                 with self._lock:
                     if self._proc is not proc:
                         break
@@ -221,7 +313,7 @@ class H264BgrMpegTsPipe:
         except Exception as e:
             with self._lock:
                 self._last_error = str(e)
-            logger.debug("H264BgrPipe reader: %s", e)
+            logger.warning("H264BgrPipe(%s) reader error: %s", self._slot, e)
 
     def _shutdown_proc(self, proc: subprocess.Popen) -> None:
         try:
@@ -243,9 +335,18 @@ class H264BgrMpegTsPipe:
         if not ffmpeg_bin:
             with self._lock:
                 self._last_error = "ffmpeg not found (set FFMPEG_BIN or add ffmpeg to PATH)"
+            logger.warning("H264BgrPipe(%s): ffmpeg not found — video will not stream", self._slot)
             return False
 
-        cmd = _build_cmd(ffmpeg_bin, w, h, fps)
+        with self._lock:
+            nvenc_previously_failed = self._nvenc_failed
+        use_nvenc = bool(getattr(settings, "H264_CUDA_PIPE_UPLOAD", True)) and not nvenc_previously_failed
+        if nvenc_previously_failed:
+            logger.info("H264BgrPipe(%s): NVENC previously failed — spawning libx264 directly", self._slot)
+            cmd = _build_cpu_cmd(ffmpeg_bin, w, h, fps)
+        else:
+            cmd = _build_cmd(ffmpeg_bin, w, h, fps)
+        logger.debug("H264BgrPipe(%s): spawn cmd: %s", self._slot, " ".join(cmd))
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -269,6 +370,49 @@ class H264BgrMpegTsPipe:
                 pass
             return False
 
+        # When NVENC is requested, wait briefly to catch immediate crashes (bad GPU/driver).
+        if use_nvenc and not nvenc_previously_failed:
+            time.sleep(0.5)
+            if proc.poll() is not None:
+                stderr_lines: list[str] = []
+                try:
+                    raw_err = proc.stderr.read() if proc.stderr else b""
+                    stderr_lines = raw_err.decode("utf-8", errors="ignore").splitlines()
+                except Exception:
+                    pass
+                err_msg = " | ".join(stderr_lines[-4:]) if stderr_lines else "NVENC crashed immediately"
+                logger.warning("H264BgrPipe(%s): NVENC failed (%s), falling back to libx264", self._slot, err_msg)
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+                cpu_cmd = _build_cpu_cmd(ffmpeg_bin, w, h, fps)
+                try:
+                    proc = subprocess.Popen(
+                        cpu_cmd,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        bufsize=0,
+                    )
+                except Exception as e2:
+                    with self._lock:
+                        self._last_error = f"libx264 fallback spawn failed: {e2}"
+                    logger.warning("H264BgrPipe: libx264 fallback spawn failed: %s", e2)
+                    return False
+
+                if proc.stdin is None or proc.stdout is None:
+                    with self._lock:
+                        self._last_error = "ffmpeg libx264 stdio unavailable"
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    return False
+
+                logger.info("H264BgrPipe(%s): libx264 CPU fallback active", self._slot)
+
         with self._lock:
             self._proc = proc
             self._dims = (w, h, fps)
@@ -282,8 +426,36 @@ class H264BgrMpegTsPipe:
 
         self._reader_t = threading.Thread(target=self._reader_loop, args=(proc,), daemon=True)
         self._reader_t.start()
+        if bool(getattr(settings, "H264_PIPE_ASYNC_WRITE", True)):
+            self._writer_t = threading.Thread(target=self._stdin_writer_loop, daemon=True)
+            self._writer_t.start()
         logger.info("H264BgrPipe(%s): started %dx%d @ %dfps", self._slot, w, h, fps)
         return True
+
+    def _stdin_writer_loop(self) -> None:
+        while True:
+            try:
+                payload = self._write_q.get(timeout=0.5)
+            except Empty:
+                continue
+            if payload is None:
+                break
+            with self._lock:
+                proc = self._proc
+            if proc is None or proc.stdin is None or proc.poll() is not None:
+                continue
+            try:
+                proc.stdin.write(payload)
+            except (BrokenPipeError, OSError) as e:
+                with self._lock:
+                    self._last_error = str(e)
+                logger.warning("H264BgrPipe(%s): stdin write error: %s", self._slot, e)
+                if proc is not None:
+                    self._shutdown_proc(proc)
+                with self._lock:
+                    if self._proc is proc:
+                        self._proc = None
+                        self._dims = None
 
     def _restart_if_needed(self, w: int, h: int, fps: int) -> subprocess.Popen | None:
         """Return live proc for (w,h,fps); restart encoder under lock when dimensions or process invalid."""
@@ -300,6 +472,19 @@ class H264BgrMpegTsPipe:
 
         if old is not None:
             self._shutdown_proc(old)
+            if self._writer_t:
+                # Drain queue then send sentinel so writer thread exits cleanly
+                while True:
+                    try:
+                        self._write_q.get_nowait()
+                    except Empty:
+                        break
+                try:
+                    self._write_q.put_nowait(None)
+                except Full:
+                    pass
+                self._writer_t.join(timeout=2)
+                self._writer_t = None
             if self._reader_t:
                 self._reader_t.join(timeout=2)
                 self._reader_t = None
@@ -328,8 +513,22 @@ class H264BgrMpegTsPipe:
         proc = self._restart_if_needed(w, h, fps)
         if proc is None or proc.stdin is None:
             return
+        raw = bgr.tobytes()
+        if bool(getattr(settings, "H264_PIPE_ASYNC_WRITE", True)) and self._writer_t:
+            try:
+                self._write_q.put_nowait(raw)
+            except Full:
+                try:
+                    _ = self._write_q.get_nowait()
+                except Empty:
+                    pass
+                try:
+                    self._write_q.put_nowait(raw)
+                except Full:
+                    pass
+            return
         try:
-            proc.stdin.write(bgr.tobytes())
+            proc.stdin.write(raw)
         except (BrokenPipeError, OSError) as e:
             with self._lock:
                 self._last_error = str(e)

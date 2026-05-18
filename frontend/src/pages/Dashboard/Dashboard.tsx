@@ -6,7 +6,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef, type ReactNode } from 'react';
 import { IconAlertJam, IconCameraCctv, IconRoiFrame, IconTune } from '../../components/icons/Icons';
 import { useDetection } from '../../hooks/useDetection';
-import { VideoPlayer, H264LivePlayer } from '../../components/VideoPlayer';
+import { H264LivePlayer } from '../../components/VideoPlayer';
 import { RoiDrawer, RoiCanvasOverlay } from '../../components/RoiDrawer';
 import type { RoiPoint } from '../../components/RoiDrawer';
 import { ModelUploader } from '../../components/ModelUploader';
@@ -45,8 +45,8 @@ let toastId = 0;
 
 export function Dashboard() {
   const {
-    currentFrame, detections, stats, wsConnected, usingFallback,
-    companionFrame, companionDetections, companionLinePosition,
+    detections, stats, wsConnected, companionWsConnected, companionActive,
+    companionDetections, companionLinePosition,
     extraLive,
     startStream, startCompanion, stopCompanion, stopStream, reloadStats, setRoi, clearRoi, setRoiSlot, clearRoiSlot, resetCount, updateSettings,
   } = useDetection();
@@ -94,10 +94,6 @@ export function Dashboard() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [cameraOpen, setCameraOpen] = useState(false);
   const [roiOpen, setRoiOpen] = useState(false);
-  const [h264Mode, setH264Mode] = useState(true);
-  const [h264FailedSlots, setH264FailedSlots] = useState<Record<string, boolean>>({});
-  const h264SkipBackupRef = useRef<number | null>(null);
-
   const trimmedStream = streamUrl.trim();
   const trafficPhaseRoadLabels = useMemo(
     (): [string, string] => phaseRoadTitlesFromPrimaryUrl(trimmedStream),
@@ -168,9 +164,9 @@ export function Dashboard() {
   };
 
   const congestion = stats.congestion;
-  const isCompanionLive = streamOn && Boolean(companionFrame);
-  const isExtra2Live = streamOn && Boolean(extraLive?.[2]?.frame);
-  const isExtra3Live = streamOn && Boolean(extraLive?.[3]?.frame);
+  const isCompanionLive = streamOn && companionActive;
+  const isExtra2Live = streamOn && Boolean((extraPreviewUrls[1] ?? '').trim());
+  const isExtra3Live = streamOn && Boolean((extraPreviewUrls[2] ?? '').trim());
 
   const urlToSlot = useCallback((urlRaw: string): string => {
     const u = (urlRaw || '').trim();
@@ -221,50 +217,7 @@ export function Dashboard() {
     return () => window.removeEventListener('keydown', onKey);
   }, [roiOpen]);
 
-  useEffect(() => {
-    if (!streamOn || !h264Mode) {
-      setH264FailedSlots({});
-    }
-  }, [streamOn, h264Mode]);
-
-  const markH264Failed = useCallback((slot: 'primary' | 'companion' | 'extra2' | 'extra3') => {
-    setH264FailedSlots((prev) => (prev[slot] ? prev : { ...prev, [slot]: true }));
-  }, []);
-
-  useEffect(() => {
-    // H264 playback is usually ahead of JPEG detection payload.
-    // Force skip_frames=0 while H264 is on to keep boxes closer to moving objects.
-    if (!streamOn) {
-      if (h264SkipBackupRef.current !== null) {
-        const restoreSkip = h264SkipBackupRef.current;
-        h264SkipBackupRef.current = null;
-        if (Number(settings.skip_frames ?? 0) !== restoreSkip) {
-          setSettings((s) => ({ ...s, skip_frames: restoreSkip }));
-          updateSettings({ skip_frames: restoreSkip });
-        }
-      }
-      return;
-    }
-    const currentSkip = Number(settings.skip_frames ?? 0);
-    if (h264Mode) {
-      if (h264SkipBackupRef.current === null) {
-        h264SkipBackupRef.current = currentSkip;
-      }
-      if (currentSkip !== 0) {
-        setSettings((s) => ({ ...s, skip_frames: 0 }));
-        updateSettings({ skip_frames: 0 });
-      }
-      return;
-    }
-    if (h264SkipBackupRef.current !== null) {
-      const restoreSkip = h264SkipBackupRef.current;
-      h264SkipBackupRef.current = null;
-      if (currentSkip !== restoreSkip) {
-        setSettings((s) => ({ ...s, skip_frames: restoreSkip }));
-        updateSettings({ skip_frames: restoreSkip });
-      }
-    }
-  }, [h264Mode, streamOn, settings.skip_frames, updateSettings]);
+  // H264 burn-in draws boxes on the same frame — INFERENCE_SKIP_FRAMES from .env is safe and improves FPS.
 
   const addToast = useCallback((message: string, type: Toast['type'] = 'info') => {
     const id = ++toastId;
@@ -387,35 +340,27 @@ export function Dashboard() {
     return roiCanvasExtra3Ref;
   }, []);
 
-  const getFrameFor = useCallback((slot: RoiSlotKey): string | Blob | null => {
-    if (slot === 'primary') return currentFrame;
-    if (slot === 'companion') return companionFrame;
-    if (slot === 2) return extraLive?.[2]?.frame ?? null;
-    return extraLive?.[3]?.frame ?? null;
-  }, [currentFrame, companionFrame, extraLive]);
+  const getVideoFor = useCallback((slot: RoiSlotKey): HTMLVideoElement | null => {
+    const canvas = getCanvasRefFor(slot).current;
+    const root = canvas?.closest('.relative');
+    return root?.querySelector('video') ?? null;
+  }, [getCanvasRefFor]);
 
-  async function mapPointsToVideo(points: number[][], frame: string | Blob | null, canvas: HTMLCanvasElement | null) {
-    if (!frame || !canvas) return points;
-    const img = new Image();
-    let objectUrl = '';
-    await new Promise<void>((resolve) => {
-      img.onload = () => resolve();
-      img.onerror = () => resolve();
-      if (frame instanceof Blob) {
-        objectUrl = URL.createObjectURL(frame);
-        img.src = objectUrl;
-      } else {
-        img.src = `data:image/jpeg;base64,${frame}`;
-      }
-    });
-    if (objectUrl) URL.revokeObjectURL(objectUrl);
-    if (!(img.naturalWidth > 0 && img.naturalHeight > 0)) return points;
+  function mapPointsToVideo(
+    points: number[][],
+    canvas: HTMLCanvasElement | null,
+    video: HTMLVideoElement | null,
+  ) {
+    if (!canvas) return points;
+    const vw = video?.videoWidth ?? 1280;
+    const vh = video?.videoHeight ?? 720;
+    if (!(vw > 0 && vh > 0)) return points;
 
     const cw = canvas.offsetWidth;
     const ch = canvas.offsetHeight;
     if (!(cw > 0 && ch > 0)) return points;
 
-    const imgRatio = img.naturalWidth / img.naturalHeight;
+    const imgRatio = vw / vh;
     const canRatio = cw / ch;
     let dw: number, dh: number, dx: number, dy: number;
     if (imgRatio > canRatio) {
@@ -423,8 +368,8 @@ export function Dashboard() {
     } else {
       dh = ch; dw = ch * imgRatio; dx = (cw - dw) / 2; dy = 0;
     }
-    const scaleX = img.naturalWidth / dw;
-    const scaleY = img.naturalHeight / dh;
+    const scaleX = vw / dw;
+    const scaleY = vh / dh;
     return points.map(([x, y]) => [
       Math.round((x - dx) * scaleX),
       Math.round((y - dy) * scaleY),
@@ -432,15 +377,15 @@ export function Dashboard() {
   }
 
   const handleApplyRoiFor = useCallback(async (slot: RoiSlotKey, canvasPoints: number[][]) => {
-    const frame = getFrameFor(slot);
     const canvas = getCanvasRefFor(slot).current;
-    const videoPoints = await mapPointsToVideo(canvasPoints, frame, canvas);
+    const video = getVideoFor(slot);
+    const videoPoints = mapPointsToVideo(canvasPoints, canvas, video);
     if (slot === 'primary') await setRoi(videoPoints);
     else await setRoiSlot(slot, videoPoints);
 
     setRoiBySlot((prev) => ({ ...prev, [String(slot)]: { ...prev[String(slot)], active: true, drawing: false } }));
     addToast(`ROI (Camera ${slot === 'primary' ? 1 : slot === 'companion' ? 2 : slot === 2 ? 3 : 4}) đã áp dụng (${canvasPoints.length} điểm)`, 'success');
-  }, [addToast, getCanvasRefFor, getFrameFor, setRoi, setRoiSlot]);
+  }, [addToast, getCanvasRefFor, getVideoFor, setRoi, setRoiSlot]);
 
   const handleClearRoiFor = useCallback(async (slot: RoiSlotKey) => {
     if (slot === 'primary') await clearRoi();
@@ -454,13 +399,13 @@ export function Dashboard() {
   const roiActiveSlots = useMemo(() => {
     const slots: RoiSlotKey[] = [];
     if (streamOn && trimmedStream) slots.push('primary');
-    if (streamOn && Boolean(companionFrame)) slots.push('companion');
-    if (streamOn && Boolean(extraLive?.[2]?.frame)) slots.push(2);
-    if (streamOn && Boolean(extraLive?.[3]?.frame)) slots.push(3);
+    if (streamOn && companionActive) slots.push('companion');
+    if (isExtra2Live) slots.push(2);
+    if (isExtra3Live) slots.push(3);
     // If nothing is live yet, still allow configuring Camera 1.
     if (slots.length === 0) slots.push('primary');
     return slots;
-  }, [streamOn, trimmedStream, companionFrame, extraLive]);
+  }, [streamOn, trimmedStream, companionActive, isExtra2Live, isExtra3Live]);
 
   useEffect(() => {
     // Keep roiTarget valid when camera slots change
@@ -506,16 +451,17 @@ export function Dashboard() {
         <div className="flex items-center gap-2 shrink-0">
           <StatusPill label={stats.model_loaded ? stats.model_name.replace('.pt', '') : 'No Model'} active={stats.model_loaded} />
           <StatusPill label={deviceInfo.cuda_available ? 'GPU' : 'CPU'} active={deviceInfo.cuda_available} title={deviceInfo.device_name ?? undefined} />
-          <StatusPill
-            label={h264Mode ? 'H264' : 'JPEG'}
-            active={h264Mode}
-            onClick={streamOn ? () => setH264Mode((v) => !v) : undefined}
-            title={
-              streamOn
-                ? (h264Mode ? 'Click để chuyển sang JPEG' : 'Click để thử lại H264')
-                : 'Bật stream để chọn mode'
-            }
-          />
+          <StatusPill label="H264" active={streamOn} title="Video: H264 NVENC (box burn-in)" />
+          <button
+            type="button"
+            onClick={() => setCameraOpen(true)}
+            className="h-8 px-2.5 inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 hover:text-accent transition-colors shadow-sm"
+            title="Camera / Stream"
+            aria-label="Camera / Stream"
+          >
+            <IconCameraCctv className="h-4 w-4 shrink-0" aria-hidden />
+            <span className="text-[11px] font-bold hidden sm:inline">Camera</span>
+          </button>
         </div>
 
         {/* Center: system title */}
@@ -576,15 +522,10 @@ export function Dashboard() {
           {streamOn && (
             <>
               <span>·</span>
-              {usingFallback ? (
-                <span className="flex items-center gap-1 text-amber-600 font-semibold" title="WebSocket không khả dụng, đang dùng HTTP polling (FPS thấp hơn)">
-                  <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
-                  Polling
-                </span>
-              ) : wsConnected ? (
-                <span className="flex items-center gap-1 text-emerald-600 font-semibold" title="Kết nối WebSocket đang hoạt động">
+              {wsConnected ? (
+                <span className="flex items-center gap-1 text-emerald-600 font-semibold" title="WebSocket stats/detections">
                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                  WebSocket
+                  WS
                 </span>
               ) : (
                 <span className="flex items-center gap-1 text-slate-400" title="Đang kết nối WebSocket...">
@@ -674,17 +615,7 @@ export function Dashboard() {
                   </div>
                 ) : null}
                 <div className="relative overflow-hidden flex-1 min-h-0">
-                  {h264Mode && streamOn && !h264FailedSlots.primary ? (
-                    <H264LivePlayer enabled={true} onError={() => markH264Failed('primary')} />
-                  ) : (
-                    <VideoPlayer
-                      frame={currentFrame}
-                      detections={detections}
-                      stats={statsForView}
-                      showLine={countingEnabled}
-                      onEmptyClick={() => setCameraOpen(true)}
-                    />
-                  )}
+                  <H264LivePlayer enabled={streamOn} onSelectCamera={() => setCameraOpen(true)} />
                   <RoiCanvasOverlay
                     points={roiBySlot.primary.points}
                     setPoints={(p) => setRoiBySlot((prev) => ({ ...prev, primary: { ...prev.primary, points: typeof p === 'function' ? (p as any)(prev.primary.points) : p } }))}
@@ -706,7 +637,7 @@ export function Dashboard() {
                       const isManual = manualPicked.length > 0 && manualPicked === slot.url;
                       const isManualLive2 = isManual && i === 0; // màn 2 có thể chạy companion LIVE
                       const extraSlot = i === 1 ? 2 : i === 2 ? 3 : 0;
-                      const isExtraLive = extraSlot > 0 && Boolean(extraLive?.[extraSlot]?.frame);
+                      const isExtraLive = extraSlot > 0 && Boolean(extraLive?.[extraSlot]?.active);
                       return (
                     <div className="min-w-0">
                       <div className="text-[10px] font-bold uppercase tracking-wide text-slate-600">
@@ -728,17 +659,7 @@ export function Dashboard() {
                     if (isManualLive2) {
                       return (
                     <div className="relative overflow-hidden flex-1 min-h-0">
-                      {h264Mode && streamOn && !h264FailedSlots.companion ? (
-                        <H264LivePlayer enabled={true} wsPath="/ws/stream-h264/companion" onError={() => markH264Failed('companion')} />
-                      ) : (
-                        <VideoPlayer
-                          frame={companionFrame}
-                          detections={companionDetections}
-                          stats={companionStatsForView}
-                          showLine={countingEnabled}
-                          onEmptyClick={() => { setAssignExtraIndex(0); setCameraOpen(true); }}
-                        />
-                      )}
+                      <H264LivePlayer enabled={streamOn && companionActive} wsPath="/ws/stream-h264/companion" />
                       <RoiCanvasOverlay
                         points={roiBySlot.companion.points}
                         setPoints={(p) => setRoiBySlot((prev) => ({ ...prev, companion: { ...prev.companion, points: typeof p === 'function' ? (p as any)(prev.companion.points) : p } }))}
@@ -752,24 +673,13 @@ export function Dashboard() {
                     </div>
                       );
                     }
-                    if (live && live.frame) {
+                    if (extraSlot > 0 && (extraSlot === 2 ? isExtra2Live : isExtra3Live)) {
                       return (
                     <div className="relative overflow-hidden flex-1 min-h-0">
-                      {h264Mode && streamOn && !(extraSlot === 2 ? h264FailedSlots.extra2 : h264FailedSlots.extra3) ? (
-                        <H264LivePlayer
-                          enabled={true}
-                          wsPath={extraSlot === 2 ? '/ws/stream-h264/extra2' : '/ws/stream-h264/extra3'}
-                          onError={() => markH264Failed(extraSlot === 2 ? 'extra2' : 'extra3')}
-                        />
-                      ) : (
-                        <VideoPlayer
-                          frame={live.frame}
-                          detections={live.dets}
-                          stats={statsForView}
-                          showLine={false}
-                          onEmptyClick={() => { setAssignExtraIndex(i); setCameraOpen(true); }}
-                        />
-                      )}
+                      <H264LivePlayer
+                        enabled={streamOn}
+                        wsPath={extraSlot === 2 ? '/ws/stream-h264/extra2' : '/ws/stream-h264/extra3'}
+                      />
                       <RoiCanvasOverlay
                         points={(extraSlot === 2 ? roiBySlot['2'] : roiBySlot['3']).points}
                         setPoints={(p) => setRoiBySlot((prev) => {
@@ -813,6 +723,7 @@ export function Dashboard() {
           {/* Stats + Traffic Light panel (right sidebar) */}
           <aside className="w-64 shrink-0 border-l border-slate-200 overflow-y-auto p-3 bg-white flex flex-col gap-3">
             <TrafficLightPanel
+              streamActive={streamOn}
               activeUrls={[trimmedStream, ...previewSlots.map((s) => s.url)].filter(Boolean)}
               cameraOptions={cameraOptions}
               selectedUrls={tlSelectedUrls}
@@ -821,28 +732,17 @@ export function Dashboard() {
               }
             />
 
-            <div className="flex items-center justify-between">
-              <h2 className="text-xs font-bold uppercase tracking-wider text-slate-500">Thống kê</h2>
-              <span className={`w-2 h-2 rounded-full ${streamOn ? 'bg-accent animate-pulse' : 'bg-slate-300'}`} />
-            </div>
-            <CounterPanel
-              stats={countingEnabled ? statsForView : { ...statsForView, total: 0, classes: {} }}
-              onReset={resetCount}
-              onExport={handleExport}
-            />
-            <hr className="border-slate-100" />
-
-            <div className="mt-auto" />
-            <div className="rounded-xl border border-slate-200 bg-white p-2">
+            <div className="rounded-xl border border-slate-200 bg-white p-2 shrink-0">
               <div className="grid grid-cols-3 gap-2">
                 <button
                   type="button"
                   onClick={() => setCameraOpen(true)}
-                  className="h-10 w-full inline-flex items-center justify-center rounded-lg border border-slate-200 bg-white hover:bg-slate-50 transition-colors text-slate-500 hover:text-accent"
+                  className="h-10 w-full inline-flex flex-col items-center justify-center gap-0.5 rounded-lg border border-accent/30 bg-accent/5 hover:bg-accent/10 transition-colors text-accent"
                   title="Camera / Stream"
                   aria-label="Camera / Stream"
                 >
                   <IconCameraCctv className="h-[1.125rem] w-[1.125rem]" aria-hidden />
+                  <span className="text-[9px] font-bold leading-none">Camera</span>
                 </button>
                 <button
                   type="button"
@@ -864,6 +764,17 @@ export function Dashboard() {
                 </button>
               </div>
             </div>
+
+            <div className="flex items-center justify-between">
+              <h2 className="text-xs font-bold uppercase tracking-wider text-slate-500">Thống kê</h2>
+              <span className={`w-2 h-2 rounded-full ${streamOn ? 'bg-accent animate-pulse' : 'bg-slate-300'}`} />
+            </div>
+            <CounterPanel
+              stats={countingEnabled ? statsForView : { ...statsForView, total: 0, classes: {} }}
+              onReset={resetCount}
+              onExport={handleExport}
+            />
+            <hr className="border-slate-100" />
           </aside>
 
         </main>

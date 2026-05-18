@@ -87,11 +87,35 @@ class Settings(BaseSettings):
     # NVENC GPU index and surface count (.env: H264_FFMPEG_GPU, H264_NVENC_SURFACES)
     H264_FFMPEG_GPU: int = 0
     H264_NVENC_SURFACES: int = 32
+    H264_NVENC_PRESET: str = "p1"
+    H264_NVENC_BITRATE: str = "2500k"
+    H264_NVENC_MAXRATE: str = "3500k"
+    # Non-blocking stdin writes to FFmpeg (when supported by the pipe service).
+    H264_PIPE_ASYNC_WRITE: bool = True
+    # H264: ffmpeg_burnin (FFmpeg decode + box burn-in + NVENC) | rtsp_relay | bgr_burnin (OpenCV).
+    H264_PIPELINE: str = "ffmpeg_burnin"
+
+    # VLC-style RTSP: FFmpeg subprocess decode with error concealment (vs OpenCV VideoCapture).
+    RTSP_FFMPEG_PIPE_DECODE: bool = True
+    # When True: live RTSP must use FFmpeg CUDA decode (no CPU/OpenCV fallback). HEVC needs NVDEC.
+    RTSP_FFMPEG_CUDA_REQUIRED: bool = True
+    # Max simultaneous FFmpeg RTSP decode pipes (live workers only; thumbnails excluded).
+    FFMPEG_CAPTURE_MAX_CONCURRENT: int = 2
+    # Feature flags for optional full-GPU stream paths (reserved / future hooks).
+    STREAM_GPU_PIPELINE: bool = False
+    STREAM_GPU_FULL_CUDA_PATH: bool = False
+    STREAM_GPU_OVERLAY_TORCHVISION: bool = False
+    STREAM_OVERLAY_MAX_LABELS: int = 45
+    # Skip N inference frames on extra streams (cam3/cam4); 0 = infer every frame.
+    EXTRA_SKIP_FRAMES: int = 0
 
     # Camera wall thumbnails (/stream/thumbnail) — avoid opening many RTSP at once
     THUMB_CACHE_TTL: float = 25.0
     THUMB_MAX_CONCURRENT: int = 2
     THUMB_FLUSH_FRAMES: int = 12
+    # Camera wall: NVDEC CUDA decode (separate slot pool from live stream).
+    THUMB_CUDA_DECODE: bool = True
+    THUMB_FFMPEG_MAX_CONCURRENT: int = 1
 
     # ── YOLO inference size ────────────────────────────────────────────────────
     # Input image size for YOLO inference. Valid values: 320, 416, 480, 640.

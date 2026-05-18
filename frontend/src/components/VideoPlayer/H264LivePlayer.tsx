@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { getWebSocketUrl } from '../../services/api';
+import { IconCameraCctv } from '../icons/Icons';
 import mpegts from 'mpegts.js';
 
 type MpegTsPlayer = {
@@ -15,24 +16,18 @@ type MpegTsPlayer = {
 
 interface Props {
   enabled: boolean;
-  onError?: () => void;
   wsPath?: string;
+  /** Khi chưa bật stream — bấm vùng đen để mở chọn camera */
+  onSelectCamera?: () => void;
 }
 
-export function H264LivePlayer({ enabled, onError, wsPath = '/ws/stream-h264' }: Props) {
+export function H264LivePlayer({ enabled, wsPath = '/ws/stream-h264', onSelectCamera }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const playerRef = useRef<MpegTsPlayer | null>(null);
   const bootTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const watchdogRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const firstFrameSeenRef = useRef(false);
   const lastFrameAtRef = useRef(0);
   const errorBurstRef = useRef<{ count: number; windowStart: number }>({ count: 0, windowStart: 0 });
-  const onErrorRef = useRef<Props['onError']>(onError);
-
-  useEffect(() => {
-    onErrorRef.current = onError;
-  }, [onError]);
-
   useEffect(() => {
     if (!enabled) return;
     let dead = false;
@@ -43,15 +38,8 @@ export function H264LivePlayer({ enabled, onError, wsPath = '/ws/stream-h264' }:
     let boundVideo: HTMLVideoElement | null = null;
     let markFrameSeen: (() => void) | null = null;
 
-    const triggerFallback = () => {
-      if (dead) return;
-      dead = true;
-      onErrorRef.current?.();
-    };
-
     const boot = async () => {
       if (dead || !mpegts.isSupported()) {
-        triggerFallback();
         return;
       }
       const video = videoRef.current;
@@ -91,40 +79,17 @@ export function H264LivePlayer({ enabled, onError, wsPath = '/ws/stream-h264' }:
           } else {
             b.count += 1;
           }
-          if (b.count >= 3) triggerFallback();
         });
       }
       p.on('error', () => {
-        const now = Date.now();
-        const b = errorBurstRef.current;
-        if (now - b.windowStart > 8000) {
-          b.windowStart = now;
-          b.count = 1;
-        } else {
-          b.count += 1;
-        }
-        // Allow short RTSP jitter/decode hiccups without dropping to JPEG immediately.
-        if (b.count >= 4 && (now - lastFrameAtRef.current) > 4500) {
-          triggerFallback();
-        }
+        // H264 only — log/debounce errors, no JPEG fallback.
       });
 
-      // If H264 relay is connected but no decodable frames arrive, avoid black screen.
       bootTimeoutRef.current = setTimeout(() => {
-        if (!firstFrameSeenRef.current) triggerFallback();
-      }, 5000);
-
-      // Runtime watchdog: tolerate short stalls, fallback only on sustained freeze.
-      watchdogRef.current = setInterval(() => {
-        if (dead) return;
-        const v = videoRef.current;
-        if (!v) return;
-        const idleMs = Date.now() - (lastFrameAtRef.current || 0);
-        if (!firstFrameSeenRef.current && v.readyState < 2 && idleMs < 7000) return;
-        if (idleMs > 7000 && v.readyState < 2) {
-          triggerFallback();
+        if (!firstFrameSeenRef.current) {
+          console.warn('[H264LivePlayer] no frames yet:', wsPath);
         }
-      }, 2500);
+      }, 12000);
     };
 
     void boot();
@@ -133,10 +98,6 @@ export function H264LivePlayer({ enabled, onError, wsPath = '/ws/stream-h264' }:
       if (bootTimeoutRef.current) {
         clearTimeout(bootTimeoutRef.current);
         bootTimeoutRef.current = null;
-      }
-      if (watchdogRef.current) {
-        clearInterval(watchdogRef.current);
-        watchdogRef.current = null;
       }
       if (boundVideo && markFrameSeen) {
         try { boundVideo.removeEventListener('loadeddata', markFrameSeen); } catch {}
@@ -156,10 +117,32 @@ export function H264LivePlayer({ enabled, onError, wsPath = '/ws/stream-h264' }:
 
   return (
     <div className="relative w-full h-full bg-black overflow-hidden">
-      <video ref={videoRef} className="w-full h-full object-contain" muted autoPlay playsInline />
-      <div className="absolute top-3 right-3 flex items-center gap-1.5 bg-indigo-600 text-white text-[11px] font-bold px-2.5 py-1 rounded-full z-10 shadow">
-        H264
-      </div>
+      {!enabled && (
+        <button
+          type="button"
+          onClick={onSelectCamera}
+          className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-2.5 text-slate-500 bg-slate-100 hover:bg-slate-50 transition-colors"
+          style={{ cursor: onSelectCamera ? 'pointer' : 'default' }}
+          aria-label="Chọn camera / kết nối stream"
+        >
+          <IconCameraCctv className="h-10 w-10 text-slate-400" aria-hidden />
+          <p className="text-sm font-medium text-slate-600">Chọn camera để xem</p>
+          <p className="text-[11px] text-slate-400">Bấm để mở Camera / Stream</p>
+        </button>
+      )}
+      <video
+        ref={videoRef}
+        className="w-full h-full object-contain"
+        muted
+        autoPlay
+        playsInline
+        style={{ visibility: enabled ? 'visible' : 'hidden' }}
+      />
+      {enabled ? (
+        <div className="absolute top-3 right-3 flex items-center gap-1.5 bg-indigo-600 text-white text-[11px] font-bold px-2.5 py-1 rounded-full z-10 shadow">
+          H264
+        </div>
+      ) : null}
     </div>
   );
 }

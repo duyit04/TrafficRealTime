@@ -5,7 +5,9 @@ Traffic Monitor – YOLOv8 Vehicle Detection & Counting API
 
 from __future__ import annotations
 import asyncio
+import ctypes
 import os
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -38,18 +40,27 @@ def _log_gpu_startup_profile() -> None:
         rtsp_cuda_decode = False
     logger.info(
         "GPU profile: torch.cuda=%s device=%s | YOLO_DEVICE=%s RTSP_hw_decode=%s "
-        "STREAM_CUDA_RESIZE=%s H264_CUDA_PIPE_UPLOAD=%s",
+        "STREAM_CUDA_RESIZE=%s H264_PIPELINE=%s",
         cuda_ok,
         name or "n/a",
         str(getattr(settings, "YOLO_DEVICE", "?")),
         rtsp_cuda_decode,
         bool(getattr(settings, "STREAM_CUDA_RESIZE", False)),
-        bool(getattr(settings, "H264_CUDA_PIPE_UPLOAD", False)),
+        str(getattr(settings, "H264_PIPELINE", "rtsp_relay")),
     )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Windows: raise multimedia timer resolution to 1ms so time.sleep is accurate enough
+    # for 30fps frame pacing (default resolution is ~15ms which causes ±5fps jitter).
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.winmm.timeBeginPeriod(1)
+            logger.info("Windows multimedia timer: 1ms resolution")
+        except Exception:
+            pass
+
     # Quieter libav when opening short RTSP grabs (camera wall thumbnails).
     os.environ.setdefault("AV_LOG_LEVEL", "error")
     os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")

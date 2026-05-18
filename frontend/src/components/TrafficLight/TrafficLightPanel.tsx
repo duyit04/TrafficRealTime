@@ -10,6 +10,8 @@ export type TrafficLightPanelProps = {
   cameraOptions?: readonly { label: string; url: string }[];
   selectedUrls?: readonly [string, string];
   onSelectUrl?: (phaseIndex: 0 | 1, url: string) => void;
+  /** Luồng camera chính đang Connect — cần cập nhật "Dừng ROI". */
+  streamActive?: boolean;
 };
 
 function getRtspRoot(url: string): string {
@@ -258,6 +260,7 @@ export function TrafficLightPanel({
   cameraOptions,
   selectedUrls,
   onSelectUrl,
+  streamActive = false,
 }: TrafficLightPanelProps = {}) {
   const [state, setState] = useState<TLState | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval>>();
@@ -275,21 +278,37 @@ export function TrafficLightPanel({
     return [labelFor(0), labelFor(1)];
   }, [selectedUrls, cameraOptions, phaseRoadLabels]);
 
-  // Poll ~4×/s để đếm ngược trong đèn mượt hơn (backend tick ~250ms).
+  // Chỉ poll khi cần: bật gợi ý (đếm ngược) hoặc đang stream (cập nhật Dừng ROI).
   useEffect(() => {
+    let dead = false;
     const poll = async () => {
+      if (dead) return;
       try {
         const s = await trafficLightApi.getState();
+        if (dead) return;
         setState(s);
         setAdviceEnabled(Boolean(s.lane_density_advice?.enabled));
       } catch {
         // ignore
       }
     };
-    poll();
-    pollRef.current = setInterval(poll, 250);
-    return () => clearInterval(pollRef.current);
-  }, []);
+
+    void poll();
+
+    const needInterval = streamActive || adviceEnabled;
+    if (!needInterval) {
+      return () => {
+        dead = true;
+      };
+    }
+
+    const intervalMs = adviceEnabled ? 500 : 2000;
+    pollRef.current = setInterval(() => void poll(), intervalMs);
+    return () => {
+      dead = true;
+      clearInterval(pollRef.current);
+    };
+  }, [streamActive, adviceEnabled]);
 
   const anyRtspSelected = Boolean(selectedUrls?.[0]?.trim() || selectedUrls?.[1]?.trim());
   const [rtspModalOpen, setRtspModalOpen] = useState(false);
