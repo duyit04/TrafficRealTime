@@ -374,6 +374,16 @@ class YOLOModel:
         out = Path(str(exported)) if exported else src.with_suffix(".engine")
         if not out.exists():
             raise RuntimeError("TensorRT export finished but .engine file not found")
+
+        # Xóa file .onnx trung gian mà Ultralytics để lại sau khi build TensorRT
+        onnx_artifact = src.with_suffix(".onnx")
+        if onnx_artifact.exists():
+            try:
+                onnx_artifact.unlink()
+                logger.info("YOLOModel: removed intermediate ONNX artifact %s", onnx_artifact.name)
+            except Exception as e:
+                logger.warning("YOLOModel: could not remove ONNX artifact: %s", e)
+
         return out
 
     # ── Private ───────────────────────────────────────────────────────────────

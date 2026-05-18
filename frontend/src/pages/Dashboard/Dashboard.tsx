@@ -1019,7 +1019,7 @@ export function Dashboard() {
 
               <div className="p-4 overflow-auto">
                 <div className="rounded-xl border border-slate-200 bg-white p-3 mb-4">
-                  <div className="text-[11px] font-bold text-slate-600 uppercase tracking-wide mb-2">Model (.pt)</div>
+                  <div className="text-[11px] font-bold text-slate-600 uppercase tracking-wide mb-2">Export TensorRT</div>
                   <ModelUploader
                     models={models}
                     onModelsChange={reloadModels}
@@ -1038,6 +1038,7 @@ export function Dashboard() {
                       min={0.1} max={0.95} step={0.01}
                       display={settings.conf_threshold.toFixed(2)}
                       onChange={(v) => handleSettingChange('conf_threshold', v)}
+                      onCommit={(v) => addToast(`Confidence: ${v.toFixed(2)}`, 'info')}
                     />
                     <SliderField
                       label="Counting Line"
@@ -1045,7 +1046,13 @@ export function Dashboard() {
                       min={0.1} max={0.9} step={0.01}
                       display={`${Math.round(settings.line_position * 100)}%`}
                       onChange={(v) => handleSettingChange('line_position', v)}
+                      onCommit={(v) => addToast(`Counting Line: ${Math.round(v * 100)}%`, 'info')}
                     />
+                    {roiBySlot.primary?.active && (
+                      <p className="text-[10px] text-amber-600 mt-0.5 mb-1">
+                        ROI đang bật — đường đếm tự động theo giữa ROI, slider không có tác dụng.
+                      </p>
+                    )}
                     <SliderField
                       label="Inference Skip Frames"
                       value={settings.skip_frames ?? 0}
@@ -1054,6 +1061,10 @@ export function Dashboard() {
                       step={1}
                       display={`${settings.skip_frames ?? 0}`}
                       onChange={(v) => handleSettingChange('skip_frames', v)}
+                      onCommit={(v) => addToast(
+                        v === 0 ? 'Skip Frames: tắt (infer mỗi frame)' : `Skip Frames: ${v} (infer 1/${v + 1} frame)`,
+                        'info'
+                      )}
                     />
                   </div>
 
@@ -1069,7 +1080,7 @@ export function Dashboard() {
                           setSettings((s) => ({ ...s, tracker_type: v }));
                           updateSettings({ tracker_type: v });
                           const names: Record<string, string> = { bytetrack: 'ByteTrack', botsort: 'BoT-SORT' };
-                          addToast(`Da chuyen tracker sang ${names[v] ?? v}`, 'success');
+                          addToast(`Tracker: ${names[v] ?? v}`, 'success');
                         }}
                         className="w-full text-xs border border-slate-300 rounded-lg px-2 py-2 bg-white text-slate-700"
                       >
@@ -1086,7 +1097,7 @@ export function Dashboard() {
                           const v = e.target.value as 'all' | 'direction';
                           setSettings((s) => ({ ...s, counting_mode: v }));
                           updateSettings({ counting_mode: v });
-                          addToast(v === 'all' ? 'Dem tat ca (ko phan biet chieu)' : 'Dem theo 2 chieu IN/OUT', 'success');
+                          addToast(v === 'all' ? 'Chế độ: Đếm tổng hợp' : 'Chế độ: Đếm theo chiều IN / OUT', 'success');
                         }}
                         className="w-full text-xs border border-slate-300 rounded-lg px-2 py-2 bg-white text-slate-700"
                       >
@@ -1099,7 +1110,11 @@ export function Dashboard() {
                       <span className="text-[11px] text-slate-500">Enable Counting</span>
                       <button
                         type="button"
-                        onClick={() => setCountingEnabled((v) => !v)}
+                        onClick={() => {
+                          const next = !countingEnabled;
+                          setCountingEnabled(next);
+                          addToast(next ? 'Hiển thị số đếm xe' : 'Ẩn số đếm xe (backend vẫn đếm)', 'info');
+                        }}
                         className={`relative inline-flex h-4 w-8 items-center rounded-full border transition-colors ${
                           countingEnabled ? 'bg-accent border-accent' : 'bg-slate-200 border-slate-300'
                         }`}
@@ -1204,9 +1219,9 @@ function SideCard({ title, icon, children }: { title: string; icon: string; chil
   );
 }
 
-function SliderField({ label, value, min, max, step, display, onChange }: {
+function SliderField({ label, value, min, max, step, display, onChange, onCommit }: {
   label: string; value: number; min: number; max: number; step: number;
-  display: string; onChange: (v: number) => void;
+  display: string; onChange: (v: number) => void; onCommit?: (v: number) => void;
 }) {
   return (
     <div className="mb-3 last:mb-0">
@@ -1217,6 +1232,7 @@ function SliderField({ label, value, min, max, step, display, onChange }: {
       <input
         type="range" min={min} max={max} step={step} value={value}
         onChange={(e) => onChange(parseFloat(e.target.value))}
+        onPointerUp={(e) => onCommit?.(parseFloat((e.target as HTMLInputElement).value))}
         className="w-full h-1.5 appearance-none bg-slate-200 rounded-full cursor-pointer accent-accent"
         style={{ accentColor: '#2563eb' }}
       />
