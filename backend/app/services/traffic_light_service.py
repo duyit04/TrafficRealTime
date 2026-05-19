@@ -47,6 +47,7 @@ class DisplayOnlyTrafficLightService:
         self._state.mode = "manual"
 
         self._state_lock = threading.RLock()
+        self._obs_lock = threading.Lock()
         self._stream_live: bool = False
 
         # Fixed-cycle timing for UI display.
@@ -156,18 +157,21 @@ class DisplayOnlyTrafficLightService:
         """
         key = _normalize_slot(slot)
         now = time.monotonic()
-        obs = self._obs_by_slot.get(key) or LaneObs()
-        obs.stopped_count = int(max(0, stopped_count))
-        obs.total_count = int(max(0, total_count))
-        obs.updated_at = float(now)
-        self._obs_by_slot[key] = obs
+        with self._obs_lock:
+            obs = self._obs_by_slot.get(key) or LaneObs()
+            obs.stopped_count = int(max(0, stopped_count))
+            obs.total_count = int(max(0, total_count))
+            obs.updated_at = float(now)
+            self._obs_by_slot[key] = obs
 
     def _effective_queues_locked(self) -> tuple[int, int]:
         """Stopped-in-ROI counts per phase (0 if observation missing or stale >2s)."""
         out: list[int] = []
+        with self._obs_lock:
+            snapshot = dict(self._obs_by_slot)
         for idx in range(2):
             slot = self._phase_slot[idx]
-            obs = self._obs_by_slot.get(slot)
+            obs = snapshot.get(slot)
             stale = True
             if obs is not None:
                 stale = (time.monotonic() - float(obs.updated_at)) > 2.0
@@ -348,10 +352,12 @@ class DisplayOnlyTrafficLightService:
         self._phase_green_seconds[0] = float(geff_ui)
         self._phase_green_seconds[1] = float(geff_ui)
 
+        with self._obs_lock:
+            obs_snapshot = dict(self._obs_by_slot)
         for idx, p in enumerate(self._state.phases[:2]):
             p.phase_id = idx
             slot = self._phase_slot[idx] if idx < len(self._phase_slot) else "primary"
-            obs = self._obs_by_slot.get(slot)
+            obs = obs_snapshot.get(slot)
             stale = True
             if obs is not None:
                 stale = (time.monotonic() - float(obs.updated_at)) > 2.0

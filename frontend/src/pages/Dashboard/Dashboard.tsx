@@ -274,13 +274,31 @@ export function Dashboard() {
   }, []);
 
   // Load settings and device (GPU/CPU)
+  // Reset toàn bộ backend state về mặc định khi trang load mới (F5 hoặc mở lần đầu)
   useEffect(() => {
     detectionApi.getSettings().then(setSettings).catch(() => {});
     reloadModels();
+    // Dừng stream nếu vẫn còn chạy (safety net cho trường hợp beforeunload bị bỏ qua)
+    streamApi.stop().catch(() => {});
+    streamApi.stopCompanion().catch(() => {});
+    detectionApi.clearRoi().catch(() => {});
+    detectionApi.resetStats().catch(() => {});
+    trafficLightApi.setAdviceEnabled(false).catch(() => {});
   }, [reloadModels]);
 
   useEffect(() => {
     streamApi.getDevice().then(setDeviceInfo).catch(() => {});
+  }, []);
+
+  // Khi user F5 hoặc đóng tab, stop tất cả stream đang chạy trên backend
+  // Dùng sendBeacon vì fetch thông thường bị cancel trước khi gửi xong
+  useEffect(() => {
+    const handleUnload = () => {
+      navigator.sendBeacon('/api/v1/stream/stop');
+      navigator.sendBeacon('/api/v1/stream/companion/stop');
+    };
+    window.addEventListener('beforeunload', handleUnload);
+    return () => window.removeEventListener('beforeunload', handleUnload);
   }, []);
 
   // Stream connect

@@ -390,6 +390,8 @@ class StreamService:
         self._stats.congestion = CongestionInfo()
         self._timeline.clear()
         self._timeline_last = 0
+        for v in self._stop_hist.values():
+            v.clear()
         logger.info("StreamService: counters reset")
 
     def update_settings(
@@ -1150,7 +1152,7 @@ class StreamService:
                             frame,
                             [d.model_dump() for d in api_dets],
                             line_y_px=int(line_y),
-                            show_line=True,
+                            show_line=not roi_service.active_for("primary"),
                             in_place=True,
                         )
                         h264_bgr_primary.write_frame(vis_h264, fps=max(1, int(self.max_fps)))
@@ -1443,7 +1445,7 @@ class StreamService:
                                 fr,
                                 [d.model_dump() for d in api_dets],
                                 line_y_px=int(companion_line_y),
-                                show_line=True,
+                                show_line=not roi_service.active_for("companion"),
                                 in_place=True,
                             )
                             c_fps = max(1, int(getattr(settings, "COMPANION_MAX_FPS", 12)))
@@ -1628,7 +1630,7 @@ class StreamService:
                             fr,
                             [d.model_dump() for d in api_dets],
                             line_y_px=int(line_y),
-                            show_line=True,
+                            show_line=not roi_service.active_for(slot_key),
                         )
                         xf = max(1, int(getattr(settings, "EXTRA_MAX_FPS", 12)))
                         (h264_bgr_extra2 if s == 2 else h264_bgr_extra3).write_frame(vis_h264, fps=xf)

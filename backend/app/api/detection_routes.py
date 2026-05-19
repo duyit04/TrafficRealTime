@@ -37,9 +37,9 @@ async def set_roi_slot(slot: str, body: RoiRequest):
 
 @router.delete("/roi", response_model=SuccessResponse)
 async def clear_roi():
-    # Back-compat: default slot = primary
-    roi_service.clear(slot="primary")
-    return SuccessResponse(success=True, message="ROI cleared")
+    for slot in ("primary", "companion", "2", "3"):
+        roi_service.clear(slot=slot)
+    return SuccessResponse(success=True, message="ROI cleared (all slots)")
 
 @router.delete("/roi/{slot}", response_model=SuccessResponse)
 async def clear_roi_slot(slot: str):

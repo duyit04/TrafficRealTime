@@ -5,6 +5,7 @@ Those have been removed/disabled; only `/state` remains for UI display.
 """
 
 from __future__ import annotations
+import asyncio
 from typing import Annotated
 
 from fastapi import APIRouter, Query
@@ -17,18 +18,19 @@ router = APIRouter(prefix="/api/v1/traffic-light", tags=["traffic-light"])
 
 @router.get("/state", response_model=TrafficLightState)
 async def get_state():
-    return tls.get_state()
+    # Chạy trong thread pool để không block event loop khi _state_lock bị ticker giữ
+    return await asyncio.to_thread(tls.get_state)
 
 
 @router.post("/sources", response_model=TrafficLightState)
 async def set_sources(body: TrafficLightSourceAssign):
-    tls.set_sources(body.phase0_slot, body.phase1_slot)
-    return tls.get_state()
+    await asyncio.to_thread(tls.set_sources, body.phase0_slot, body.phase1_slot)
+    return await asyncio.to_thread(tls.get_state)
 
 
 @router.post("/advice", response_model=TrafficLightState)
 async def set_advice_enabled(
     enabled: Annotated[bool, Query(description="Enable lane-density green-time suggestions")] = True,
 ):
-    tls.set_advice_enabled(bool(enabled))
-    return tls.get_state()
+    await asyncio.to_thread(tls.set_advice_enabled, bool(enabled))
+    return await asyncio.to_thread(tls.get_state)
