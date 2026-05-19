@@ -72,8 +72,6 @@ class DisplayOnlyTrafficLightService:
         self._obs_by_slot: dict[str, LaneObs] = {}
         # Whether to compute and apply green-time suggestions from ROI queue.
         self._advice_enabled: bool = False
-        # Khi demand: theo dõi (q0,q1); đổi hàng chờ → reset mốc đếm để UI “nhảy lại” khớp pha.
-        self._prev_demand_green_queues: tuple[int, int] | None = None
         self._start_ticker()
         with self._state_lock:
             self._sync_state_locked()
@@ -91,7 +89,6 @@ class DisplayOnlyTrafficLightService:
                 self._pending_next_green = 1
                 self._cycle_count = 0
                 self._phase_started_at = time.monotonic()
-                self._prev_demand_green_queues = None
                 self._sync_state_locked()
                 return
 
@@ -121,7 +118,6 @@ class DisplayOnlyTrafficLightService:
                 self._phase_green_seconds[0] = 30.0
                 self._phase_green_seconds[1] = 30.0
             self._green_seconds = float(self._phase_green_seconds[self._active_phase])
-            self._prev_demand_green_queues = None
             self._sync_state_locked()
 
     def get_state(self) -> TrafficLightState:
@@ -147,7 +143,6 @@ class DisplayOnlyTrafficLightService:
                 self._phase_started_at = time.monotonic()
                 self._green_seconds = 30.0
                 self._phase_green_seconds = [30.0, 30.0]
-                self._prev_demand_green_queues = None
                 self._cycle_count = 0
             self._sync_state_locked()
 
@@ -252,26 +247,18 @@ class DisplayOnlyTrafficLightService:
                         elapsed = now - self._phase_started_at
 
                         if self._stream_live and self._advice_enabled:
-                            if self._movement_substate != "green":
-                                self._prev_demand_green_queues = None
-
                             if self._movement_substate == "green":
                                 q0, q1 = self._effective_queues_locked()
-                                aq0, aq1 = int(q0), int(q1)
                                 advice_ok = self._advice_ready_locked()
                                 demand_here = advice_ok and self._has_demand_locked(q0, q1)
                                 if demand_here:
-                                    qkey = (aq0, aq1)
-                                    prev_k = self._prev_demand_green_queues
-                                    if prev_k is None or prev_k != qkey:
-                                        self._phase_started_at = now
-                                        elapsed = 0.0
-                                    self._prev_demand_green_queues = qkey
-
                                     must = self._strict_row_phase_for_queues_locked(q0, q1)
                                     if must is not None and int(must) != int(self._active_phase):
+                                        # Chỉ reset timer khi pha thực sự chuyển, không reset khi số xe thay đổi
                                         self._active_phase = int(must)
                                         self._pending_next_green = 1 - self._active_phase
+                                        self._phase_started_at = now
+                                        elapsed = 0.0
 
                                     srv = int(self._active_phase)
                                     wai = int(1 - srv)
@@ -281,8 +268,6 @@ class DisplayOnlyTrafficLightService:
                                     elapsed_g = max(0.0, now - self._phase_started_at)
                                     hi = float(settings.TLC_MAX_GREEN)
                                     self._green_seconds = float(min(hi, max(elapsed_g, geff)))
-                                else:
-                                    self._prev_demand_green_queues = None
 
                                 if elapsed >= self._green_seconds:
                                     self._movement_substate = "yellow"
