@@ -635,6 +635,17 @@ export function Dashboard() {
                 ) : null}
                 <div className="relative overflow-hidden flex-1 min-h-0">
                   <H264LivePlayer enabled={streamOn} onSelectCamera={() => setCameraOpen(true)} />
+                  {/* Connecting overlay — visible from click Connect until stream_active=true */}
+                  {streamOn && !stats.stream_active && !stats.stream_error && (
+                    <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 bg-slate-900/75 backdrop-blur-sm pointer-events-none">
+                      <svg className="h-10 w-10 text-white animate-spin" viewBox="0 0 24 24" fill="none">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
+                        <path className="opacity-90" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                      </svg>
+                      <span className="text-sm font-semibold text-white tracking-wide">Đang kết nối camera…</span>
+                      <span className="text-xs text-white/60">Vui lòng chờ</span>
+                    </div>
+                  )}
                   <RoiCanvasOverlay
                     points={roiBySlot.primary.points}
                     setPoints={(p) => setRoiBySlot((prev) => ({ ...prev, primary: { ...prev.primary, points: typeof p === 'function' ? (p as any)(prev.primary.points) : p } }))}
