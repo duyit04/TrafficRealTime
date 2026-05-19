@@ -195,7 +195,11 @@ class Settings(BaseSettings):
     # Bbox đếm xe trên luồng phụ companion (POST /stream/start companion_url).
     TLC_COMPANION_VEHICLE_BBOX: str = ""
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "extra": "ignore",  # ignore stale .env keys (e.g. renamed settings)
+    }
 
 
 _VALID_IMGSZ = {320, 416, 480, 640}
