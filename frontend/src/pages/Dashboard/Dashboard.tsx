@@ -554,22 +554,23 @@ export function Dashboard() {
                   Hiển thị: {1 + previewSlots.length} camera
                 </div>
                 <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onMouseDown={(e) => e.preventDefault()}
-                    onClick={() => setExtraPreviewCount(0)}
-                    disabled={extraPreviewCount === 0}
-                    className="h-7 px-2 rounded-lg border border-slate-200 text-[11px] font-semibold text-slate-600 bg-white hover:bg-slate-50 disabled:opacity-40"
-                    title="Về 1 camera"
-                  >
-                    1 camera
-                  </button>
+                  {previewSlots.length > 0 && (
+                    <button
+                      type="button"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => setExtraPreviewCount(0)}
+                      className="h-7 px-2 rounded-lg border border-slate-200 text-[11px] font-semibold text-slate-600 bg-white hover:bg-slate-50"
+                      title="Về 1 camera"
+                    >
+                      1 camera
+                    </button>
+                  )}
                   <div className="inline-flex rounded-lg border border-slate-200 overflow-hidden bg-white">
                     <button
                       type="button"
                       onMouseDown={(e) => e.preventDefault()}
-                      onClick={() => setExtraPreviewCount((c) => Math.max(0, c - 1))}
-                      disabled={!trimmedStream || extraPreviewCount <= 0}
+                      onClick={() => setExtraPreviewCount(Math.max(0, previewSlots.length - 1))}
+                      disabled={!trimmedStream || previewSlots.length <= 0}
                       className="h-7 w-8 inline-flex items-center justify-center text-slate-700 hover:bg-slate-50 disabled:opacity-40"
                       title="Giảm camera"
                       aria-label="Giảm camera"
@@ -577,7 +578,7 @@ export function Dashboard() {
                       −
                     </button>
                     <div className="h-7 w-10 inline-flex items-center justify-center text-[11px] font-bold text-slate-700 border-x border-slate-200">
-                      +{previewSlots.length}
+                      {previewSlots.length > 0 ? `+${previewSlots.length}` : '–'}
                     </div>
                     <button
                       type="button"
@@ -587,7 +588,7 @@ export function Dashboard() {
                         if (idx >= maxExtraPreviews) return;
                         openAssignFor(idx);
                       }}
-                      disabled={!trimmedStream || extraPreviewCount >= maxExtraPreviews}
+                      disabled={!trimmedStream || previewSlots.length >= maxExtraPreviews}
                       className="h-7 w-8 inline-flex items-center justify-center text-slate-700 hover:bg-slate-50 disabled:opacity-40"
                       title={!trimmedStream ? 'Chưa có URL camera chính' : 'Thêm camera'}
                       aria-label="Thêm camera"

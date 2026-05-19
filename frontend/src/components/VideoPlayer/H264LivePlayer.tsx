@@ -37,6 +37,7 @@ export function H264LivePlayer({ enabled, wsPath = '/ws/stream-h264', onSelectCa
     errorBurstRef.current = { count: 0, windowStart: 0 };
     let boundVideo: HTMLVideoElement | null = null;
     let markFrameSeen: (() => void) | null = null;
+    let lagInterval: ReturnType<typeof setInterval> | null = null;
 
     const boot = async () => {
       if (dead || !mpegts.isSupported()) {
@@ -54,12 +55,24 @@ export function H264LivePlayer({ enabled, wsPath = '/ws/stream-h264', onSelectCa
       video.addEventListener('playing', markFrameSeen);
       video.addEventListener('timeupdate', markFrameSeen);
 
-      const p = mpegts.createPlayer({
-        type: 'mpegts',
-        isLive: true,
-        hasAudio: false,
-        url: wsUrl,
-      });
+      const p = mpegts.createPlayer(
+        {
+          type: 'mpegts',
+          isLive: true,
+          hasAudio: false,
+          url: wsUrl,
+        },
+        {
+          enableWorker: true,
+          enableStashBuffer: false,
+          liveBufferLatencyChasing: true,
+          liveBufferLatencyMaxLatency: 2.0,
+          liveBufferLatencyMinRemain: 0.2,
+          autoCleanupSourceBuffer: true,
+          autoCleanupMaxBackwardDuration: 4,
+          autoCleanupMinBackwardDuration: 2,
+        },
+      );
       playerRef.current = p;
       p.attachMediaElement(video);
       p.load();
@@ -85,6 +98,16 @@ export function H264LivePlayer({ enabled, wsPath = '/ws/stream-h264', onSelectCa
         // H264 only — log/debounce errors, no JPEG fallback.
       });
 
+      // Safety-net: seek to live edge if lag exceeds 3s (catches edge cases mpegts latency chasing misses)
+      lagInterval = setInterval(() => {
+        if (dead || !video || !video.buffered.length) return;
+        const liveEdge = video.buffered.end(video.buffered.length - 1);
+        const lag = liveEdge - video.currentTime;
+        if (lag > 3.0) {
+          video.currentTime = liveEdge - 0.3;
+        }
+      }, 4000);
+
       bootTimeoutRef.current = setTimeout(() => {
         if (!firstFrameSeenRef.current) {
           console.warn('[H264LivePlayer] no frames yet:', wsPath);
@@ -95,6 +118,10 @@ export function H264LivePlayer({ enabled, wsPath = '/ws/stream-h264', onSelectCa
     void boot();
     return () => {
       dead = true;
+      if (lagInterval) {
+        clearInterval(lagInterval);
+        lagInterval = null;
+      }
       if (bootTimeoutRef.current) {
         clearTimeout(bootTimeoutRef.current);
         bootTimeoutRef.current = null;

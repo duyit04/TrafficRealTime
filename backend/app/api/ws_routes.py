@@ -39,6 +39,10 @@ class ConnectionManager:
     def __init__(self) -> None:
         self.active: list[WebSocket] = []
         self._loop: asyncio.AbstractEventLoop | None = None
+        import threading as _threading
+        self._buf_lock = _threading.Lock()
+        self._outbuf = bytearray()
+        self._broadcast_scheduled = False
 
     async def connect(self, ws: WebSocket) -> None:
         await ws.accept()
@@ -78,18 +82,33 @@ class ConnectionManager:
 
     def broadcast_bytes_threadsafe(self, data: bytes) -> None:
         """
-        Best-effort thread-safe byte broadcast from non-async threads.
-        Uses per-send tasks to avoid blocking worker threads.
+        Thread-safe byte broadcast. Batches chunks so only one asyncio task is
+        in-flight at a time — prevents event-loop task queue from growing and
+        causing H264 stream drift over time.
         """
         if not self.active:
             return
         loop = self._loop
         if loop is None:
             return
+        with self._buf_lock:
+            self._outbuf.extend(data)
+            if self._broadcast_scheduled:
+                return
+            self._broadcast_scheduled = True
         try:
-            loop.call_soon_threadsafe(lambda: asyncio.create_task(self.broadcast_bytes(data)))
+            loop.call_soon_threadsafe(self._flush_broadcast)
         except Exception:
-            pass
+            with self._buf_lock:
+                self._broadcast_scheduled = False
+
+    def _flush_broadcast(self) -> None:
+        with self._buf_lock:
+            data = bytes(self._outbuf)
+            self._outbuf.clear()
+            self._broadcast_scheduled = False
+        if data:
+            asyncio.create_task(self.broadcast_bytes(data))
 
     def broadcast_text_threadsafe(self, text: str) -> None:
         """Thread-safe JSON/text broadcast (stats/detections, no JPEG)."""

@@ -1628,7 +1628,7 @@ class StreamService:
                             fr,
                             [d.model_dump() for d in api_dets],
                             line_y_px=int(line_y),
-                            show_line=False,
+                            show_line=True,
                         )
                         xf = max(1, int(getattr(settings, "EXTRA_MAX_FPS", 12)))
                         (h264_bgr_extra2 if s == 2 else h264_bgr_extra3).write_frame(vis_h264, fps=xf)

@@ -3,6 +3,7 @@ Model routes – upload, list, load, delete YOLO .pt/.engine files.
 """
 
 from __future__ import annotations
+import datetime
 import math
 import threading
 import time
@@ -10,6 +11,7 @@ from fastapi import APIRouter, UploadFile, File, HTTPException
 from pathlib import Path
 
 from app.core.config import settings
+from app.core.logger import logger
 from app.models.detection_model import (
     ModelInfo, ModelLoadRequest, ModelExportEngineRequest, SuccessResponse, ErrorResponse
 )
@@ -116,6 +118,20 @@ async def export_engine(body: ModelExportEngineRequest):
                 _engine_job["progress_message"] = "Đang build TensorRT engine (có thể vài phút)…"
 
     def _job():
+        # Backup existing .engine if present (prevents silent overwrite)
+        backed_up: str | None = None
+        try:
+            src = model_service._resolve(body.name)
+            expected_engine = src.with_suffix(".engine")
+            if expected_engine.exists():
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup = expected_engine.parent / f"{expected_engine.stem}_backup_{ts}.engine"
+                expected_engine.rename(backup)
+                backed_up = backup.name
+                logger.info("export_engine: backed up %s → %s", expected_engine.name, backup.name)
+        except Exception as _be:
+            logger.warning("export_engine: backup check failed: %s", _be)
+
         prog_thread = threading.Thread(target=_progress_loop, daemon=True)
         prog_thread.start()
         try:
@@ -128,6 +144,9 @@ async def export_engine(body: ModelExportEngineRequest):
             )
             stop_progress.set()
             prog_thread.join(timeout=2)
+            done_msg = "Export hoàn thành"
+            if backed_up:
+                done_msg += f" (file cũ đã backup: {backed_up})"
             with _engine_job_lock:
                 _engine_job.update(
                     {
@@ -138,7 +157,7 @@ async def export_engine(body: ModelExportEngineRequest):
                         "engine": str(out),
                         "ended_at": time.time(),
                         "progress": 100,
-                        "progress_message": "Export hoàn thành",
+                        "progress_message": done_msg,
                     }
                 )
         except Exception as exc:

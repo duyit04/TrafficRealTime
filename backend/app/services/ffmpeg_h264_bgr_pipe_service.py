@@ -121,7 +121,7 @@ def _build_cmd(ffmpeg_bin: str, w: int, h: int, fps: int) -> list[str]:
         "-framerate",
         str(fps),
         "-thread_queue_size",
-        "512",
+        "4",
         "-i",
         "pipe:0",
     ]
@@ -152,7 +152,7 @@ def _build_cpu_cmd(ffmpeg_bin: str, w: int, h: int, fps: int) -> list[str]:
         "-framerate",
         str(fps),
         "-thread_queue_size",
-        "512",
+        "4",
         "-i",
         "pipe:0",
         "-an",
@@ -273,7 +273,7 @@ class H264BgrMpegTsPipe:
                 logger.warning("H264BgrPipe(%s): stdout is None — no output will be produced", self._slot)
                 return
             while True:
-                chunk = proc.stdout.read(188 * 7)
+                chunk = proc.stdout.read(188 * 64)
                 if not chunk:
                     if proc.poll() is not None:
                         rc = proc.returncode

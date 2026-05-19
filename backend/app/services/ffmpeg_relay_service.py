@@ -245,7 +245,7 @@ class FFmpegRelayService:
                 with self._lock:
                     if not self._running:
                         break
-                chunk = proc.stdout.read(188 * 7)
+                chunk = proc.stdout.read(188 * 64)
                 if not chunk:
                     if proc.poll() is not None:
                         break
