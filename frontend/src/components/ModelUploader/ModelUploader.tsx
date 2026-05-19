@@ -9,6 +9,14 @@ import type { ModelInfo } from '../../types/detection';
 import { modelApi } from '../../services/api';
 import { IconBoltEngine, IconPlay, IconTrash } from '../icons/Icons';
 
+function IconUpload({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 20 20" fill="currentColor">
+      <path fillRule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zM6.293 6.707a1 1 0 010-1.414l3-3a1 1 0 011.414 0l3 3a1 1 0 01-1.414 1.414L11 5.414V13a1 1 0 11-2 0V5.414L7.707 6.707a1 1 0 01-1.414 0z" clipRule="evenodd" />
+    </svg>
+  );
+}
+
 interface Props {
   models: ModelInfo[];
   onModelsChange: () => void;
@@ -33,7 +41,9 @@ export function ModelUploader({ models, onModelsChange, onToast, onReloadStats, 
   const [engineExportMsg,  setEngineExportMsg]  = useState('');
   const [loadAfterExport,  setLoadAfterExport]  = useState(true);
   const [exportFp16,       setExportFp16]       = useState(true);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [uploading,        setUploading]        = useState(false);
+  const pollRef   = useRef<ReturnType<typeof setInterval> | null>(null);
+  const fileRef   = useRef<HTMLInputElement | null>(null);
 
   // Giữ selection hợp lệ khi danh sách thay đổi
   useEffect(() => {
@@ -119,16 +129,36 @@ export function ModelUploader({ models, onModelsChange, onToast, onReloadStats, 
     }
   }, [activePt, loadAfterExport, exportFp16, onToast, startPoll, pollOnce]);
 
+  // ── Upload .pt ────────────────────────────────────────────────────────────
+  const handleUpload = useCallback(async (file: File) => {
+    if (!file.name.endsWith('.pt')) {
+      onToast('Chỉ chấp nhận file .pt', 'error');
+      return;
+    }
+    setUploading(true);
+    try {
+      await modelApi.upload(file);
+      onToast(`Đã upload '${file.name}'`, 'success');
+      onModelsChange();
+      setSelectedPt(file.name);
+    } catch (e: unknown) {
+      onToast(e instanceof Error ? e.message : 'Upload thất bại', 'error');
+    } finally {
+      setUploading(false);
+      if (fileRef.current) fileRef.current.value = '';
+    }
+  }, [onToast, onModelsChange]);
+
   return (
     <div className="flex flex-col gap-4">
 
       {/* ── Export TensorRT ───────────────────────────────────────── */}
       <div className="flex flex-col gap-2">
 
-        {/* Chọn model .pt nguồn */}
-        {ptModels.length > 0 ? (
-          <div className="flex items-center gap-2">
-            <span className="text-[11px] text-slate-500 shrink-0 w-12">Nguồn</span>
+        {/* Chọn model .pt nguồn + upload */}
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] text-slate-500 shrink-0 w-12">Nguồn</span>
+          {ptModels.length > 0 ? (
             <select
               className="flex-1 min-w-0 text-xs border border-slate-200 rounded-lg px-2 py-1.5 bg-white text-slate-700"
               value={activePt}
@@ -140,12 +170,31 @@ export function ModelUploader({ models, onModelsChange, onToast, onReloadStats, 
                 </option>
               ))}
             </select>
-          </div>
-        ) : (
-          <p className="text-[11px] text-slate-400 italic">
-            Chưa có file .pt — đặt vào thư mục <code className="bg-slate-100 px-1 rounded">models_storage/</code> rồi tải lại trang.
-          </p>
-        )}
+          ) : (
+            <span className="flex-1 text-[11px] text-slate-400 italic">Chưa có file .pt</span>
+          )}
+          {/* Hidden file input */}
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".pt"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) void handleUpload(f);
+            }}
+          />
+          <button
+            type="button"
+            disabled={uploading || exportingEngine}
+            title="Upload file .pt từ máy tính"
+            onClick={() => fileRef.current?.click()}
+            className="shrink-0 inline-flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-semibold rounded-lg border border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          >
+            <IconUpload className="h-3 w-3 shrink-0" aria-hidden />
+            {uploading ? 'Uploading…' : 'Upload .pt'}
+          </button>
+        </div>
 
         {/* Options */}
         <div className="flex flex-wrap gap-3 pl-14">
