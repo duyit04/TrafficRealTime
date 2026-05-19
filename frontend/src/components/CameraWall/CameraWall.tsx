@@ -39,7 +39,7 @@ interface Props {
 
 const REFRESH_INTERVAL = 18000; // ms between thumbnail refreshes (less RTSP churn)
 const ACTIVE_TILE_REFRESH_INTERVAL = 45000; // ms for the stream currently in LIVE mode
-const VISIBLE_STAGGER_MS = 450; // delay between visible tiles when modal opens
+const VISIBLE_STAGGER_MS = 80; // delay between visible tiles when modal opens
 
 async function fetchThumbnail(
   url: string,

@@ -410,6 +410,8 @@ class StreamService:
         if line is not None:
             self.line_position = max(0.05, min(0.95, line))
             self._counting_line_y = None
+            self._companion_counting_line_y = None
+            self._extra_counting_line_y.clear()
         if fps is not None:
             self.max_fps = max(1, min(60, fps))
         if jpeg_quality is not None:
@@ -424,6 +426,7 @@ class StreamService:
                 self._tracker_type = t
                 self._tracker = get_tracker(t)
                 self._companion_tracker = get_tracker(t)
+                self._extra_trackers.clear()
                 yolo_model.reset_tracker()
         if counting_mode is not None:
             self._counter.set_mode(counting_mode)
@@ -1517,6 +1520,8 @@ class StreamService:
         fps_cnt = 0
         t0 = time.time()
         frame_interval = 1.0 / max(int(getattr(settings, "EXTRA_MAX_FPS", 12)), 1)
+        extra_skip_counter = 0
+        extra_last_dets: list = []
 
         while True:
             with self._extra_lock:
@@ -1546,19 +1551,33 @@ class StreamService:
                 fps_cnt = 0
                 t0 = time.time()
 
+            do_infer = True
+            skip_n = max(0, int(self.skip_frames or 0))
+            if skip_n > 0:
+                if extra_skip_counter > 0:
+                    do_infer = False
+                    extra_skip_counter -= 1
+                else:
+                    extra_skip_counter = skip_n
+
             dets = []
             try:
-                if self._sync_secondary_model(self._extra_yolo[s]):
+                if do_infer and self._sync_secondary_model(self._extra_yolo[s]):
                     dets = self._extra_yolo[s].track(
                         fr,
                         conf=self.conf_threshold,
                         tracker=self._tracker.tracker_yaml,
                         persist=True,
                     )
+                    extra_last_dets = dets
+                elif not do_infer:
+                    dets = extra_last_dets
                 else:
                     dets = []
+                    extra_last_dets = []
             except Exception:
                 dets = []
+                extra_last_dets = []
 
             try:
                 if s not in self._extra_trackers:

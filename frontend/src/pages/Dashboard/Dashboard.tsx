@@ -299,7 +299,7 @@ export function Dashboard() {
       await startStream(url);
       setStreamOn(true);
       addToast('Stream dang ket noi...', 'info');
-      const deadline = Date.now() + 25000;
+      const deadline = Date.now() + 35000;
       const t = setInterval(async () => {
         if (Date.now() > deadline) {
           clearInterval(t);
@@ -920,7 +920,7 @@ export function Dashboard() {
                       await startStream(turl);
                       setStreamOn(true);
                       addToast(`Dang ket noi: ${turl.split('/').pop()}`, 'info');
-                      const deadline = Date.now() + 25000;
+                      const deadline = Date.now() + 35000;
                       const t = setInterval(async () => {
                         if (Date.now() > deadline) { clearInterval(t); setStreamOn(false); addToast('Timeout ket noi', 'error'); return; }
                         try {

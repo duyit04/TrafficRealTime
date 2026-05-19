@@ -222,6 +222,7 @@ class FFmpegRtspCapture:
         self._stderr_tail: deque[str] = deque(maxlen=8)
         self._lock = threading.Lock()
         self._retrieve_buf: np.ndarray | None = None
+        self._initial_buf: bytes = b""
         self._src_w = 0
         self._src_h = 0
         self.decode_backend: str = ""
@@ -312,20 +313,60 @@ class FFmpegRtspCapture:
         if proc.stderr is not None:
             self._stderr_t = threading.Thread(target=self._drain_stderr, args=(proc.stderr,), daemon=True)
             self._stderr_t.start()
-        deadline = time.time() + 10.0
+
+        # Wait for first bytes from stdout instead of a blind 10s timer.
+        # Success = FFmpeg produces data; failure = process exits (fast, usually <1s).
+        frame_bytes = out_w * out_h * 3
+        chunk_size = min(65536, max(4096, frame_bytes))
+        _first_chunk: list[bytes] = []
+        _data_event = threading.Event()
+
+        def _read_first_chunk() -> None:
+            try:
+                data = proc.stdout.read(chunk_size)  # type: ignore[union-attr]
+                if data:
+                    _first_chunk.append(data)
+            except Exception:
+                pass
+            _data_event.set()
+
+        first_t = threading.Thread(target=_read_first_chunk, daemon=True)
+        first_t.start()
+
+        deadline = time.time() + 9.0
         while time.time() < deadline:
             code = proc.poll()
             if code is not None:
+                _data_event.wait(timeout=0.3)
                 with self._lock:
                     err = "; ".join(self._stderr_tail) if self._stderr_tail else f"ffmpeg exited {code}"
                 self._last_error = err
                 self._kill_proc(proc)
                 self._stderr_t = None
                 return False
-            time.sleep(0.15)
+            if _data_event.is_set():
+                break
+            time.sleep(0.05)
+
+        if not _data_event.is_set():
+            self._last_error = "FFmpeg no data within 9s — RTSP timeout or bad URL"
+            self._kill_proc(proc)
+            self._stderr_t = None
+            return False
+
+        if not _first_chunk:
+            code = proc.poll()
+            with self._lock:
+                err = "; ".join(self._stderr_tail) if self._stderr_tail else f"ffmpeg read failed (exit={code})"
+            self._last_error = err
+            self._kill_proc(proc)
+            self._stderr_t = None
+            return False
+
+        self._initial_buf = _first_chunk[0]
         self._proc = proc
         self._w, self._h = out_w, out_h
-        self._frame_bytes = out_w * out_h * 3
+        self._frame_bytes = frame_bytes
         self._opened = True
         return True
 
@@ -378,7 +419,15 @@ class FFmpegRtspCapture:
             self._last_error = f"FFmpeg {slot_kind} slots full (max {max_slots})"
             logger.warning("FFmpegRtspCapture(%s): %s", self._label, self._last_error)
             return
-        size = _probe_size_cached(self._url, _resolve_ffprobe_bin(ffmpeg_bin))
+        # Run ffprobe size + codec in parallel to halve probe time on first connect.
+        import concurrent.futures as _cf
+        ffprobe_bin = _resolve_ffprobe_bin(ffmpeg_bin)
+        with _cf.ThreadPoolExecutor(max_workers=2) as _ex:
+            _f_size = _ex.submit(_probe_size_cached, self._url, ffprobe_bin)
+            _f_codec = _ex.submit(_probe_codec_cached, self._url, ffprobe_bin)
+            size = _f_size.result()
+            codec_name = _f_codec.result()
+
         if size is None:
             try:
                 max_w = int(getattr(settings, "STREAM_MAX_WIDTH", 1280) or 1280)
@@ -395,9 +444,6 @@ class FFmpegRtspCapture:
             src_w, src_h = size
         out_w, out_h, scaled = _pipe_output_size(src_w, src_h, pipe_max_width=self._pipe_max_width)
         self._src_w, self._src_h = src_w, src_h
-
-        ffprobe_bin = _resolve_ffprobe_bin(ffmpeg_bin)
-        codec_name = _probe_codec_cached(self._url, ffprobe_bin)
         want_cuda = cuda_decode_enabled()
         opened = False
         decode = ""
@@ -520,7 +566,11 @@ class FFmpegRtspCapture:
         if proc is None or proc.stdout is None or not self.isOpened():
             return False, None
         need = self._frame_bytes
-        buf = bytearray()
+        if self._initial_buf:
+            buf = bytearray(self._initial_buf)
+            self._initial_buf = b""
+        else:
+            buf = bytearray()
         deadline = time.time() + _READ_TIMEOUT_SEC
         try:
             while len(buf) < need and time.time() < deadline:

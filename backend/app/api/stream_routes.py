@@ -11,7 +11,7 @@ import os
 import time
 import cv2
 from functools import partial
-from threading import Lock
+import threading
 from typing import Annotated
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
@@ -28,14 +28,15 @@ from app.services.ffmpeg_rtsp_decode import cuda_decode_enabled, ffmpeg_cuda_req
 from app.core.config import settings
 from app.ml.yolo_model import yolo_model
 
-# Thread pool for thumbnail grabs — low concurrency limits parallel RTSP opens
-_thumb_workers = max(1, min(int(getattr(settings, "THUMB_MAX_CONCURRENT", 2) or 2), 4))
+# Thread pool for thumbnail grabs — allow more concurrency for faster camera wall loading
+_thumb_workers = max(1, min(int(getattr(settings, "THUMB_MAX_CONCURRENT", 4) or 4), 8))
 _thumb_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=_thumb_workers, thread_name_prefix="thumb"
 )
 _thumb_cache: dict[tuple[str, int, bool], tuple[dict, float]] = {}
-_thumb_cache_lock = Lock()
-_ffmpeg_env_lock = Lock()
+_thumb_cache_lock = threading.Lock()
+# Semaphore allows up to 3 concurrent RTSP opens (was exclusive Lock → serialized)
+_ffmpeg_env_lock = threading.Semaphore(3)
 
 _THUMB_FFMPEG_EXTRA = (
     "|fflags;discardcorrupt|flags;low_delay|err_detect;ignore_err|loglevel;quiet"
@@ -295,7 +296,7 @@ def _read_thumbnail_frame(cap: cv2.VideoCapture, *, fast_decode: bool) -> cv2.ty
     flush_n = max(10, min(flush_n, 24)) if fast_decode else max(flush_n, 16)
     flush_n = max(6, min(flush_n, 28))
     if not fast_decode:
-        flush_n = max(flush_n, 18)
+        flush_n = max(flush_n, 8)
 
     for _ in range(flush_n):
         cap.grab()
@@ -339,6 +340,8 @@ def _grab_thumbnail(url: str, max_width: int = 320, *, fast_decode: bool = False
     try:
         is_rtsp = str(url).strip().lower().startswith("rtsp://")
         with _suppress_ffmpeg_stderr():
+            # Hold lock only during cap open (serializes env-var writes for OpenCV path).
+            # Released before reading so other cameras can open concurrently.
             with _ffmpeg_env_lock:
                 if is_rtsp and _thumb_use_cuda_decode():
                     from app.services.ffmpeg_rtsp_capture import FFmpegRtspCapture
@@ -363,6 +366,7 @@ def _grab_thumbnail(url: str, max_width: int = 320, *, fast_decode: bool = False
                     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     decode_mode = "opencv"
 
+            # Lock released — read frame while other cameras can open in parallel
             if cap is None or not cap.isOpened():
                 err = getattr(cap, "_last_error", None) if cap is not None else None
                 return {"ok": False, "frame": None, "error": err or "Cannot open stream"}
