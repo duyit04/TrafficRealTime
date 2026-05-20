@@ -45,7 +45,7 @@ let toastId = 0;
 
 export function Dashboard() {
   const {
-    detections, stats, wsConnected, companionWsConnected, companionActive,
+    detections, stats, wsConnected, companionWsConnected, companionActive, companionStreamActive,
     companionDetections, companionLinePosition,
     extraLive,
     startStream, startCompanion, stopCompanion, stopStream, reloadStats, setRoi, clearRoi, setRoiSlot, clearRoiSlot, resetCount, updateSettings,
@@ -690,6 +690,16 @@ export function Dashboard() {
                       return (
                     <div className="relative overflow-hidden flex-1 min-h-0">
                       <H264LivePlayer enabled={streamOn && companionActive} wsPath="/ws/stream-h264/companion" />
+                      {streamOn && companionActive && !companionStreamActive && (
+                        <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 bg-slate-900/75 backdrop-blur-sm pointer-events-none">
+                          <svg className="h-10 w-10 text-white animate-spin" viewBox="0 0 24 24" fill="none">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
+                            <path className="opacity-90" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                          </svg>
+                          <span className="text-sm font-semibold text-white tracking-wide">Đang kết nối camera…</span>
+                          <span className="text-xs text-white/60">Vui lòng chờ</span>
+                        </div>
+                      )}
                       <RoiCanvasOverlay
                         points={roiBySlot.companion.points}
                         setPoints={(p) => setRoiBySlot((prev) => ({ ...prev, companion: { ...prev.companion, points: typeof p === 'function' ? (p as any)(prev.companion.points) : p } }))}
@@ -710,6 +720,16 @@ export function Dashboard() {
                         enabled={streamOn}
                         wsPath={extraSlot === 2 ? '/ws/stream-h264/extra2' : '/ws/stream-h264/extra3'}
                       />
+                      {streamOn && !live?.active && (
+                        <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 bg-slate-900/75 backdrop-blur-sm pointer-events-none">
+                          <svg className="h-10 w-10 text-white animate-spin" viewBox="0 0 24 24" fill="none">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
+                            <path className="opacity-90" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                          </svg>
+                          <span className="text-sm font-semibold text-white tracking-wide">Đang kết nối camera…</span>
+                          <span className="text-xs text-white/60">Vui lòng chờ</span>
+                        </div>
+                      )}
                       <RoiCanvasOverlay
                         points={(extraSlot === 2 ? roiBySlot['2'] : roiBySlot['3']).points}
                         setPoints={(p) => setRoiBySlot((prev) => {

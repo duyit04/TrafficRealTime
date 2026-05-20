@@ -79,6 +79,7 @@ export function useDetection() {
   const [stats, setStats] = useState<VehicleStats>(DEFAULT_STATS);
   const [streamActive, setStreamActive] = useState(false);
   const [companionActive, setCompanionActive] = useState(false);
+  const [companionStreamActive, setCompanionStreamActive] = useState(false);
   const [companionDetections, setCompanionDetections] = useState<Detection[]>([]);
   const [companionFps, setCompanionFps] = useState(0);
   const [companionLinePosition, setCompanionLinePosition] = useState<number>(DEFAULT_STATS.line_position);
@@ -145,11 +146,13 @@ export function useDetection() {
     };
     if (!msg) return;
     if (msg.stream_active === false) {
+      setCompanionStreamActive(false);
       setCompanionDetections([]);
       setCompanionFps(0);
       setCompanionLinePosition(DEFAULT_STATS.line_position);
       return;
     }
+    setCompanionStreamActive(true);
     if (Array.isArray(msg.detections)) {
       applyDetections(msg.detections, lastCompanionDetsRef, setCompanionDetections);
     }
@@ -185,12 +188,14 @@ export function useDetection() {
   const stopCompanion = useCallback(async () => {
     await streamApi.stopCompanion();
     setCompanionActive(false);
+    setCompanionStreamActive(false);
   }, []);
 
   const stopStream = useCallback(async () => {
     await streamApi.stop();
     setStreamActive(false);
     setCompanionActive(false);
+    setCompanionStreamActive(false);
     setDetections([]);
     setCompanionDetections([]);
     setExtraLive({});
@@ -245,6 +250,7 @@ export function useDetection() {
     companionWsConnected,
     streamActive,
     companionActive,
+    companionStreamActive,
     startStream,
     startCompanion,
     stopCompanion,
