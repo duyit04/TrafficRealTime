@@ -196,8 +196,8 @@ class FFmpegRelayService:
         cmd: list[str] = [ffmpeg_bin]
         cmd.extend(rtsp_demuxer_flags())
         if cuda_decode_enabled():
-            cmd.extend(cuda_hwaccel_before_input())
-        cmd += ["-i", url]
+            cmd.extend(cuda_hwaccel_before_input(device_frames=True))
+        cmd += ["-i", url, "-vsync", "0"]
         cmd.extend(_nvenc_relay_args())
         return cmd
 

@@ -836,6 +836,11 @@ class StreamService:
     def _worker(self, url: str) -> None:
         is_rtsp = str(url).lower().startswith("rtsp://")
 
+        # Hoist imports out of the per-frame loop — importing inside a tight loop
+        # causes repeated sys.modules lookups which add measurable overhead at 30fps.
+        from app.services.traffic_light_service import traffic_light_service as tls
+        from app.services.model_service import model_service as _model_service
+
         # Capture thread pushes freshest frames into a size-1 queue (drop-frame behavior).
         frame_q: Queue[np.ndarray] = Queue(maxsize=1)
         stop_evt = threading.Event()
@@ -941,8 +946,6 @@ class StreamService:
 
         self._stats.stream_active = True
         try:
-            from app.services.traffic_light_service import traffic_light_service as tls
-
             tls.set_stream_live(True)
         except Exception as e:
             logger.debug("TrafficLight attach: %s", e)
@@ -1115,42 +1118,38 @@ class StreamService:
 
                 # 4.1 Model info for UI (avoid "No Model" flicker)
                 try:
-                    from app.services.model_service import model_service
-
-                    self._stats.model_loaded = bool(model_service.is_loaded)
-                    self._stats.model_name = str(model_service.name or "")
+                    self._stats.model_loaded = bool(_model_service.is_loaded)
+                    self._stats.model_name = str(_model_service.name or "")
                 except Exception:
                     pass
 
-                # 5. Build payload
-                from app.models.detection_model import Detection, BoundingBox
-
-                # Full-frame detections for UI boxes; ROI only gates counting/track below.
-                api_dets = [
-                    Detection(
-                        bbox=BoundingBox(x1=d.x1, y1=d.y1, x2=d.x2, y2=d.y2),
-                        class_name=d.class_name,
-                        confidence=d.confidence,
-                        track_id=d.track_id,
-                    )
+                # 5. Build payload — build dict directly, skip Pydantic object creation
+                # (avoids 2 loops: one to create Detection objects, one to model_dump() them)
+                api_dets_dict = [
+                    {
+                        "bbox": {"x1": d.x1, "y1": d.y1, "x2": d.x2, "y2": d.y2},
+                        "class_name": d.class_name,
+                        "confidence": d.confidence,
+                        "track_id": d.track_id,
+                    }
                     for d in raw_dets
                 ]
 
                 # 5.1 Feed stopped-count-in-ROI to traffic-light service (phase mapping happens there)
+                # Only compute when ROI is active — skip the per-frame loop otherwise
                 try:
-                    from app.services.traffic_light_service import traffic_light_service as tls
-
-                    stopped_cnt, total_cnt = self._compute_stopped_in_roi("primary", raw_dets)
-                    tls.update_lane_observation("primary", stopped_cnt, total_cnt)
+                    if roi_service.active_for("primary"):
+                        stopped_cnt, total_cnt = self._compute_stopped_in_roi("primary", raw_dets)
+                        tls.update_lane_observation("primary", stopped_cnt, total_cnt)
                 except Exception:
                     pass
 
-                # 5.2 H264 bgr_burnin — box vẽ sẵn trên video (rtsp_relay dùng FFmpeg relay riêng)
+                # 5.2 H264 bgr_burnin — reuse already-serialized dicts (no second model_dump)
                 if should_h264_burnin():
                     try:
                         vis_h264 = overlay_traffic_ui(
                             frame,
-                            [d.model_dump() for d in api_dets],
+                            api_dets_dict,
                             line_y_px=int(line_y),
                             show_line=not roi_service.active_for("primary"),
                             in_place=True,
@@ -1159,16 +1158,50 @@ class StreamService:
                     except Exception as he:
                         logger.warning("H264 burn-in primary skipped: %s", he)
 
+                # Build stats snapshot without deep copy — read fields directly from _stats
+                # merged_vehicle_stats() does model_copy(deep=True) which is expensive at 30fps
+                _s = self._stats
+                stats_dict = {
+                    "total": self._merged_total(),
+                    "count_in": int(self._counter.count_in) + int(self._companion_counter.count_in),
+                    "count_out": int(self._counter.count_out) + int(self._companion_counter.count_out),
+                    "classes": dict(_s.classes),
+                    "classes_in": dict(_s.classes_in),
+                    "classes_out": dict(_s.classes_out),
+                    "counting_mode": _s.counting_mode,
+                    "fps": _s.fps,
+                    "fps_capture": _s.fps_capture,
+                    "fps_inference": _s.fps_inference,
+                    "fps_sent": _s.fps_sent,
+                    "avg_inference_ms": _s.avg_inference_ms,
+                    "frame_count": _s.frame_count,
+                    "stream_active": _s.stream_active,
+                    "model_loaded": _s.model_loaded,
+                    "model_name": _s.model_name,
+                    "roi_active": _s.roi_active,
+                    "conf_threshold": _s.conf_threshold,
+                    "line_position": _s.line_position,
+                    "congestion": {
+                        "is_congested": _s.congestion.is_congested,
+                        "vehicle_count": _s.congestion.vehicle_count,
+                        "threshold": _s.congestion.threshold,
+                        "duration_seconds": _s.congestion.duration_seconds,
+                        "stable_duration": _s.congestion.stable_duration,
+                        "message": _s.congestion.message,
+                        "level": _s.congestion.level,
+                    },
+                }
+
                 header = {
-                    "detections": [d.model_dump() for d in api_dets],
-                    "stats": self.merged_vehicle_stats().model_dump(),
+                    "detections": api_dets_dict,
+                    "stats": stats_dict,
                 }
 
                 with self._lock:
                     self._latest = {
                         "frame": None,
-                        "detections": header["detections"],
-                        "stats": header["stats"],
+                        "detections": api_dets_dict,
+                        "stats": stats_dict,
                     }
 
                 try:
@@ -1220,8 +1253,6 @@ class StreamService:
             self._stats.fps = 0.0
             self._running = False
             try:
-                from app.services.traffic_light_service import traffic_light_service as tls
-
                 tls.set_stream_live(False)
             except Exception as e:
                 logger.debug("TrafficLight detach: %s", e)
@@ -1311,6 +1342,7 @@ class StreamService:
         frame_interval = 1.0 / max(int(getattr(settings, "COMPANION_MAX_FPS", 12)), 1)
         skip_counter = 0
         last_dets: list = []
+        _next_deadline = time.perf_counter()
 
         try:
             while self._companion_running:
@@ -1387,15 +1419,14 @@ class StreamService:
 
                 # Optional: publish companion frame + detections for UI second panel
                 try:
-                    from app.models.detection_model import Detection, BoundingBox
-
-                    api_dets = [
-                        Detection(
-                            bbox=BoundingBox(x1=d.x1, y1=d.y1, x2=d.x2, y2=d.y2),
-                            class_name=d.class_name,
-                            confidence=d.confidence,
-                            track_id=d.track_id,
-                        )
+                    # Build dict directly — skip Pydantic object creation (same as primary)
+                    api_dets_dict = [
+                        {
+                            "bbox": {"x1": d.x1, "y1": d.y1, "x2": d.x2, "y2": d.y2},
+                            "class_name": d.class_name,
+                            "confidence": d.confidence,
+                            "track_id": d.track_id,
+                        }
                         for d in dets
                     ]
                     # Keep companion pipeline parity with primary:
@@ -1414,15 +1445,15 @@ class StreamService:
                         companion_line_y = self._companion_counting_line_y
                     self._companion_counter.update(active_tracks, companion_line_y)
                     companion_cong = self._companion_congestion.update(len(active_tracks))
-                    companion_congestion_payload = CongestionInfo(
-                        is_congested=companion_cong.is_congested,
-                        vehicle_count=companion_cong.vehicle_count,
-                        threshold=companion_cong.threshold,
-                        duration_seconds=companion_cong.duration_seconds,
-                        stable_duration=companion_cong.stable_duration,
-                        message=companion_cong.message,
-                        level=companion_cong.level,
-                    ).model_dump()
+                    companion_congestion_payload = {
+                        "is_congested": companion_cong.is_congested,
+                        "vehicle_count": companion_cong.vehicle_count,
+                        "threshold": companion_cong.threshold,
+                        "duration_seconds": companion_cong.duration_seconds,
+                        "stable_duration": companion_cong.stable_duration,
+                        "message": companion_cong.message,
+                        "level": companion_cong.level,
+                    }
                     companion_model_loaded = False
                     companion_model_name = ""
                     try:
@@ -1433,17 +1464,17 @@ class StreamService:
                     except Exception:
                         pass
                     try:
-                        from app.services.traffic_light_service import traffic_light_service as tls
-
-                        stopped_cnt, total_cnt = self._compute_stopped_in_roi("companion", dets)
-                        tls.update_lane_observation("companion", stopped_cnt, total_cnt)
+                        if roi_service.active_for("companion"):
+                            from app.services.traffic_light_service import traffic_light_service as tls
+                            stopped_cnt, total_cnt = self._compute_stopped_in_roi("companion", dets)
+                            tls.update_lane_observation("companion", stopped_cnt, total_cnt)
                     except Exception:
                         pass
                     if should_h264_burnin():
                         try:
                             vis_h264 = overlay_traffic_ui(
                                 fr,
-                                [d.model_dump() for d in api_dets],
+                                api_dets_dict,
                                 line_y_px=int(companion_line_y),
                                 show_line=not roi_service.active_for("companion"),
                                 in_place=True,
@@ -1453,7 +1484,7 @@ class StreamService:
                         except Exception as he:
                             logger.debug("H264 burn-in companion skipped: %s", he)
                     header = {
-                        "detections": [d.model_dump() for d in api_dets],
+                        "detections": api_dets_dict,
                         "fps": float(self._companion_fps),
                         "frame_count": int(self._companion_frame_count),
                         "stream_active": True,
@@ -1490,6 +1521,15 @@ class StreamService:
                 sleep_t = frame_interval - (time.time() - t_start)
                 if sleep_t > 0:
                     time.sleep(sleep_t)
+                # Deadline-based pacing — same as primary worker to avoid drift
+                _next_deadline += frame_interval
+                _wait = _next_deadline - time.perf_counter()
+                if _wait > 0.002:
+                    time.sleep(_wait - 0.001)
+                while time.perf_counter() < _next_deadline:
+                    pass
+                if time.perf_counter() - _next_deadline > frame_interval:
+                    _next_deadline = time.perf_counter()
         finally:
             stop_evt.set()
             try:
