@@ -128,6 +128,10 @@ def _build_cmd(ffmpeg_bin: str, w: int, h: int, fps: int) -> list[str]:
     if bool(getattr(settings, "H264_CUDA_PIPE_UPLOAD", True)):
         # bgr24 must be converted to nv12 on CPU before hwupload_cuda can accept it
         cmd += ["-vf", f"format=nv12,hwupload_cuda=device={gi}"]
+    else:
+        # h264_nvenc does not accept bgr24 directly; force explicit BGR24→NV12 via libswscale
+        # so FFmpeg does not auto-pick a format that swaps R/B channels (e.g. 0rgb32 vs 0bgr32)
+        cmd += ["-vf", "format=nv12"]
     cmd.extend(_nvenc_output_args())
     return cmd
 
