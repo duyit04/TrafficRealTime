@@ -39,6 +39,7 @@ class BuiltinTracker:
     No external dependencies needed — tracking happens inside model.track().
     This adapter just converts RawDetection (with track_id) → Track objects.
     """
+    uses_builtin: bool = True
 
     def __init__(self, tracker_yaml: str = "bytetrack.yaml", **kwargs: Any) -> None:
         self.tracker_yaml = tracker_yaml
@@ -96,18 +97,26 @@ class BuiltinTracker:
         self._id_to_prev_cx.clear()
 
 
-def get_tracker(tracker_type: str, **kwargs: Any) -> BuiltinTracker:
+def get_tracker(tracker_type: str, **kwargs: Any):
     """
     Factory: returns a tracker adapter.
 
     tracker_type:
       - "bytetrack" → ultralytics built-in ByteTrack (default)
       - "botsort"   → ultralytics built-in BoT-SORT
+      - "sort"      → pure Python SORT (Kalman + Hungarian IoU)
+      - "deepsort"  → DeepSORT (SORT + HSV appearance matching)
     """
     t = (tracker_type or "bytetrack").strip().lower()
     if t == "bytetrack":
         return BuiltinTracker(tracker_yaml="bytetrack.yaml", **kwargs)
     if t == "botsort":
         return BuiltinTracker(tracker_yaml="botsort.yaml", **kwargs)
+    if t == "sort":
+        from app.ml.sort_tracker import SortTracker
+        return SortTracker(**kwargs)
+    if t == "deepsort":
+        from app.ml.deep_sort_tracker import DeepSortTracker
+        return DeepSortTracker(**kwargs)
     # Fallback to bytetrack
     return BuiltinTracker(tracker_yaml="bytetrack.yaml", **kwargs)

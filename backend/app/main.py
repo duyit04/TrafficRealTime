@@ -75,10 +75,12 @@ async def lifespan(app: FastAPI):
 
     # Validate tracker type at startup
     tracker_type = (settings.TRACKER_TYPE or "bytetrack").strip().lower()
-    if tracker_type not in ("bytetrack", "botsort"):
-        raise RuntimeError("Invalid TRACKER_TYPE. Use 'bytetrack' or 'botsort'.")
+    _valid_trackers = ("bytetrack", "botsort", "sort", "deepsort")
+    if tracker_type not in _valid_trackers:
+        raise RuntimeError(f"Invalid TRACKER_TYPE. Use one of: {', '.join(_valid_trackers)}.")
     get_tracker(tracker_type)
-    logger.info("Tracker ready: %s (ultralytics built-in)", tracker_type)
+    _builtin = tracker_type in ("bytetrack", "botsort")
+    logger.info("Tracker ready: %s (%s)", tracker_type, "ultralytics built-in" if _builtin else "custom Python")
 
     # Auto-load a default model so UI is ready on first open.
     # Priority:

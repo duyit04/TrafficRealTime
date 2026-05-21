@@ -424,7 +424,7 @@ class StreamService:
             self.skip_frames = max(0, min(10, int(skip_frames)))
         if tracker_type is not None:
             t = str(tracker_type).strip().lower()
-            if t in ("bytetrack", "botsort"):
+            if t in ("bytetrack", "botsort", "sort", "deepsort"):
                 self._tracker_type = t
                 self._tracker = get_tracker(t)
                 self._companion_tracker = get_tracker(t)
@@ -1037,16 +1037,20 @@ class StreamService:
 
                     if do_infer:
                         t_infer0 = time.time()
-                        # 1. Detection + Tracking (built-in ByteTrack/BoT-SORT)
-                        raw_dets = yolo_model.track(
-                            frame,
-                            conf=self.conf_threshold,
-                            tracker=self._tracker.tracker_yaml,
-                            persist=True,
-                        )
+                        # 1. Detection (+ built-in tracking when using ByteTrack/BoT-SORT)
+                        if getattr(self._tracker, 'uses_builtin', True):
+                            raw_dets = yolo_model.track(
+                                frame,
+                                conf=self.conf_threshold,
+                                tracker=self._tracker.tracker_yaml,
+                                persist=True,
+                            )
+                        else:
+                            # SORT / DeepSORT: detection only; tracker assigns IDs below
+                            raw_dets = yolo_model.predict(frame, conf=self.conf_threshold)
 
                         # 2. Convert to Track objects (with prev_cy for line-crossing)
-                        tracks = self._tracker.update(raw_dets)
+                        tracks = self._tracker.update(raw_dets, frame)
                         infer_fps_cnt += 1
                         infer_ms = (time.time() - t_infer0) * 1000.0
                         infer_ms_hist.append(infer_ms)
@@ -1395,13 +1399,16 @@ class StreamService:
                     if do_infer:
                         try:
                             if self._sync_secondary_model(self._companion_yolo):
-                                dets = self._companion_yolo.track(
-                                    fr,
-                                    conf=self.conf_threshold,
-                                    tracker=self._tracker.tracker_yaml,
-                                    persist=True,
-                                )
-                                tracks = self._companion_tracker.update(dets)
+                                if getattr(self._companion_tracker, 'uses_builtin', True):
+                                    dets = self._companion_yolo.track(
+                                        fr,
+                                        conf=self.conf_threshold,
+                                        tracker=self._companion_tracker.tracker_yaml,
+                                        persist=True,
+                                    )
+                                else:
+                                    dets = self._companion_yolo.predict(fr, conf=self.conf_threshold)
+                                tracks = self._companion_tracker.update(dets, fr)
                             else:
                                 dets = []
                                 tracks = []
@@ -1602,15 +1609,22 @@ class StreamService:
                 else:
                     extra_skip_counter = skip_n
 
+            # Lazy-init tracker before detect so we can check uses_builtin
+            if s not in self._extra_trackers:
+                self._extra_trackers[s] = get_tracker(self._tracker_type)
+
             dets = []
             try:
                 if do_infer and self._sync_secondary_model(self._extra_yolo[s]):
-                    dets = self._extra_yolo[s].track(
-                        fr,
-                        conf=self.conf_threshold,
-                        tracker=self._tracker.tracker_yaml,
-                        persist=True,
-                    )
+                    if getattr(self._extra_trackers[s], 'uses_builtin', True):
+                        dets = self._extra_yolo[s].track(
+                            fr,
+                            conf=self.conf_threshold,
+                            tracker=self._extra_trackers[s].tracker_yaml,
+                            persist=True,
+                        )
+                    else:
+                        dets = self._extra_yolo[s].predict(fr, conf=self.conf_threshold)
                     extra_last_dets = dets
                 elif not do_infer:
                     dets = extra_last_dets
@@ -1622,13 +1636,11 @@ class StreamService:
                 extra_last_dets = []
 
             try:
-                if s not in self._extra_trackers:
-                    self._extra_trackers[s] = get_tracker(self._tracker_type)
                 if s not in self._extra_counters:
                     ec = VehicleCounter()
                     ec.set_mode(self._counter.mode)
                     self._extra_counters[s] = ec
-                tracks = self._extra_trackers[s].update(dets)
+                tracks = self._extra_trackers[s].update(dets, fr)
                 frame_h = int(fr.shape[0])
                 slot_key = str(int(slot))
                 if roi_service.active_for(slot_key) and len(roi_service.points_for(slot_key)) >= 3:

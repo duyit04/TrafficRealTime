@@ -1129,13 +1129,15 @@ export function Dashboard() {
                           const v = e.target.value;
                           setSettings((s) => ({ ...s, tracker_type: v }));
                           updateSettings({ tracker_type: v });
-                          const names: Record<string, string> = { bytetrack: 'ByteTrack', botsort: 'BoT-SORT' };
+                          const names: Record<string, string> = { bytetrack: 'ByteTrack', botsort: 'BoT-SORT', sort: 'SORT', deepsort: 'DeepSORT' };
                           addToast(`Tracker: ${names[v] ?? v}`, 'success');
                         }}
                         className="w-full text-xs border border-slate-300 rounded-lg px-2 py-2 bg-white text-slate-700"
                       >
                         <option value="bytetrack">ByteTrack (recommended)</option>
                         <option value="botsort">BoT-SORT</option>
+                        <option value="sort">SORT</option>
+                        <option value="deepsort">DeepSORT</option>
                       </select>
                     </div>
 
