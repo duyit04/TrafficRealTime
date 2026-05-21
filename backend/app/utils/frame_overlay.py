@@ -40,6 +40,9 @@ def overlay_traffic_ui(
     h, w = out.shape[:2]
     for d in detections or []:
         bb = d.get("bbox") if isinstance(d, dict) else None
+        if not isinstance(bb, dict) and isinstance(d, dict):
+            if all(k in d for k in ("x1", "y1", "x2", "y2")):
+                bb = {"x1": d["x1"], "y1": d["y1"], "x2": d["x2"], "y2": d["y2"]}
         if not isinstance(bb, dict):
             continue
         try:

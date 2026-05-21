@@ -136,6 +136,9 @@ class StreamService:
         self._extra_latest: dict[int, dict] = {}
         self._extra_lock = threading.Lock()
 
+        # Source mode: "rtsp" | "file"
+        self._source_mode: str = "rtsp"
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -1782,6 +1785,207 @@ class StreamService:
         return int(stopped_cnt), int(len(in_roi))
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    # ── Video file source ─────────────────────────────────────────────────────
+
+    def start_video_file(self, path: str) -> None:
+        """Upload a local video file and start detection+tracking on it."""
+        self._last_error = None
+        self._stats.stream_error = ""
+        t = threading.Thread(target=self._do_start_video_file, args=(path,), daemon=True)
+        t.start()
+        logger.info("StreamService: video file start requested → %s", path)
+
+    def _do_start_video_file(self, path: str) -> None:
+        self.stop()
+        self._reset_all()
+        self._running = True
+        self._source_mode = "file"
+        self._thread = threading.Thread(target=self._video_file_worker, args=(path,), daemon=True)
+        self._thread.start()
+        logger.info("StreamService: video file worker started")
+
+    def _video_file_worker(self, path: str) -> None:
+        """Read frames from a video file, run detection/tracking, write to H264 pipe + WS."""
+        import os
+        from app.services.model_service import model_service as _model_service
+
+        try:
+            tls = None
+            try:
+                from app.services.traffic_light_service import traffic_light_service as _tls
+                tls = _tls
+            except Exception:
+                pass
+
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                self._last_error = f"Không thể mở file video: {path}"
+                self._stats.stream_error = self._last_error
+                logger.warning("StreamService: %s", self._last_error)
+                self._running = False
+                return
+
+            video_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            frame_interval = 1.0 / max(1.0, min(float(self.max_fps), video_fps))
+            self._stats.stream_active = True
+            fps_cnt = 0
+            t0 = time.time()
+            _next_deadline = time.perf_counter()
+
+            while self._running:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                frame = np.array(frame)  # ensure writable
+
+                # Detection / tracking
+                try:
+                    if getattr(self._tracker, 'uses_builtin', True):
+                        raw_dets = yolo_model.track(
+                            frame,
+                            conf=self.conf_threshold,
+                            tracker=self._tracker.tracker_yaml,
+                            persist=True,
+                        )
+                    else:
+                        raw_dets = yolo_model.predict(frame, conf=self.conf_threshold)
+                    tracks = self._tracker.update(raw_dets, frame)
+                except Exception as pipe_err:
+                    if is_tracker_state_error(pipe_err):
+                        yolo_model.reset_tracker()
+                        self._tracker.reset()
+                    raw_dets = []
+                    tracks = []
+
+                # Counting line
+                frame_h = frame.shape[0]
+                if self._counting_line_y is None:
+                    self._counting_line_y = int(frame_h * self.line_position)
+                line_y = self._counting_line_y
+                self._stats.line_position = self.line_position
+
+                self._counter.update(tracks, line_y)
+                self._stats.total = self._counter.total
+                self._stats.count_in = self._counter.count_in
+                self._stats.count_out = self._counter.count_out
+                self._stats.classes = dict(self._counter.by_class)
+                self._stats.classes_in = dict(self._counter.by_class_in)
+                self._stats.classes_out = dict(self._counter.by_class_out)
+
+                try:
+                    self._stats.model_loaded = bool(_model_service.is_loaded)
+                    self._stats.model_name = str(_model_service.name or "")
+                except Exception:
+                    pass
+
+                fps_cnt += 1
+                elapsed = time.time() - t0
+                if elapsed >= 1.0:
+                    self._stats.fps = round(fps_cnt / elapsed, 1)
+                    fps_cnt = 0
+                    t0 = time.time()
+
+                self._stats.frame_count = getattr(self._stats, 'frame_count', 0) + 1
+
+                api_dets_dict = [
+                    {
+                        "bbox": {"x1": d.x1, "y1": d.y1, "x2": d.x2, "y2": d.y2},
+                        "class_name": d.class_name,
+                        "confidence": d.confidence,
+                        "track_id": d.track_id,
+                    }
+                    for d in raw_dets
+                ]
+
+                # H264 burn-in
+                if should_h264_burnin():
+                    try:
+                        vis = overlay_traffic_ui(
+                            frame,
+                            api_dets_dict,
+                            line_y_px=int(line_y),
+                            show_line=True,
+                            in_place=True,
+                        )
+                        h264_bgr_primary.write_frame(vis, fps=max(1, int(video_fps)))
+                    except Exception as he:
+                        logger.warning("H264 burn-in video file skipped: %s", he)
+
+                _s = self._stats
+                stats_dict = {
+                    "total": int(_s.total),
+                    "count_in": int(_s.count_in),
+                    "count_out": int(_s.count_out),
+                    "classes": dict(_s.classes),
+                    "classes_in": dict(_s.classes_in),
+                    "classes_out": dict(_s.classes_out),
+                    "counting_mode": _s.counting_mode,
+                    "fps": _s.fps,
+                    "fps_capture": 0.0,
+                    "fps_inference": 0.0,
+                    "fps_sent": 0.0,
+                    "avg_inference_ms": _s.avg_inference_ms,
+                    "frame_count": _s.frame_count,
+                    "stream_active": _s.stream_active,
+                    "model_loaded": _s.model_loaded,
+                    "model_name": _s.model_name,
+                    "roi_active": False,
+                    "conf_threshold": _s.conf_threshold,
+                    "line_position": _s.line_position,
+                    "congestion": {
+                        "is_congested": False,
+                        "vehicle_count": 0,
+                        "threshold": 0,
+                        "duration_seconds": 0.0,
+                        "stable_duration": 0.0,
+                        "message": "",
+                        "level": "normal",
+                    },
+                }
+                header = {"detections": api_dets_dict, "stats": stats_dict}
+                with self._lock:
+                    self._latest = {"frame": None, "detections": api_dets_dict, "stats": stats_dict}
+                try:
+                    if ws_manager.has_clients:
+                        ws_manager.broadcast_text_threadsafe(stats_message_json(header))
+                except Exception:
+                    pass
+
+                # Deadline-based frame pacing
+                _next_deadline += frame_interval
+                _wait = _next_deadline - time.perf_counter()
+                if _wait > 0.002:
+                    time.sleep(_wait - 0.001)
+                while time.perf_counter() < _next_deadline:
+                    pass
+                if time.perf_counter() - _next_deadline > frame_interval:
+                    _next_deadline = time.perf_counter()
+
+        except Exception as e:
+            logger.exception("StreamService: video file worker crashed: %s", e)
+            self._last_error = f"Video worker error: {e}"
+            self._stats.stream_error = str(e)
+        finally:
+            try:
+                cap.release()
+            except Exception:
+                pass
+            # Delete temp upload file
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                    logger.info("StreamService: deleted temp video %s", path)
+            except Exception:
+                pass
+            with self._lock:
+                self._latest = None
+            self._stats.stream_active = False
+            self._stats.fps = 0.0
+            self._running = False
+            self._source_mode = "rtsp"
+            logger.info("StreamService: video file worker exited")
 
     def _reset_all(self) -> None:
         self._tracker = get_tracker(self._tracker_type)

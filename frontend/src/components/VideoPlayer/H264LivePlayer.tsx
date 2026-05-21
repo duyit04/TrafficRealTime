@@ -17,11 +17,19 @@ type MpegTsPlayer = {
 interface Props {
   enabled: boolean;
   wsPath?: string;
-  /** Khi chưa bật stream — bấm vùng đen để mở chọn camera */
+  /** Khi chưa bật stream — bấm vùng placeholder */
   onSelectCamera?: () => void;
+  placeholderTitle?: string;
+  placeholderSubtitle?: string;
 }
 
-export function H264LivePlayer({ enabled, wsPath = '/ws/stream-h264', onSelectCamera }: Props) {
+export function H264LivePlayer({
+  enabled,
+  wsPath = '/ws/stream-h264',
+  onSelectCamera,
+  placeholderTitle = 'Chọn camera để xem',
+  placeholderSubtitle = 'Bấm để mở Camera / Stream',
+}: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const playerRef = useRef<MpegTsPlayer | null>(null);
   const bootTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -150,11 +158,11 @@ export function H264LivePlayer({ enabled, wsPath = '/ws/stream-h264', onSelectCa
           onClick={onSelectCamera}
           className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-2.5 text-slate-500 bg-slate-100 hover:bg-slate-50 transition-colors"
           style={{ cursor: onSelectCamera ? 'pointer' : 'default' }}
-          aria-label="Chọn camera / kết nối stream"
+          aria-label={placeholderTitle}
         >
           <IconCameraCctv className="h-10 w-10 text-slate-400" aria-hidden />
-          <p className="text-sm font-medium text-slate-600">Chọn camera để xem</p>
-          <p className="text-[11px] text-slate-400">Bấm để mở Camera / Stream</p>
+          <p className="text-sm font-medium text-slate-600">{placeholderTitle}</p>
+          <p className="text-[11px] text-slate-400">{placeholderSubtitle}</p>
         </button>
       )}
       <video

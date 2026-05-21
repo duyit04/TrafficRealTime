@@ -201,6 +201,20 @@ export function useDetection() {
     setExtraLive({});
   }, []);
 
+  /** Bật WS stats sau khi backend đã start (upload video / nguồn không qua startStream). */
+  const beginPlayback = useCallback(() => {
+    setStreamActive(true);
+  }, []);
+
+  const endPlayback = useCallback(() => {
+    setStreamActive(false);
+    setCompanionActive(false);
+    setCompanionStreamActive(false);
+    setDetections([]);
+    setCompanionDetections([]);
+    setExtraLive({});
+  }, []);
+
   const setRoi = useCallback(async (points: number[][]) => {
     await detectionApi.setRoi({ points, active: true });
   }, []);
@@ -255,6 +269,8 @@ export function useDetection() {
     startCompanion,
     stopCompanion,
     stopStream,
+    beginPlayback,
+    endPlayback,
     reloadStats,
     setRoi,
     clearRoi,

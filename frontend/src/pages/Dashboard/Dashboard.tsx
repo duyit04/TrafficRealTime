@@ -16,6 +16,8 @@ import { TwinSiblingPanel, getPreviewRefreshMs, getPreviewStaggerMs } from '../.
 import { TrafficLightPanel } from '../../components/TrafficLight';
 import { modelApi, detectionApi, streamApi, trafficLightApi } from '../../services/api';
 import type { DeviceInfo } from '../../services/api';
+import { ImageDetect } from '../../components/ImageDetect/ImageDetect';
+import { VideoUpload } from '../../components/VideoUpload/VideoUpload';
 import type { ModelInfo, Settings, Toast } from '../../types/detection';
 
 // ── Camera presets (control room) ─────────────────────────────────────────────
@@ -48,7 +50,9 @@ export function Dashboard() {
     detections, stats, wsConnected, companionWsConnected, companionActive, companionStreamActive,
     companionDetections, companionLinePosition,
     extraLive,
-    startStream, startCompanion, stopCompanion, stopStream, reloadStats, setRoi, clearRoi, setRoiSlot, clearRoiSlot, resetCount, updateSettings,
+    startStream, startCompanion, stopCompanion, stopStream, beginPlayback, endPlayback, reloadStats,
+    streamActive: playbackActive,
+    setRoi, clearRoi, setRoiSlot, clearRoiSlot, resetCount, updateSettings,
   } = useDetection();
 
   const [streamUrl, setStreamUrl]     = useState('');
@@ -94,6 +98,8 @@ export function Dashboard() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [cameraOpen, setCameraOpen] = useState(false);
   const [roiOpen, setRoiOpen] = useState(false);
+  type AppMode = 'rtsp' | 'image' | 'video';
+  const [appMode, setAppMode] = useState<AppMode>('rtsp');
   const trimmedStream = streamUrl.trim();
   const trafficPhaseRoadLabels = useMemo(
     (): [string, string] => phaseRoadTitlesFromPrimaryUrl(trimmedStream),
@@ -469,17 +475,23 @@ export function Dashboard() {
         <div className="flex items-center gap-2 shrink-0">
           <StatusPill label={stats.model_loaded ? stats.model_name.replace('.pt', '') : 'No Model'} active={stats.model_loaded} />
           <StatusPill label={deviceInfo.cuda_available ? 'GPU' : 'CPU'} active={deviceInfo.cuda_available} title={deviceInfo.device_name ?? undefined} />
-          <StatusPill label="H264" active={streamOn} title="Video: H264 NVENC (box burn-in)" />
-          <button
-            type="button"
-            onClick={() => setCameraOpen(true)}
-            className="h-8 px-2.5 inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 hover:text-accent transition-colors shadow-sm"
-            title="Camera / Stream"
-            aria-label="Camera / Stream"
-          >
-            <IconCameraCctv className="h-4 w-4 shrink-0" aria-hidden />
-            <span className="text-[11px] font-bold hidden sm:inline">Camera</span>
-          </button>
+          <StatusPill
+            label="H264"
+            active={appMode === 'rtsp' ? streamOn : stats.stream_active}
+            title="Video: H264 NVENC (box burn-in)"
+          />
+          {appMode === 'rtsp' ? (
+            <button
+              type="button"
+              onClick={() => setCameraOpen(true)}
+              className="h-8 px-2.5 inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 hover:text-accent transition-colors shadow-sm"
+              title="Camera / Stream"
+              aria-label="Camera / Stream"
+            >
+              <IconCameraCctv className="h-4 w-4 shrink-0" aria-hidden />
+              <span className="text-[11px] font-bold hidden sm:inline">Camera</span>
+            </button>
+          ) : null}
         </div>
 
         {/* Center: system title */}
@@ -537,7 +549,7 @@ export function Dashboard() {
               </div>
             </>
           )}
-          {streamOn && (
+          {(streamOn || (appMode === 'video' && playbackActive)) && (
             <>
               <span>·</span>
               {wsConnected ? (
@@ -559,14 +571,13 @@ export function Dashboard() {
 
       {/* ── Body ───────────────────────────────────────────────────────────── */}
       <div className="flex flex-1 min-h-0">
-
-        {/* ── Main ─────────────────────────────────────────────────────────── */}
         <main className="flex flex-1 min-w-0 min-h-0 overflow-hidden">
 
-          {/* Video panel — 1 màn chính; mỗi lần « Mở rộng » thêm một cột preview */}
+          {/* ── Content area (left) ──────────────────────────────────────── */}
           <div className="flex flex-col flex-1 min-w-0 p-3 gap-2 min-h-0">
-            {/* Multi-view controls */}
-            {streamOn ? (
+
+            {/* Multi-view controls — RTSP only */}
+            {appMode === 'rtsp' && streamOn ? (
               <div className="flex items-center justify-between gap-2 px-0.5">
                 <div className="text-[10px] font-bold uppercase tracking-wide text-slate-600">
                   Hiển thị: {1 + previewSlots.length} camera
@@ -618,7 +629,17 @@ export function Dashboard() {
               </div>
             ) : null}
 
-            {/* Chọn camera màn phụ: dùng chung modal Camera/Stream */}
+            {/* ── Main frame: image / video / camera grid ─────────────── */}
+            {appMode === 'image' ? (
+              <ImageDetect />
+            ) : appMode === 'video' ? (
+              <VideoUpload
+                streamActive={stats.stream_active}
+                onPlaybackStart={beginPlayback}
+                onPlaybackStop={endPlayback}
+                onReloadStats={reloadStats}
+              />
+            ) : (
             <div className={`gap-3 flex-1 min-h-0 min-w-0 grid ${previewGridClass} items-stretch`}>
               <div className="flex flex-col min-h-0 min-w-0 gap-1.5">
                 {multiView ? (
@@ -768,32 +789,38 @@ export function Dashboard() {
                 </div>
               ))}
             </div>
+            )}
           </div>
 
-          {/* Stats + Traffic Light panel (right sidebar) */}
+          {/* ── Sidebar (right) ───────────────────────────────────────── */}
+          {appMode === 'rtsp' || appMode === 'video' ? (
           <aside className="w-64 shrink-0 border-l border-slate-200 overflow-y-auto p-3 bg-white flex flex-col gap-3">
-            <TrafficLightPanel
-              streamActive={streamOn}
-              activeUrls={[trimmedStream, ...previewSlots.map((s) => s.url)].filter(Boolean)}
-              cameraOptions={cameraOptions}
-              selectedUrls={tlSelectedUrls}
-              onSelectUrl={(idx, url) =>
-                setTlSelectedUrls((prev) => (idx === 0 ? [url, prev[1]] : [prev[0], url]))
-              }
-            />
+            {appMode === 'rtsp' ? (
+              <TrafficLightPanel
+                streamActive={streamOn}
+                activeUrls={[trimmedStream, ...previewSlots.map((s) => s.url)].filter(Boolean)}
+                cameraOptions={cameraOptions}
+                selectedUrls={tlSelectedUrls}
+                onSelectUrl={(idx, url) =>
+                  setTlSelectedUrls((prev) => (idx === 0 ? [url, prev[1]] : [prev[0], url]))
+                }
+              />
+            ) : null}
 
             <div className="rounded-xl border border-slate-200 bg-white p-2 shrink-0">
-              <div className="grid grid-cols-3 gap-2">
-                <button
-                  type="button"
-                  onClick={() => setCameraOpen(true)}
-                  className="h-10 w-full inline-flex flex-col items-center justify-center gap-0.5 rounded-lg border border-accent/30 bg-accent/5 hover:bg-accent/10 transition-colors text-accent"
-                  title="Camera / Stream"
-                  aria-label="Camera / Stream"
-                >
-                  <IconCameraCctv className="h-[1.125rem] w-[1.125rem]" aria-hidden />
-                  <span className="text-[9px] font-bold leading-none">Camera</span>
-                </button>
+              <div className={`grid gap-2 ${appMode === 'rtsp' ? 'grid-cols-3' : 'grid-cols-2'}`}>
+                {appMode === 'rtsp' ? (
+                  <button
+                    type="button"
+                    onClick={() => setCameraOpen(true)}
+                    className="h-10 w-full inline-flex flex-col items-center justify-center gap-0.5 rounded-lg border border-accent/30 bg-accent/5 hover:bg-accent/10 transition-colors text-accent"
+                    title="Camera / Stream"
+                    aria-label="Camera / Stream"
+                  >
+                    <IconCameraCctv className="h-[1.125rem] w-[1.125rem]" aria-hidden />
+                    <span className="text-[9px] font-bold leading-none">Camera</span>
+                  </button>
+                ) : null}
                 <button
                   type="button"
                   onClick={() => setRoiOpen(true)}
@@ -817,7 +844,7 @@ export function Dashboard() {
 
             <div className="flex items-center justify-between">
               <h2 className="text-xs font-bold uppercase tracking-wider text-slate-500">Thống kê</h2>
-              <span className={`w-2 h-2 rounded-full ${streamOn ? 'bg-accent animate-pulse' : 'bg-slate-300'}`} />
+              <span className={`w-2 h-2 rounded-full ${(appMode === 'rtsp' ? streamOn : stats.stream_active) ? 'bg-accent animate-pulse' : 'bg-slate-300'}`} />
             </div>
             <CounterPanel
               stats={countingEnabled ? statsForView : { ...statsForView, total: 0, classes: {} }}
@@ -826,6 +853,19 @@ export function Dashboard() {
             />
             <hr className="border-slate-100" />
           </aside>
+          ) : (
+          <div className="w-12 shrink-0 border-l border-slate-200 bg-white flex flex-col items-center pt-2">
+            <button
+              type="button"
+              onClick={() => setSettingsOpen(true)}
+              className="h-9 w-9 inline-flex items-center justify-center rounded-lg border border-slate-200 hover:bg-slate-50 transition-colors text-slate-500 hover:text-accent"
+              title="Cài đặt"
+              aria-label="Cài đặt"
+            >
+              <IconTune className="h-[1.125rem] w-[1.125rem]" aria-hidden />
+            </button>
+          </div>
+          )}
 
         </main>
       </div>
@@ -867,7 +907,16 @@ export function Dashboard() {
               <div className="p-4 overflow-auto">
                 <div className="mb-3 flex flex-wrap gap-2">
                   {roiActiveSlots.map((k) => {
-                    const label = k === 'primary' ? 'Camera 1' : k === 'companion' ? 'Camera 2' : k === 2 ? 'Camera 3' : 'Camera 4';
+                    const label =
+                      appMode === 'video' && k === 'primary'
+                        ? 'Video'
+                        : k === 'primary'
+                          ? 'Camera 1'
+                          : k === 'companion'
+                            ? 'Camera 2'
+                            : k === 2
+                              ? 'Camera 3'
+                              : 'Camera 4';
                     const isOn = roiTarget === k;
                     return (
                       <button
@@ -1068,6 +1117,30 @@ export function Dashboard() {
               </div>
 
               <div className="p-4 overflow-auto">
+                <div className="rounded-xl border border-slate-200 bg-white p-3 mb-4">
+                  <div className="text-[11px] font-bold text-slate-600 uppercase tracking-wide mb-2">Chế độ nguồn</div>
+                  <div className="flex gap-2">
+                    {([
+                      { key: 'rtsp',  label: 'Camera RTSP', desc: 'Luồng RTSP trực tiếp' },
+                      { key: 'image', label: 'Detect Ảnh',  desc: 'Upload ảnh để nhận diện' },
+                      { key: 'video', label: 'Detect Video', desc: 'Upload video để tracking' },
+                    ] as { key: AppMode; label: string; desc: string }[]).map(({ key, label, desc }) => (
+                      <button
+                        key={key}
+                        type="button"
+                        onClick={() => { setAppMode(key); setSettingsOpen(false); }}
+                        className={`flex-1 p-2 rounded-lg border text-left transition-colors ${
+                          appMode === key
+                            ? 'border-accent bg-blue-50 text-accent'
+                            : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300'
+                        }`}
+                      >
+                        <div className="text-[11px] font-bold">{label}</div>
+                        <div className="text-[10px] text-slate-400 mt-0.5">{desc}</div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
                 <div className="rounded-xl border border-slate-200 bg-white p-3 mb-4">
                   <div className="text-[11px] font-bold text-slate-600 uppercase tracking-wide mb-2">Export TensorRT</div>
                   <ModelUploader

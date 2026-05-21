@@ -196,6 +196,49 @@ export interface TLState {
   lane_density_advice?: { enabled?: boolean; note?: string };
 }
 
+// ── Media (image detect + video upload) ──────────────────────────────────────
+
+export interface ImageDetectResult {
+  success: boolean;
+  image: string;
+  width: number;
+  height: number;
+  detections: Array<{
+    x1: number; y1: number; x2: number; y2: number;
+    class_name: string; confidence: number; track_id: null;
+  }>;
+  count: number;
+}
+
+export const mediaApi = {
+  detectImage: async (file: File): Promise<ImageDetectResult> => {
+    const form = new FormData();
+    form.append('file', file);
+    const res = await fetch(`${BASE}/media/detect-image`, { method: 'POST', body: form });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || 'Detection failed');
+    }
+    return res.json();
+  },
+
+  startVideo: async (file: File): Promise<{ success: boolean; filename: string; size: number }> => {
+    const form = new FormData();
+    form.append('file', file);
+    const res = await fetch(`${BASE}/media/start-video`, { method: 'POST', body: form });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || 'Upload failed');
+    }
+    return res.json();
+  },
+
+  stopVideo: () => apiFetch<SuccessResponse>('/media/stop-video', { method: 'POST' }),
+
+  getStatus: () =>
+    apiFetch<{ source_mode: string; running: boolean; stream_active: boolean }>('/media/status'),
+};
+
 export const trafficLightApi = {
   getState: () => apiFetch<TLState>('/traffic-light/state'),
   setSources: (body: { phase0_slot: string; phase1_slot: string }) =>

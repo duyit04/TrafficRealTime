@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
 from app.core.logger import logger
-from app.api import model_routes, stream_routes, detection_routes, traffic_light_routes
+from app.api import model_routes, stream_routes, detection_routes, traffic_light_routes, media_routes
 from app.api.ws_routes import router as ws_router
 from app.services.model_service import model_service
 from app.services.stream_service import stream_service
@@ -153,6 +153,7 @@ app.include_router(model_routes.router)
 app.include_router(stream_routes.router)
 app.include_router(detection_routes.router)
 app.include_router(traffic_light_routes.router)
+app.include_router(media_routes.router)
 app.include_router(ws_router)
 
 
