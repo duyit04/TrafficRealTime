@@ -237,6 +237,53 @@ class DisplayOnlyTrafficLightService:
         hi = float(settings.TLC_MAX_GREEN)
         return float(max(lo, min(hi, base + a * qw - b * qs)))
 
+    def _apply_phase_advice_display_locked(
+        self,
+        q0: int,
+        q1: int,
+        advice_ready: bool,
+        demand_here: bool,
+    ) -> None:
+        """
+        UI gợi ý: pha đỏ → green_time = G (xanh tiếp theo);
+        pha xanh/vàng → red_time_hint = R (khối đỏ tiếp theo ≈ G + clearance).
+        """
+        default_g = float(getattr(settings, "TLC_ADVICE_DEFAULT_SECONDS", 30.0) or 30.0)
+        clearance_full = float(self._yellow_seconds + self._all_red_seconds)
+
+        for p in self._state.phases[:2]:
+            p.green_time = default_g
+            p.red_time_hint = 0.0
+
+        if not advice_ready:
+            return
+
+        def _g(waiting: int, serving: int) -> float:
+            if not demand_here:
+                return default_g
+            return self._coupled_green_duration(int(waiting), int(serving), q0, q1)
+
+        ap = int(self._active_phase)
+        sub = self._movement_substate
+
+        if sub in ("green", "yellow"):
+            wai = int(1 - ap)
+            srv = ap
+            g = _g(wai, srv)
+            for idx, p in enumerate(self._state.phases[:2]):
+                if idx == wai:
+                    p.green_time = float(g)
+                if idx == srv:
+                    p.red_time_hint = float(g) + clearance_full
+        elif sub == "all_red":
+            nh = self._pick_next_green_after_all_red_locked(q0, q1)
+            other = int(1 - nh)
+            for idx, p in enumerate(self._state.phases[:2]):
+                if idx == nh:
+                    p.green_time = float(_g(other, nh))
+                else:
+                    p.green_time = float(_g(nh, other))
+
     # ── Internal loop ───────────────────────────────────────────────────────
     def _start_ticker(self) -> None:
         if self._ticker_thread and self._ticker_thread.is_alive():
@@ -364,8 +411,6 @@ class DisplayOnlyTrafficLightService:
             p.queue_length = 0 if (obs is None or stale) else int(obs.stopped_count)
             p.approaching_count = 0
             p.avg_wait = 0.0
-            p.green_time = float(geff_ui)
-            p.red_time_hint = 0.0
 
         if not self._stream_live or not self._advice_enabled:
             self._state.intersection_state = "green"
@@ -374,6 +419,7 @@ class DisplayOnlyTrafficLightService:
                 p.color = "red"
                 p.remaining = 0.0
                 p.time_until_green = 0.0
+            self._apply_phase_advice_display_locked(q0, q1, advice_ready, demand_here)
             self._state.ui_hint = ""
             return
 
@@ -394,11 +440,6 @@ class DisplayOnlyTrafficLightService:
                     p.remaining = 0.0
                     p.time_until_green = float(rem + self._yellow_seconds + self._all_red_seconds)
 
-            # Hướng đang XANH: một G chung ⇒ khối đỏ tinh (trước khi được xanh lại) ≈ geff_ui + vàng/all_red).
-            if advice_ready:
-                ap = int(self._active_phase)
-                self._state.phases[ap].red_time_hint = float(geff_ui) + clearance
-
         elif self._movement_substate == "yellow":
             self._state.intersection_state = "yellow"
             # yellow_phase_id is set in ticker loop when entering "yellow".
@@ -413,11 +454,6 @@ class DisplayOnlyTrafficLightService:
                     p.remaining = 0.0
                     p.time_until_green = float(rem + self._all_red_seconds)
 
-            if advice_ready:
-                ap = int(self._active_phase)
-                clearance_y = float(self._yellow_seconds + self._all_red_seconds)
-                self._state.phases[ap].red_time_hint = float(geff_ui) + clearance_y
-
         else:  # all_red
             self._state.intersection_state = "all_red"
             self._state.yellow_phase_id = None
@@ -426,6 +462,7 @@ class DisplayOnlyTrafficLightService:
                 p.remaining = 0.0
                 p.time_until_green = float(self._all_red_seconds - elapsed)
 
+        self._apply_phase_advice_display_locked(q0, q1, advice_ready, demand_here)
         self._state.ui_hint = ""
 
 

@@ -59,8 +59,12 @@ function TrafficLightVisual({
         const titleShort = shortCameraLabel(titleFull, idx);
         const q = p.queue_length ?? 0;
 
-        const countdownRaw =
-          color === 'red' ? (p.time_until_green ?? 0) : (p.remaining ?? 0);
+        /** Đỏ → G (green_time); xanh/vàng → R (red_time_hint) — gợi ý pha kế tiếp, không đếm ngược chu kỳ. */
+        const countdownRaw = showAdvice
+          ? color === 'red'
+            ? (p.green_time ?? 0)
+            : (p.red_time_hint ?? 0)
+          : 0;
         const countdownSec = showAdvice
           ? Math.max(0, Math.floor(countdownRaw))
           : 0;
@@ -75,8 +79,8 @@ function TrafficLightVisual({
           : 'bg-slate-400';
 
         /**
-         * Tắt gợi ý: cả ba bóng sáng full (đỏ/vàng/xanh), không đếm ngược.
-         * Bật gợi ý: một bóng theo phase + đếm ngược ~250ms, số màu theo vai trò pha đỏ↔xanh.
+         * Tắt gợi ý: cả ba bóng sáng full, không hiện số gợi ý.
+         * Bật gợi ý: chấm = trạng thái hiện tại; số = G (đỏ) hoặc R (xanh/vàng).
          */
         const adviceNumCls =
           color === 'red' ? 'text-emerald-400' : 'text-red-400';
@@ -128,7 +132,14 @@ function TrafficLightVisual({
                   })}
                 </div>
                 {showAdvice ? (
-                  <div className="pointer-events-none absolute inset-0 flex items-center justify-center rounded-2xl">
+                  <div
+                    className="pointer-events-none absolute inset-0 flex items-center justify-center rounded-2xl"
+                    title={
+                      color === 'red'
+                        ? `Gợi ý xanh tiếp theo (G): ${countdownSec}s`
+                        : `Gợi ý đỏ tiếp theo (R): ${countdownSec}s`
+                    }
+                  >
                     <span
                       className={`font-black tabular-nums text-[28px] leading-none drop-shadow-[0_2px_10px_rgba(0,0,0,0.95)] ${adviceNumCls}`}
                     >
