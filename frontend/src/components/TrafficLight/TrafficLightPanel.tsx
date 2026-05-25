@@ -42,6 +42,12 @@ function shortCameraLabel(raw: string, fallbackIndex: number): string {
   return `Camera ${fallbackIndex + 1}`;
 }
 
+function adviceValueForPhase(p: TLState['phases'][number]): number {
+  return p.color === 'red' ? (p.green_time ?? 0) : (p.red_time_hint ?? 0);
+}
+
+type AdviceAnchor = { sec: number; atMs: number };
+
 function TrafficLightVisual({
   phases,
   showAdvice,
@@ -51,6 +57,65 @@ function TrafficLightVisual({
   showAdvice: boolean;
   phaseTitles: readonly [string, string];
 }) {
+  /** Mốc đếm ngược cục bộ: luôn giảm từ số gợi ý G/R vừa cập nhật. */
+  const anchorsRef = useRef<[AdviceAnchor | null, AdviceAnchor | null]>([null, null]);
+  const prevSnapRef = useRef<{
+    queues: [number, number];
+    colors: [string, string];
+    advice: [number, number];
+  }>({
+    queues: [-1, -1],
+    colors: ['', ''],
+    advice: [-1, -1],
+  });
+  const [tick, setTick] = useState(0);
+
+  useEffect(() => {
+    if (!showAdvice) {
+      anchorsRef.current = [null, null];
+      prevSnapRef.current = { queues: [-1, -1], colors: ['', ''], advice: [-1, -1] };
+      return;
+    }
+
+    const q0 = phases[0]?.queue_length ?? 0;
+    const q1 = phases[1]?.queue_length ?? 0;
+    const prev = prevSnapRef.current;
+    const queuesChanged = q0 !== prev.queues[0] || q1 !== prev.queues[1];
+
+    phases.slice(0, 2).forEach((p, idx) => {
+      const i = idx as 0 | 1;
+      const advice = Math.floor(adviceValueForPhase(p));
+      const q = p.queue_length ?? 0;
+      const color = p.color;
+      const adviceChanged = advice !== prev.advice[i];
+      const colorChanged = color !== prev.colors[i];
+      const queueChanged = q !== prev.queues[i];
+
+      const shouldReset =
+        anchorsRef.current[i] === null ||
+        queuesChanged ||
+        queueChanged ||
+        adviceChanged ||
+        colorChanged;
+
+      if (shouldReset) {
+        anchorsRef.current[i] = { sec: advice, atMs: Date.now() };
+      }
+    });
+
+    prevSnapRef.current = {
+      queues: [q0, q1],
+      colors: [phases[0]?.color ?? '', phases[1]?.color ?? ''],
+      advice: phases.slice(0, 2).map((ph) => Math.floor(adviceValueForPhase(ph))) as [number, number],
+    };
+  }, [phases, showAdvice]);
+
+  useEffect(() => {
+    if (!showAdvice) return;
+    const id = window.setInterval(() => setTick((n) => n + 1), 500);
+    return () => window.clearInterval(id);
+  }, [showAdvice]);
+
   return (
     <div className="grid grid-cols-2 gap-3">
       {phases.slice(0, 2).map((p, idx) => {
@@ -59,14 +124,12 @@ function TrafficLightVisual({
         const titleShort = shortCameraLabel(titleFull, idx);
         const q = p.queue_length ?? 0;
 
-        /** Đỏ → G (green_time); xanh/vàng → R (red_time_hint) — gợi ý pha kế tiếp, không đếm ngược chu kỳ. */
-        const countdownRaw = showAdvice
-          ? color === 'red'
-            ? (p.green_time ?? 0)
-            : (p.red_time_hint ?? 0)
-          : 0;
+        const anchor = anchorsRef.current[idx];
+        void tick;
         const countdownSec = showAdvice
-          ? Math.max(0, Math.floor(countdownRaw))
+          ? anchor
+            ? Math.max(0, Math.floor(anchor.sec - (Date.now() - anchor.atMs) / 1000))
+            : Math.max(0, Math.floor(adviceValueForPhase(p)))
           : 0;
 
         /** Chấm bên cạnh: chỉ báo phase khi bật gợi ý; tắt gợi ý → xám (không nhảy theo đỏ/vàng/xanh). */
@@ -79,11 +142,23 @@ function TrafficLightVisual({
           : 'bg-slate-400';
 
         /**
-         * Tắt gợi ý: cả ba bóng sáng full, không hiện số gợi ý.
-         * Bật gợi ý: chấm = trạng thái hiện tại; số = G (đỏ) hoặc R (xanh/vàng).
+         * Bật gợi ý: số = G/R vừa cập nhật, rồi giảm dần từ đó; có xe ROI → cập nhật gợi ý mới → giảm tiếp.
          */
         const adviceNumCls =
           color === 'red' ? 'text-emerald-400' : 'text-red-400';
+
+        /** Số giây gợi ý pha tiếp theo (G/R) — cố định đến lần cập nhật ROI tiếp theo. */
+        const suggestedSec = showAdvice
+          ? anchor
+            ? Math.max(0, Math.floor(anchor.sec))
+            : Math.max(0, Math.floor(adviceValueForPhase(p)))
+          : 0;
+        const suggestedLabelCls =
+          color === 'red' ? 'text-emerald-500' : 'text-red-500';
+        const suggestedTitle =
+          color === 'red'
+            ? `Đã gợi ý xanh tiếp theo (G): ${suggestedSec}s`
+            : `Đã gợi ý đỏ tiếp theo (R): ${suggestedSec}s`;
 
         return (
           <div key={idx} className="rounded-xl border border-slate-200 bg-white px-2 py-3 shadow-sm">
@@ -95,19 +170,29 @@ function TrafficLightVisual({
             </div>
 
             <div className="mt-2 flex items-center justify-center gap-3">
-              <span
-                className={`h-5 w-5 shrink-0 rounded-full shadow-sm ring-2 ring-white ${badgeTone}`}
-                title={
-                  showAdvice
-                    ? color === 'red'
-                      ? 'Đang đỏ'
-                      : color === 'yellow'
-                        ? 'Đang vàng'
-                        : 'Đang xanh'
-                    : 'Tắt gợi ý — không chỉ báo phase'
-                }
-                aria-hidden
-              />
+              <div className="flex shrink-0 flex-col items-center gap-1">
+                <span
+                  className={`h-5 w-5 rounded-full shadow-sm ring-2 ring-white ${badgeTone}`}
+                  title={
+                    showAdvice
+                      ? color === 'red'
+                        ? 'Đang đỏ'
+                        : color === 'yellow'
+                          ? 'Đang vàng'
+                          : 'Đang xanh'
+                      : 'Tắt gợi ý — không chỉ báo phase'
+                  }
+                  aria-hidden
+                />
+                {showAdvice ? (
+                  <span
+                    className={`text-[11px] font-black tabular-nums leading-none ${suggestedLabelCls}`}
+                    title={suggestedTitle}
+                  >
+                    {suggestedSec}s
+                  </span>
+                ) : null}
+              </div>
               <div className="relative bg-slate-900 rounded-2xl p-2.5 shadow-lg border border-slate-800">
                 <div
                   className={`flex flex-col gap-2.5 ${showAdvice ? 'opacity-[0.32]' : 'opacity-100'}`}
@@ -136,8 +221,8 @@ function TrafficLightVisual({
                     className="pointer-events-none absolute inset-0 flex items-center justify-center rounded-2xl"
                     title={
                       color === 'red'
-                        ? `Gợi ý xanh tiếp theo (G): ${countdownSec}s`
-                        : `Gợi ý đỏ tiếp theo (R): ${countdownSec}s`
+                        ? `Gợi ý xanh (G): còn ${countdownSec}s`
+                        : `Gợi ý đỏ (R): còn ${countdownSec}s`
                     }
                   >
                     <span
