@@ -118,12 +118,12 @@ export function useDetection() {
       return;
     }
 
-    if (payload.stats && !payload.stats.stream_active) {
-      setStreamActive(false);
-      return;
-    }
     if (payload.stats) {
       setStats(payload.stats);
+      if (!payload.stats.stream_active) {
+        setStreamActive(false);
+        return;
+      }
     }
     if (Array.isArray(payload.detections)) {
       applyDetections(payload.detections, lastDetectionsRef, setDetections);

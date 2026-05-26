@@ -968,6 +968,9 @@ class StreamService:
         _next_deadline = time.perf_counter()
         _last_good_frame: np.ndarray | None = None
         _holdover_count = 0
+        # Congestion: track last known vehicle count from inference frames only.
+        # On skipped/holdover/backlog frames tracks=[] which would falsely reset the timer.
+        _last_active_count: int = 0
         try:
             while self._running:
                 frame, backlog = self._drain_latest_frame(
@@ -1112,7 +1115,11 @@ class StreamService:
                 # any per-frame TLC queue/approach inference here.
 
                 # 4. Congestion — cùng tập xe đã lọc
-                cong_state = self._congestion.update(len(active_tracks))
+                # Only update the known count on real inference frames; on skipped/holdover/backlog
+                # frames tracks=[] which would falsely reset the congestion timer to zero.
+                if do_infer:
+                    _last_active_count = len(active_tracks)
+                cong_state = self._congestion.update(_last_active_count)
                 self._stats.congestion = CongestionInfo(
                     is_congested=cong_state.is_congested,
                     vehicle_count=cong_state.vehicle_count,
@@ -1350,6 +1357,7 @@ class StreamService:
         skip_counter = 0
         last_dets: list = []
         _next_deadline = time.perf_counter()
+        _last_companion_active_count: int = 0  # hold count across skipped/backlog frames
 
         try:
             while self._companion_running:
@@ -1454,7 +1462,11 @@ class StreamService:
                             self._companion_counting_line_y = int(frame_h * self.line_position)
                         companion_line_y = self._companion_counting_line_y
                     self._companion_counter.update(active_tracks, companion_line_y)
-                    companion_cong = self._companion_congestion.update(len(active_tracks))
+                    # Only update count on real inference; skipped frames have tracks=[] which
+                    # would falsely reset the congestion timer.
+                    if do_infer:
+                        _last_companion_active_count = len(active_tracks)
+                    companion_cong = self._companion_congestion.update(_last_companion_active_count)
                     companion_congestion_payload = {
                         "is_congested": companion_cong.is_congested,
                         "vehicle_count": companion_cong.vehicle_count,
@@ -1874,6 +1886,18 @@ class StreamService:
                 self._stats.classes_in = dict(self._counter.by_class_in)
                 self._stats.classes_out = dict(self._counter.by_class_out)
 
+                # Congestion — video file mode (tracks always fresh per frame)
+                _vid_cong = self._congestion.update(len(tracks))
+                self._stats.congestion = CongestionInfo(
+                    is_congested=_vid_cong.is_congested,
+                    vehicle_count=_vid_cong.vehicle_count,
+                    threshold=_vid_cong.threshold,
+                    duration_seconds=_vid_cong.duration_seconds,
+                    stable_duration=_vid_cong.stable_duration,
+                    message=_vid_cong.message,
+                    level=_vid_cong.level,
+                )
+
                 try:
                     self._stats.model_loaded = bool(_model_service.is_loaded)
                     self._stats.model_name = str(_model_service.name or "")
@@ -1914,6 +1938,7 @@ class StreamService:
                         logger.warning("H264 burn-in video file skipped: %s", he)
 
                 _s = self._stats
+                _vc = _s.congestion
                 stats_dict = {
                     "total": int(_s.total),
                     "count_in": int(_s.count_in),
@@ -1935,13 +1960,13 @@ class StreamService:
                     "conf_threshold": _s.conf_threshold,
                     "line_position": _s.line_position,
                     "congestion": {
-                        "is_congested": False,
-                        "vehicle_count": 0,
-                        "threshold": 0,
-                        "duration_seconds": 0.0,
-                        "stable_duration": 0.0,
-                        "message": "",
-                        "level": "normal",
+                        "is_congested": _vc.is_congested,
+                        "vehicle_count": _vc.vehicle_count,
+                        "threshold": _vc.threshold,
+                        "duration_seconds": _vc.duration_seconds,
+                        "stable_duration": _vc.stable_duration,
+                        "message": _vc.message,
+                        "level": _vc.level,
                     },
                 }
                 header = {"detections": api_dets_dict, "stats": stats_dict}
