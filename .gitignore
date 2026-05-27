@@ -29,3 +29,7 @@ Thumbs.db
 # Node (nếu frontend dùng npm)
 node_modules/
 *.pt
+#clean
+.kiro/
+.hypothesis/
+docs/

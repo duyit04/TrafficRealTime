@@ -16,6 +16,8 @@ A full-stack demo system for **object detection and multi-object monitoring** in
 
 The architecture is extendable for **SORT**, **DeepSORT**, **ByteTrack**, and **multi-camera** in the future.
 
+**Sơ đồ kiến trúc hệ thống (layout ảnh mẫu, cập nhật theo code hiện tại):** [docs/KIEN-TRUC-HE-THONG.md](docs/KIEN-TRUC-HE-THONG.md).
+
 ---
 
 ## Tech stack
