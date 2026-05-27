@@ -33,3 +33,4 @@ node_modules/
 .kiro/
 .hypothesis/
 docs/
+.ai-memory.md
