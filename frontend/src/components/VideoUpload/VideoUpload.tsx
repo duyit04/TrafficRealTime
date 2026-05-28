@@ -16,6 +16,7 @@ export function VideoUpload({ streamActive, onPlaybackStart, onPlaybackStop, onR
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const [streamReady, setStreamReady] = useState(false);
+  const [videoEnded, setVideoEnded] = useState(false);
 
   const handleFile = async (file: File) => {
     setError(null);
@@ -42,9 +43,21 @@ export function VideoUpload({ streamActive, onPlaybackStart, onPlaybackStop, onR
     }
     setRunning(false);
     setFileName(null);
+    setVideoEnded(false);
     onPlaybackStop();
     onReloadStats?.();
   };
+
+  // Detect natural end: backend sends stream_active=false while we're still running
+  useEffect(() => {
+    if (running && streamReady && !streamActive) {
+      setRunning(false);
+      setFileName(null);
+      setVideoEnded(true);
+      onPlaybackStop();
+      onReloadStats?.();
+    }
+  }, [streamActive, running, streamReady]);
 
   useEffect(() => {
     if (streamActive) setStreamReady(true);
@@ -67,7 +80,10 @@ export function VideoUpload({ streamActive, onPlaybackStart, onPlaybackStop, onR
   };
 
   const openFilePicker = () => {
-    if (!uploading && !running) inputRef.current?.click();
+    if (!uploading && !running) {
+      setVideoEnded(false);
+      inputRef.current?.click();
+    }
   };
 
   return (
@@ -132,6 +148,21 @@ export function VideoUpload({ streamActive, onPlaybackStart, onPlaybackStop, onR
               <path className="opacity-90" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
             </svg>
             <span className="text-sm font-semibold text-white">Đang xử lý video…</span>
+          </div>
+        ) : null}
+
+        {videoEnded && !running ? (
+          <div
+            className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 bg-slate-900/70 backdrop-blur-sm cursor-pointer"
+            onClick={openFilePicker}
+          >
+            <div className="flex h-12 w-12 items-center justify-center rounded-full bg-emerald-500/20 ring-2 ring-emerald-400">
+              <svg className="h-6 w-6 text-emerald-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            </div>
+            <span className="text-sm font-bold text-white">Video đã phát xong</span>
+            <span className="text-xs text-white/60">Bấm để chọn video khác</span>
           </div>
         ) : null}
       </div>
