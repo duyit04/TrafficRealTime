@@ -2006,6 +2006,47 @@ class StreamService:
                 pass
             with self._lock:
                 self._latest = None
+            # Notify frontend that video playback has ended
+            try:
+                if ws_manager.has_clients:
+                    _s = self._stats
+                    _vc = _s.congestion
+                    end_stats = {
+                        "total": int(_s.total),
+                        "count_in": int(_s.count_in),
+                        "count_out": int(_s.count_out),
+                        "classes": dict(_s.classes),
+                        "classes_in": dict(_s.classes_in),
+                        "classes_out": dict(_s.classes_out),
+                        "counting_mode": _s.counting_mode,
+                        "fps": 0.0,
+                        "fps_capture": 0.0,
+                        "fps_inference": 0.0,
+                        "fps_sent": 0.0,
+                        "avg_inference_ms": 0.0,
+                        "frame_count": int(getattr(_s, "frame_count", 0)),
+                        "stream_active": False,
+                        "model_loaded": bool(_s.model_loaded),
+                        "model_name": str(_s.model_name or ""),
+                        "roi_active": False,
+                        "conf_threshold": float(_s.conf_threshold),
+                        "line_position": float(_s.line_position),
+                        "congestion": {
+                            "is_congested": _vc.is_congested,
+                            "vehicle_count": _vc.vehicle_count,
+                            "threshold": _vc.threshold,
+                            "duration_seconds": _vc.duration_seconds,
+                            "stable_duration": _vc.stable_duration,
+                            "message": _vc.message,
+                            "level": _vc.level,
+                        },
+                    }
+                    ws_manager.broadcast_text_threadsafe(
+                        stats_message_json({"video_ended": True, "detections": [], "stats": end_stats})
+                    )
+                    time.sleep(0.1)
+            except Exception:
+                pass
             self._stats.stream_active = False
             self._stats.fps = 0.0
             self._running = False
