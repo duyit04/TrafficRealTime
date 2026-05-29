@@ -24,6 +24,24 @@ export interface CongestionInfo {
   level: 'normal' | 'warning' | 'critical';
 }
 
+/** Per-camera counting snapshot (WebSocket lane_stats / API by_slot). */
+export interface LaneStats {
+  total: number;
+  count_in: number;
+  count_out: number;
+  classes: Record<string, number>;
+  classes_in: Record<string, number>;
+  classes_out: Record<string, number>;
+  counting_mode: 'all' | 'direction';
+  line_position: number;
+  roi_active: boolean;
+  roi_count: number;
+  fps?: number;
+  congestion?: CongestionInfo;
+}
+
+export type StatsSlotKey = 'primary' | 'companion' | '2' | '3';
+
 export interface VehicleStats {
   total: number;
   count_in: number;                // vehicles going IN  (top → bottom)
@@ -47,6 +65,8 @@ export interface VehicleStats {
   line_position: number;
   stream_error?: string;
   congestion: CongestionInfo;
+  /** Per-camera breakdown when fetched from GET /stats */
+  by_slot?: Partial<Record<StatsSlotKey, LaneStats>>;
 }
 
 // ── WebSocket Payload ─────────────────────────────────────────────────────────

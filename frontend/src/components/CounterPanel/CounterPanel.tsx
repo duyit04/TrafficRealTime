@@ -22,21 +22,30 @@ interface Props {
   stats: VehicleStats;
   onReset: () => void;
   onExport: () => void;
+  /** Camera label shown above the panel (e.g. "Camera 1 — Cổng chính"). */
+  cameraLabel?: string;
+  compact?: boolean;
+  showActions?: boolean;
 }
 
-export function CounterPanel({ stats, onReset, onExport }: Props) {
+export function CounterPanel({ stats, onReset, onExport, cameraLabel, compact, showActions = true }: Props) {
   const mode = stats.counting_mode ?? 'all';
   const entries = Object.entries(stats.classes).sort((a, b) => b[1] - a[1]);
   const maxCount = entries[0]?.[1] || 1;
 
   return (
-    <div className="flex flex-col gap-3">
+    <div className={`flex flex-col ${compact ? 'gap-2' : 'gap-3'}`}>
+      {cameraLabel ? (
+        <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400 truncate" title={cameraLabel}>
+          {cameraLabel}
+        </div>
+      ) : null}
 
       {/* ── Summary ── */}
       <div className={`grid gap-2 ${mode === 'direction' ? 'grid-cols-3' : 'grid-cols-1'}`}>
-        <div className="rounded-xl border border-slate-200 bg-white px-3 py-2.5">
+        <div className={`rounded-xl border border-slate-200 bg-white ${compact ? 'px-2.5 py-2' : 'px-3 py-2.5'}`}>
           <div className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">Tổng</div>
-          <div className="text-3xl font-black text-accent tabular-nums leading-tight">{stats.total}</div>
+          <div className={`${compact ? 'text-2xl' : 'text-3xl'} font-black text-accent tabular-nums leading-tight`}>{stats.total}</div>
         </div>
         {mode === 'direction' ? (
           <>
@@ -87,21 +96,22 @@ export function CounterPanel({ stats, onReset, onExport }: Props) {
         </div>
       ) : null}
 
-      {/* Action buttons */}
-      <div className="flex gap-2 pt-1">
-        <button
-          onClick={onReset}
-          className="flex-1 py-2 text-xs font-semibold rounded-lg border border-slate-200 text-slate-700 bg-white hover:bg-slate-50 transition-colors"
-        >
-          Reset
-        </button>
-        <button
-          onClick={onExport}
-          className="flex-1 py-2 text-xs font-bold rounded-lg bg-accent text-white hover:bg-blue-700 transition-colors"
-        >
-          CSV
-        </button>
-      </div>
+      {showActions ? (
+        <div className="flex gap-2 pt-1">
+          <button
+            onClick={onReset}
+            className="flex-1 py-2 text-xs font-semibold rounded-lg border border-slate-200 text-slate-700 bg-white hover:bg-slate-50 transition-colors"
+          >
+            Reset
+          </button>
+          <button
+            onClick={onExport}
+            className="flex-1 py-2 text-xs font-bold rounded-lg bg-accent text-white hover:bg-blue-700 transition-colors"
+          >
+            CSV
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }

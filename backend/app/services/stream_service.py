@@ -122,6 +122,8 @@ class StreamService:
         self._companion_frame_count: int = 0
         self._companion_fps: float = 0.0
         self._companion_counting_line_y: int | None = None
+        self._companion_line_position: float = 0.55
+        self._companion_roi_count: int = 0
 
         # Extra slots: per-slot tracker + counter (gộp vào GET /stats)
         self._extra_trackers: dict[int, object] = {}
@@ -795,6 +797,75 @@ class StreamService:
                 out[key] = out.get(key, 0) + int(v)
         return out
 
+    @staticmethod
+    def _lane_stats_payload(
+        counter: VehicleCounter,
+        *,
+        line_position: float,
+        roi_active: bool,
+        roi_count: int,
+        fps: float = 0.0,
+        congestion: CongestionInfo | None = None,
+    ) -> dict:
+        """Per-camera counting snapshot for dashboard / WebSocket lane_stats."""
+        payload: dict = {
+            "total": int(counter.total),
+            "count_in": int(counter.count_in),
+            "count_out": int(counter.count_out),
+            "classes": dict(counter.by_class),
+            "classes_in": dict(counter.by_class_in),
+            "classes_out": dict(counter.by_class_out),
+            "counting_mode": counter.mode,
+            "line_position": float(line_position),
+            "roi_active": bool(roi_active),
+            "roi_count": int(roi_count) if roi_active else 0,
+            "fps": float(fps),
+        }
+        if congestion is not None:
+            payload["congestion"] = {
+                "is_congested": congestion.is_congested,
+                "vehicle_count": congestion.vehicle_count,
+                "threshold": congestion.threshold,
+                "duration_seconds": congestion.duration_seconds,
+                "stable_duration": congestion.stable_duration,
+                "message": congestion.message,
+                "level": congestion.level,
+            }
+        return payload
+
+    def stats_by_slot(self) -> dict[str, dict]:
+        """primary + companion + extra slots — không gộp, dùng cho dashboard."""
+        out: dict[str, dict] = {}
+        out["primary"] = self._lane_stats_payload(
+            self._counter,
+            line_position=float(self._stats.line_position),
+            roi_active=bool(roi_service.active_for("primary")),
+            roi_count=int(self._stats.roi_count),
+            fps=float(self._stats.fps),
+            congestion=self._stats.congestion,
+        )
+        if self._companion_running:
+            out["companion"] = self._lane_stats_payload(
+                self._companion_counter,
+                line_position=float(self._companion_line_position),
+                roi_active=bool(roi_service.active_for("companion")),
+                roi_count=int(self._companion_roi_count),
+                fps=float(self._companion_fps),
+                congestion=self._companion_congestion.state,
+            )
+        for s, c in self._extra_counters.items():
+            ly = self._extra_counting_line_y.get(int(s))
+            lp = float(ly) / 1080.0 if ly else float(self.line_position)
+            sk = str(int(s))
+            out[sk] = self._lane_stats_payload(
+                c,
+                line_position=lp,
+                roi_active=bool(roi_service.active_for(sk)),
+                roi_count=0,
+                fps=0.0,
+            )
+        return out
+
     def merged_vehicle_stats(self) -> VehicleStats:
         """primary + companion + extra 2/3 — dùng cho API /stats."""
         with self._merge_lock:
@@ -1186,12 +1257,12 @@ class StreamService:
                 # merged_vehicle_stats() does model_copy(deep=True) which is expensive at 30fps
                 _s = self._stats
                 stats_dict = {
-                    "total": self._merged_total(),
-                    "count_in": int(self._counter.count_in) + int(self._companion_counter.count_in),
-                    "count_out": int(self._counter.count_out) + int(self._companion_counter.count_out),
-                    "classes": dict(_s.classes),
-                    "classes_in": dict(_s.classes_in),
-                    "classes_out": dict(_s.classes_out),
+                    "total": int(self._counter.total),
+                    "count_in": int(self._counter.count_in),
+                    "count_out": int(self._counter.count_out),
+                    "classes": dict(self._counter.by_class),
+                    "classes_in": dict(self._counter.by_class_in),
+                    "classes_out": dict(self._counter.by_class_out),
                     "counting_mode": _s.counting_mode,
                     "fps": _s.fps,
                     "fps_capture": _s.fps_capture,
@@ -1477,6 +1548,14 @@ class StreamService:
                     # would falsely reset the congestion timer.
                     if do_infer:
                         _last_companion_active_count = len(active_tracks)
+                    self._companion_line_position = float(companion_line_y) / float(max(frame_h, 1))
+                    _companion_roi_on = bool(
+                        roi_service.active_for("companion")
+                        and roi_service.points_for("companion")
+                    )
+                    self._companion_roi_count = (
+                        int(_last_companion_active_count) if _companion_roi_on else 0
+                    )
                     companion_cong = self._companion_congestion.update(_last_companion_active_count)
                     companion_congestion_payload = {
                         "is_congested": companion_cong.is_congested,
@@ -1516,10 +1595,6 @@ class StreamService:
                             h264_bgr_companion.write_frame(vis_h264, fps=c_fps)
                         except Exception as he:
                             logger.debug("H264 burn-in companion skipped: %s", he)
-                    _companion_roi_on = bool(
-                        roi_service.active_for("companion")
-                        and roi_service.points_for("companion")
-                    )
                     header = {
                         "detections": api_dets_dict,
                         "fps": float(self._companion_fps),
@@ -1720,12 +1795,25 @@ class StreamService:
                         (h264_bgr_extra2 if s == 2 else h264_bgr_extra3).write_frame(vis_h264, fps=xf)
                     except Exception as he:
                         logger.debug("H264 burn-in extra slot %d skipped: %s", s, he)
+                _extra_roi_on = bool(
+                    roi_service.active_for(slot_key)
+                    and len(roi_service.points_for(slot_key)) >= 3
+                )
+                ec = self._extra_counters.get(s)
                 header = {
                     "slot": int(slot),
                     "detections": [d.model_dump() for d in api_dets],
                     "fps": float(fps_val),
                     "stream_active": True,
                 }
+                if ec is not None:
+                    header["lane_stats"] = self._lane_stats_payload(
+                        ec,
+                        line_position=float(line_y) / float(max(frame_h, 1)),
+                        roi_active=_extra_roi_on,
+                        roi_count=len(active_tracks) if _extra_roi_on else 0,
+                        fps=float(fps_val),
+                    )
                 with self._extra_lock:
                     self._extra_latest[int(slot)] = {
                         "slot": int(slot),

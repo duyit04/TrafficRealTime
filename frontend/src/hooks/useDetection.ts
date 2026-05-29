@@ -6,7 +6,15 @@
 import { useState, useEffect, useCallback, useRef, useMemo, type MutableRefObject } from 'react';
 import { detectionApi, streamApi, getWebSocketUrl } from '../services/api';
 import { useWebSocket } from './useWebSocket';
-import type { Detection, FramePayload, VehicleStats, Settings, CongestionInfo } from '../types/detection';
+import type {
+  Detection,
+  FramePayload,
+  VehicleStats,
+  Settings,
+  CongestionInfo,
+  LaneStats,
+  StatsSlotKey,
+} from '../types/detection';
 
 const DEFAULT_STATS: VehicleStats = {
   total: 0,
@@ -56,6 +64,24 @@ function zeroLiveThroughput(stats: VehicleStats): VehicleStats {
   };
 }
 
+function laneStatsToVehicleStats(lane: LaneStats, base: VehicleStats): VehicleStats {
+  return {
+    ...base,
+    total: lane.total ?? 0,
+    count_in: lane.count_in ?? 0,
+    count_out: lane.count_out ?? 0,
+    classes: lane.classes ?? {},
+    classes_in: lane.classes_in ?? {},
+    classes_out: lane.classes_out ?? {},
+    counting_mode: lane.counting_mode ?? base.counting_mode,
+    line_position: lane.line_position ?? base.line_position,
+    roi_active: lane.roi_active ?? false,
+    roi_count: lane.roi_count ?? 0,
+    fps: lane.fps ?? base.fps,
+    congestion: lane.congestion ?? base.congestion,
+  };
+}
+
 function applyDetections(
   next: Detection[],
   lastRef: MutableRefObject<{ ts: number; dets: Detection[] }>,
@@ -87,6 +113,7 @@ export function useDetection() {
   const [companionCongestion, setCompanionCongestion] = useState<CongestionInfo | null>(null);
   const [companionRoiActive, setCompanionRoiActive] = useState(false);
   const [companionRoiCount, setCompanionRoiCount] = useState(0);
+  const [statsBySlot, setStatsBySlot] = useState<Partial<Record<StatsSlotKey, VehicleStats>>>({});
   const [extraLive, setExtraLive] = useState<
     Record<number, { dets: Detection[]; fps: number; active: boolean }>
   >({});
@@ -94,18 +121,34 @@ export function useDetection() {
   const lastDetectionsRef = useRef<{ ts: number; dets: Detection[] }>({ ts: 0, dets: [] });
   const lastCompanionDetsRef = useRef<{ ts: number; dets: Detection[] }>({ ts: 0, dets: [] });
 
-  useEffect(() => {
-    detectionApi.getStats().then(setStats).catch(() => {});
+  const applyBySlotFromApi = useCallback((s: VehicleStats) => {
+    const bySlot = s.by_slot;
+    if (!bySlot) return;
+    setStatsBySlot((prev) => {
+      const next = { ...prev };
+      (Object.entries(bySlot) as [StatsSlotKey, LaneStats][]).forEach(([key, lane]) => {
+        if (lane) next[key] = laneStatsToVehicleStats(lane, s);
+      });
+      return next;
+    });
   }, []);
+
+  useEffect(() => {
+    detectionApi.getStats().then((s) => {
+      setStats(s);
+      applyBySlotFromApi(s);
+    }).catch(() => {});
+  }, [applyBySlotFromApi]);
 
   const reloadStats = useCallback(async () => {
     try {
       const s = await detectionApi.getStats();
       setStats(s);
+      applyBySlotFromApi(s);
     } catch {
       // ignore
     }
-  }, []);
+  }, [applyBySlotFromApi]);
 
   const handleWsMessage = useCallback((data: unknown) => {
     const payload = data as FramePayload & { slot?: number; fps?: number; stream_active?: boolean };
@@ -119,11 +162,23 @@ export function useDetection() {
           active: payload.stream_active !== false,
         },
       }));
+      const lane = (payload as { lane_stats?: LaneStats }).lane_stats;
+      if (lane) {
+        const slotKey = String(slot) as StatsSlotKey;
+        setStatsBySlot((prev) => ({
+          ...prev,
+          [slotKey]: laneStatsToVehicleStats(lane, prev[slotKey] ?? DEFAULT_STATS),
+        }));
+      }
       return;
     }
 
     if (payload.stats) {
       setStats(payload.stats);
+      setStatsBySlot((prev) => ({
+        ...prev,
+        primary: payload.stats as VehicleStats,
+      }));
       if (!payload.stats.stream_active) {
         setStreamActive(false);
         return;
@@ -162,6 +217,11 @@ export function useDetection() {
       setCompanionCongestion(null);
       setCompanionRoiActive(false);
       setCompanionRoiCount(0);
+      setStatsBySlot((prev) => {
+        const next = { ...prev };
+        delete next.companion;
+        return next;
+      });
       return;
     }
     setCompanionStreamActive(true);
@@ -169,16 +229,21 @@ export function useDetection() {
       applyDetections(msg.detections, lastCompanionDetsRef, setCompanionDetections);
     }
     if (typeof msg.fps === 'number') setCompanionFps(msg.fps);
-    const laneLine = Number(msg?.lane_stats?.line_position);
-    if (Number.isFinite(laneLine) && laneLine >= 0 && laneLine <= 1) {
-      setCompanionLinePosition(laneLine);
-    }
-    if (msg.lane_stats?.congestion) {
-      setCompanionCongestion(msg.lane_stats.congestion);
-    }
-    if (typeof msg.lane_stats?.roi_active === 'boolean') {
-      setCompanionRoiActive(msg.lane_stats.roi_active);
-      setCompanionRoiCount(msg.lane_stats.roi_active ? (msg.lane_stats.roi_count ?? 0) : 0);
+    if (msg.lane_stats) {
+      const lane = msg.lane_stats as LaneStats;
+      setStatsBySlot((prev) => ({
+        ...prev,
+        companion: laneStatsToVehicleStats(lane, prev.companion ?? DEFAULT_STATS),
+      }));
+      if (typeof lane.roi_active === 'boolean') {
+        setCompanionRoiActive(lane.roi_active);
+        setCompanionRoiCount(lane.roi_active ? (lane.roi_count ?? 0) : 0);
+      }
+      if (lane.congestion) setCompanionCongestion(lane.congestion);
+      const laneLine = Number(lane.line_position);
+      if (Number.isFinite(laneLine) && laneLine >= 0 && laneLine <= 1) {
+        setCompanionLinePosition(laneLine);
+      }
     }
   }, []);
 
@@ -220,6 +285,7 @@ export function useDetection() {
     setCompanionCongestion(null);
     setCompanionRoiActive(false);
     setCompanionRoiCount(0);
+    setStatsBySlot({});
     setExtraLive({});
   }, []);
 
@@ -234,6 +300,7 @@ export function useDetection() {
     setCompanionStreamActive(false);
     setDetections([]);
     setCompanionDetections([]);
+    setStatsBySlot({});
     setExtraLive({});
   }, []);
 
@@ -258,10 +325,28 @@ export function useDetection() {
       await detectionApi.resetStats();
       const s = await detectionApi.getStats();
       setStats(s);
+      applyBySlotFromApi(s);
+      setStatsBySlot((prev) => {
+        const cleared = { ...prev };
+        (['primary', 'companion', '2', '3'] as StatsSlotKey[]).forEach((k) => {
+          if (cleared[k]) {
+            cleared[k] = {
+              ...cleared[k]!,
+              total: 0,
+              count_in: 0,
+              count_out: 0,
+              classes: {},
+              classes_in: {},
+              classes_out: {},
+            };
+          }
+        });
+        return cleared;
+      });
     } catch (err) {
       console.error('[useDetection] reset failed:', err);
     }
-  }, []);
+  }, [applyBySlotFromApi]);
 
   const updateSettings = useCallback((patch: Partial<Settings>) => {
     clearTimeout(settingsTimerRef.current);
@@ -284,6 +369,7 @@ export function useDetection() {
     companionCongestion,
     companionRoiActive,
     companionRoiCount,
+    statsBySlot,
     extraLive,
     wsConnected,
     companionWsConnected,

@@ -54,8 +54,10 @@ async def get_stats():
     s = stream_service.stats
     s.model_loaded = model_service.is_loaded
     s.model_name = model_service.name
-    # roi_active: đã gộp mọi slot trong merged_vehicle_stats
-    return s
+    # Merged totals + per-camera breakdown for dashboard
+    payload = s.model_dump()
+    payload["by_slot"] = stream_service.stats_by_slot()
+    return payload
 
 
 @router.post("/stats/reset", response_model=SuccessResponse)

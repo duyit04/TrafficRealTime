@@ -50,6 +50,7 @@ export function Dashboard() {
     detections, stats, wsConnected, companionWsConnected, companionActive, companionStreamActive,
     companionDetections, companionLinePosition, companionCongestion,
     companionRoiActive, companionRoiCount,
+    statsBySlot,
     extraLive,
     startStream, startCompanion, stopCompanion, stopStream, beginPlayback, endPlayback, reloadStats,
     streamActive: playbackActive,
@@ -166,14 +167,83 @@ export function Dashboard() {
     line_position: settings.line_position,
   };
   const companionStatsForView = {
-    ...statsForView,
+    ...(statsBySlot.companion ?? statsForView),
     line_position: companionLinePosition,
+    congestion: companionCongestion ?? statsBySlot.companion?.congestion ?? statsForView.congestion,
   };
+
+  const isExtra2Live = streamOn && Boolean((extraPreviewUrls[1] ?? '').trim());
+  const isExtra3Live = streamOn && Boolean((extraPreviewUrls[2] ?? '').trim());
+
+  /** Thống kê đếm xe — một panel cho mỗi camera đang live. */
+  const cameraStatPanels = useMemo(() => {
+    const panels: { key: string; label: string; stats: typeof statsForView; roiCount?: number; roiActive?: boolean }[] = [];
+    if (streamOn) {
+      panels.push({
+        key: 'primary',
+        label: primaryCameraLabel || 'Camera 1',
+        stats: statsBySlot.primary ?? statsForView,
+        roiCount: stats.roi_count,
+        roiActive: stats.roi_active,
+      });
+    }
+    if (companionStreamActive) {
+      panels.push({
+        key: 'companion',
+        label: previewSlots[0]?.label ?? 'Camera 2',
+        stats: companionStatsForView,
+        roiCount: companionRoiCount,
+        roiActive: companionRoiActive,
+      });
+    }
+    if (isExtra2Live) {
+      const slotStats = statsBySlot['2'];
+      panels.push({
+        key: '2',
+        label: previewSlots[1]?.label ?? 'Camera 3',
+        stats: slotStats
+          ? { ...statsForView, ...slotStats, line_position: slotStats.line_position ?? statsForView.line_position }
+          : { ...statsForView, total: 0, count_in: 0, count_out: 0, classes: {}, classes_in: {}, classes_out: {} },
+        roiCount: slotStats?.roi_count,
+        roiActive: slotStats?.roi_active,
+      });
+    }
+    if (isExtra3Live) {
+      const slotStats = statsBySlot['3'];
+      panels.push({
+        key: '3',
+        label: previewSlots[2]?.label ?? 'Camera 4',
+        stats: slotStats
+          ? { ...statsForView, ...slotStats, line_position: slotStats.line_position ?? statsForView.line_position }
+          : { ...statsForView, total: 0, count_in: 0, count_out: 0, classes: {}, classes_in: {}, classes_out: {} },
+        roiCount: slotStats?.roi_count,
+        roiActive: slotStats?.roi_active,
+      });
+    }
+    return panels;
+  }, [
+    streamOn,
+    companionStreamActive,
+    isExtra2Live,
+    isExtra3Live,
+    primaryCameraLabel,
+    previewSlots,
+    statsBySlot,
+    statsForView,
+    companionStatsForView,
+    stats.roi_count,
+    stats.roi_active,
+    companionRoiCount,
+    companionRoiActive,
+  ]);
+
+  const combinedTotal = useMemo(
+    () => cameraStatPanels.reduce((sum, p) => sum + (p.stats.total ?? 0), 0),
+    [cameraStatPanels],
+  );
 
   const congestion = stats.congestion;
   const isCompanionLive = streamOn && companionActive;
-  const isExtra2Live = streamOn && Boolean((extraPreviewUrls[1] ?? '').trim());
-  const isExtra3Live = streamOn && Boolean((extraPreviewUrls[2] ?? '').trim());
 
   const urlToSlot = useCallback((urlRaw: string): string => {
     const u = (urlRaw || '').trim();
@@ -439,20 +509,21 @@ export function Dashboard() {
 
   // Export CSV
   const handleExport = async () => {
-    const s = stats;
-    const rows = [
-      ['Metric', 'Value'],
-      ['Total', s.total],
-      ['IN (top->bottom)', s.count_in ?? 0],
-      ['OUT (bottom->top)', s.count_out ?? 0],
-      ['FPS', s.fps],
-      ['Model', s.model_name],
-      ['---', '---'],
-      ['Class', 'Total', 'IN', 'OUT'],
-      ...Object.entries(s.classes).map(([cls, count]) => [
-        cls, count, s.classes_in?.[cls] ?? 0, s.classes_out?.[cls] ?? 0,
-      ]),
-    ];
+    const rows: (string | number)[][] = [['Camera', 'Metric', 'Value']];
+    for (const panel of cameraStatPanels) {
+      const s = panel.stats;
+      rows.push([panel.label, 'Total', s.total]);
+      rows.push([panel.label, 'IN', s.count_in ?? 0]);
+      rows.push([panel.label, 'OUT', s.count_out ?? 0]);
+      rows.push([panel.label, 'FPS', s.fps ?? 0]);
+      for (const [cls, count] of Object.entries(s.classes)) {
+        rows.push([panel.label, cls, count]);
+      }
+      rows.push(['---', '---', '---']);
+    }
+    if (cameraStatPanels.length > 1) {
+      rows.push(['Tổng hợp', 'Total', combinedTotal]);
+    }
     const csv = rows.map((r) => r.join(',')).join('\n');
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
@@ -844,44 +915,54 @@ export function Dashboard() {
               </div>
             </div>
 
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2">
               <h2 className="text-xs font-bold uppercase tracking-wider text-slate-500">Thống kê</h2>
-              <span className={`w-2 h-2 rounded-full ${(appMode === 'rtsp' ? streamOn : stats.stream_active) ? 'bg-accent animate-pulse' : 'bg-slate-300'}`} />
+              <div className="flex items-center gap-2 shrink-0">
+                {cameraStatPanels.length > 1 ? (
+                  <span className="text-[10px] font-semibold tabular-nums text-slate-500" title="Tổng các camera">
+                    Σ {combinedTotal}
+                  </span>
+                ) : null}
+                <span className={`w-2 h-2 rounded-full ${(appMode === 'rtsp' ? streamOn : stats.stream_active) ? 'bg-accent animate-pulse' : 'bg-slate-300'}`} />
+              </div>
             </div>
-            {/* ROI vehicle count — one block per active camera */}
-            {streamOn && stats.roi_active && (
-              <div className="flex items-center justify-between gap-2 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2">
-                <div className="flex items-center gap-2 min-w-0">
-                  <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse shrink-0" />
-                  <div className="min-w-0">
-                    <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400 leading-none mb-0.5">Camera 1</div>
-                    <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-600 leading-tight">Xe trong vùng ROI</div>
-                  </div>
+            <div className="flex flex-col gap-4">
+              {cameraStatPanels.map((panel, idx) => (
+                <div key={panel.key} className="flex flex-col gap-2">
+                  {panel.roiActive ? (
+                    <div className="flex items-center justify-between gap-2 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+                        <div className="min-w-0">
+                          <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400 leading-none mb-0.5 truncate" title={panel.label}>
+                            {panel.label}
+                          </div>
+                          <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-600 leading-tight">Xe trong vùng ROI</div>
+                        </div>
+                      </div>
+                      <span className="text-xl font-extrabold tabular-nums text-accent leading-none">
+                        {panel.roiCount ?? 0}
+                      </span>
+                    </div>
+                  ) : null}
+                  <CounterPanel
+                    cameraLabel={panel.label}
+                    compact={cameraStatPanels.length > 1}
+                    stats={
+                      countingEnabled
+                        ? panel.stats
+                        : { ...panel.stats, total: 0, classes: {}, classes_in: {}, classes_out: {}, count_in: 0, count_out: 0 }
+                    }
+                    showActions={idx === cameraStatPanels.length - 1}
+                    onReset={resetCount}
+                    onExport={handleExport}
+                  />
+                  {idx < cameraStatPanels.length - 1 ? (
+                    <hr className="border-slate-100" />
+                  ) : null}
                 </div>
-                <span className="text-xl font-extrabold tabular-nums text-accent leading-none">
-                  {stats.roi_count ?? 0}
-                </span>
-              </div>
-            )}
-            {companionStreamActive && companionRoiActive && (
-              <div className="flex items-center justify-between gap-2 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2">
-                <div className="flex items-center gap-2 min-w-0">
-                  <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse shrink-0" />
-                  <div className="min-w-0">
-                    <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400 leading-none mb-0.5">Camera 2</div>
-                    <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-600 leading-tight">Xe trong vùng ROI</div>
-                  </div>
-                </div>
-                <span className="text-xl font-extrabold tabular-nums text-accent leading-none">
-                  {companionRoiCount}
-                </span>
-              </div>
-            )}
-            <CounterPanel
-              stats={countingEnabled ? statsForView : { ...statsForView, total: 0, classes: {} }}
-              onReset={resetCount}
-              onExport={handleExport}
-            />
+              ))}
+            </div>
             <hr className="border-slate-100" />
           </aside>
           ) : (
