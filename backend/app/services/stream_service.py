@@ -1119,6 +1119,12 @@ class StreamService:
                 # frames tracks=[] which would falsely reset the congestion timer to zero.
                 if do_infer:
                     _last_active_count = len(active_tracks)
+                # Live count of vehicles currently INSIDE the ROI (0 when ROI inactive).
+                # Note: self._stats.roi_active is otherwise only set on the REST /stats path,
+                # so we must set it here too or the WS payload always reports roi_active=false.
+                _roi_on = bool(roi_service.active and roi_service.points)
+                self._stats.roi_active = _roi_on
+                self._stats.roi_count = int(_last_active_count) if _roi_on else 0
                 cong_state = self._congestion.update(_last_active_count)
                 self._stats.congestion = CongestionInfo(
                     is_congested=cong_state.is_congested,
@@ -1193,6 +1199,7 @@ class StreamService:
                     "model_loaded": _s.model_loaded,
                     "model_name": _s.model_name,
                     "roi_active": _s.roi_active,
+                    "roi_count": int(_s.roi_count),
                     "conf_threshold": _s.conf_threshold,
                     "line_position": _s.line_position,
                     "congestion": {
@@ -1871,14 +1878,23 @@ class StreamService:
                     raw_dets = []
                     tracks = []
 
-                # Counting line
+                # Counting line + ROI filter (mirrors primary _worker logic)
                 frame_h = frame.shape[0]
-                if self._counting_line_y is None:
-                    self._counting_line_y = int(frame_h * self.line_position)
-                line_y = self._counting_line_y
-                self._stats.line_position = self.line_position
+                if roi_service.active and roi_service.points:
+                    active_tracks = [
+                        t for t in tracks if roi_service.is_inside(t.cx, t.cy, slot="primary")
+                    ]
+                    roi_mid = roi_service.mid_y_for("primary")
+                    line_y = roi_mid if roi_mid is not None else int(frame_h * self.line_position)
+                    self._stats.line_position = line_y / frame_h
+                else:
+                    active_tracks = tracks
+                    if self._counting_line_y is None:
+                        self._counting_line_y = int(frame_h * self.line_position)
+                    line_y = self._counting_line_y
+                    self._stats.line_position = self.line_position
 
-                self._counter.update(tracks, line_y)
+                self._counter.update(active_tracks, line_y)
                 self._stats.total = self._counter.total
                 self._stats.count_in = self._counter.count_in
                 self._stats.count_out = self._counter.count_out
@@ -1887,7 +1903,7 @@ class StreamService:
                 self._stats.classes_out = dict(self._counter.by_class_out)
 
                 # Congestion — video file mode (tracks always fresh per frame)
-                _vid_cong = self._congestion.update(len(tracks))
+                _vid_cong = self._congestion.update(len(active_tracks))
                 self._stats.congestion = CongestionInfo(
                     is_congested=_vid_cong.is_congested,
                     vehicle_count=_vid_cong.vehicle_count,
@@ -1930,7 +1946,7 @@ class StreamService:
                             frame,
                             api_dets_dict,
                             line_y_px=int(line_y),
-                            show_line=True,
+                            show_line=not roi_service.active_for("primary"),
                             in_place=True,
                         )
                         h264_bgr_primary.write_frame(vis, fps=max(1, int(video_fps)))
@@ -1956,7 +1972,7 @@ class StreamService:
                     "stream_active": _s.stream_active,
                     "model_loaded": _s.model_loaded,
                     "model_name": _s.model_name,
-                    "roi_active": False,
+                    "roi_active": roi_service.active_for("primary"),
                     "conf_threshold": _s.conf_threshold,
                     "line_position": _s.line_position,
                     "congestion": {
@@ -2028,7 +2044,7 @@ class StreamService:
                         "stream_active": False,
                         "model_loaded": bool(_s.model_loaded),
                         "model_name": str(_s.model_name or ""),
-                        "roi_active": False,
+                        "roi_active": roi_service.active_for("primary"),
                         "conf_threshold": float(_s.conf_threshold),
                         "line_position": float(_s.line_position),
                         "congestion": {

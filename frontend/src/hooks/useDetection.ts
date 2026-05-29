@@ -26,6 +26,7 @@ const DEFAULT_STATS: VehicleStats = {
   model_loaded: false,
   model_name: '',
   roi_active: false,
+  roi_count: 0,
   conf_threshold: 0.35,
   line_position: 0.55,
   congestion: {

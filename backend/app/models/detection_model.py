@@ -53,6 +53,7 @@ class VehicleStats(BaseModel):
     model_loaded: bool = False
     model_name: str = ""
     roi_active: bool = False
+    roi_count: int = 0              # vehicles currently INSIDE the ROI (live, this frame)
     conf_threshold: float = 0.35
     line_position: float = 0.55
     stream_error: str = ""

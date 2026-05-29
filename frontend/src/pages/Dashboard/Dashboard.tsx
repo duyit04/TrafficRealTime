@@ -846,6 +846,19 @@ export function Dashboard() {
               <h2 className="text-xs font-bold uppercase tracking-wider text-slate-500">Thống kê</h2>
               <span className={`w-2 h-2 rounded-full ${(appMode === 'rtsp' ? streamOn : stats.stream_active) ? 'bg-accent animate-pulse' : 'bg-slate-300'}`} />
             </div>
+            {stats.roi_active && (
+              <div className="flex items-center justify-between gap-2 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+                  <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-600 leading-tight">
+                    Xe trong vùng ROI
+                  </span>
+                </div>
+                <span className="text-xl font-extrabold tabular-nums text-accent leading-none">
+                  {stats.roi_count ?? 0}
+                </span>
+              </div>
+            )}
             <CounterPanel
               stats={countingEnabled ? statsForView : { ...statsForView, total: 0, classes: {} }}
               onReset={resetCount}

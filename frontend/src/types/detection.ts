@@ -42,6 +42,7 @@ export interface VehicleStats {
   model_loaded: boolean;
   model_name: string;
   roi_active: boolean;
+  roi_count: number;               // vehicles currently INSIDE the ROI (live)
   conf_threshold: number;
   line_position: number;
   stream_error?: string;
