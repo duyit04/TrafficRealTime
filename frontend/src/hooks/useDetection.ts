@@ -6,7 +6,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo, type MutableRefObject } from 'react';
 import { detectionApi, streamApi, getWebSocketUrl } from '../services/api';
 import { useWebSocket } from './useWebSocket';
-import type { Detection, FramePayload, VehicleStats, Settings } from '../types/detection';
+import type { Detection, FramePayload, VehicleStats, Settings, CongestionInfo } from '../types/detection';
 
 const DEFAULT_STATS: VehicleStats = {
   total: 0,
@@ -84,6 +84,9 @@ export function useDetection() {
   const [companionDetections, setCompanionDetections] = useState<Detection[]>([]);
   const [companionFps, setCompanionFps] = useState(0);
   const [companionLinePosition, setCompanionLinePosition] = useState<number>(DEFAULT_STATS.line_position);
+  const [companionCongestion, setCompanionCongestion] = useState<CongestionInfo | null>(null);
+  const [companionRoiActive, setCompanionRoiActive] = useState(false);
+  const [companionRoiCount, setCompanionRoiCount] = useState(0);
   const [extraLive, setExtraLive] = useState<
     Record<number, { dets: Detection[]; fps: number; active: boolean }>
   >({});
@@ -143,7 +146,12 @@ export function useDetection() {
     const msg = data as FramePayload & {
       stream_active?: boolean;
       fps?: number;
-      lane_stats?: { line_position?: number };
+      lane_stats?: {
+        line_position?: number;
+        congestion?: CongestionInfo;
+        roi_active?: boolean;
+        roi_count?: number;
+      };
     };
     if (!msg) return;
     if (msg.stream_active === false) {
@@ -151,6 +159,9 @@ export function useDetection() {
       setCompanionDetections([]);
       setCompanionFps(0);
       setCompanionLinePosition(DEFAULT_STATS.line_position);
+      setCompanionCongestion(null);
+      setCompanionRoiActive(false);
+      setCompanionRoiCount(0);
       return;
     }
     setCompanionStreamActive(true);
@@ -161,6 +172,13 @@ export function useDetection() {
     const laneLine = Number(msg?.lane_stats?.line_position);
     if (Number.isFinite(laneLine) && laneLine >= 0 && laneLine <= 1) {
       setCompanionLinePosition(laneLine);
+    }
+    if (msg.lane_stats?.congestion) {
+      setCompanionCongestion(msg.lane_stats.congestion);
+    }
+    if (typeof msg.lane_stats?.roi_active === 'boolean') {
+      setCompanionRoiActive(msg.lane_stats.roi_active);
+      setCompanionRoiCount(msg.lane_stats.roi_active ? (msg.lane_stats.roi_count ?? 0) : 0);
     }
   }, []);
 
@@ -199,6 +217,9 @@ export function useDetection() {
     setCompanionStreamActive(false);
     setDetections([]);
     setCompanionDetections([]);
+    setCompanionCongestion(null);
+    setCompanionRoiActive(false);
+    setCompanionRoiCount(0);
     setExtraLive({});
   }, []);
 
@@ -260,6 +281,9 @@ export function useDetection() {
     companionDetections,
     companionFps,
     companionLinePosition,
+    companionCongestion,
+    companionRoiActive,
+    companionRoiCount,
     extraLive,
     wsConnected,
     companionWsConnected,

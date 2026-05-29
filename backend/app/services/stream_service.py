@@ -442,6 +442,10 @@ class StreamService:
             threshold=congestion_threshold,
             duration=congestion_duration,
         )
+        self._companion_congestion.update_settings(
+            threshold=congestion_threshold,
+            duration=congestion_duration,
+        )
 
     def get_latest(self) -> dict | None:
         with self._lock:
@@ -1512,6 +1516,10 @@ class StreamService:
                             h264_bgr_companion.write_frame(vis_h264, fps=c_fps)
                         except Exception as he:
                             logger.debug("H264 burn-in companion skipped: %s", he)
+                    _companion_roi_on = bool(
+                        roi_service.active_for("companion")
+                        and roi_service.points_for("companion")
+                    )
                     header = {
                         "detections": api_dets_dict,
                         "fps": float(self._companion_fps),
@@ -1526,6 +1534,8 @@ class StreamService:
                             "classes_out": dict(self._companion_counter.by_class_out),
                             "counting_mode": self._companion_counter.mode,
                             "line_position": (float(companion_line_y) / float(max(frame_h, 1))),
+                            "roi_active": _companion_roi_on,
+                            "roi_count": int(_last_companion_active_count) if _companion_roi_on else 0,
                             "congestion": companion_congestion_payload,
                             "model_loaded": companion_model_loaded,
                             "model_name": companion_model_name,

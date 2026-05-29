@@ -48,7 +48,8 @@ let toastId = 0;
 export function Dashboard() {
   const {
     detections, stats, wsConnected, companionWsConnected, companionActive, companionStreamActive,
-    companionDetections, companionLinePosition,
+    companionDetections, companionLinePosition, companionCongestion,
+    companionRoiActive, companionRoiCount,
     extraLive,
     startStream, startCompanion, stopCompanion, stopStream, beginPlayback, endPlayback, reloadStats,
     streamActive: playbackActive,
@@ -520,34 +521,35 @@ export function Dashboard() {
           <span className="hidden lg:inline text-slate-500 tabular-nums" title="Average YOLO inference time (ms)">
             Infer: {stats.avg_inference_ms.toFixed(1)}ms
           </span>
-          {congestion && congestion.is_congested && (
-            <>
-              <span className="shrink-0">·</span>
-              <div
-                className={`
-                  shrink-0 flex items-center gap-1.5 px-2.5 py-1 rounded-lg border shadow-md
-                  text-[11px] font-bold max-w-[min(18rem,calc(100vw-14rem))] sm:max-w-[min(22rem,calc(100vw-16rem))]
-                  animate-bounce
-                  ${congestion.level === 'critical'
-                    ? 'bg-red-600 text-white border-red-400 shadow-red-500/30'
-                    : 'bg-amber-500 text-white border-amber-300 shadow-amber-500/30'}
-                `}
-                title={
-                  congestion.level === 'critical'
-                    ? `Kẹt xe nghiêm trọng: ${congestion.vehicle_count} xe trong ${congestion.duration_seconds.toFixed(0)}s`
-                    : `Mật độ cao: ${congestion.vehicle_count} xe trong ${congestion.duration_seconds.toFixed(0)}s`
-                }
-              >
-                <span className="shrink-0" aria-hidden>
-                  {congestion.level === 'critical' ? '🚨' : '⚠️'}
-                </span>
-                <span className="truncate">
-                  {congestion.level === 'critical' ? 'KẸT XE NGHIÊM TRỌNG' : 'MẬT ĐỘ CAO'}
-                  {' — '}
-                  {congestion.vehicle_count} xe / {congestion.duration_seconds.toFixed(0)}s
-                </span>
-              </div>
-            </>
+          {[
+            { cong: congestion, label: 'Cam 1' },
+            { cong: companionStreamActive ? companionCongestion : null, label: 'Cam 2' },
+          ].map(({ cong, label }) =>
+            cong && cong.is_congested ? (
+              <span key={label} className="shrink-0 flex items-center gap-1">
+                <span className="shrink-0 text-slate-400">·</span>
+                <div
+                  className={`
+                    shrink-0 flex items-center gap-1.5 px-2.5 py-1 rounded-lg border shadow-md
+                    text-[11px] font-bold max-w-[min(16rem,calc(100vw-14rem))]
+                    animate-bounce
+                    ${cong.level === 'critical'
+                      ? 'bg-red-600 text-white border-red-400 shadow-red-500/30'
+                      : 'bg-amber-500 text-white border-amber-300 shadow-amber-500/30'}
+                  `}
+                  title={`${label}: ${cong.level === 'critical' ? 'Kẹt xe nghiêm trọng' : 'Mật độ cao'} — ${cong.vehicle_count} xe trong ${cong.duration_seconds.toFixed(0)}s`}
+                >
+                  <span className="shrink-0" aria-hidden>{cong.level === 'critical' ? '🚨' : '⚠️'}</span>
+                  <span className="truncate">
+                    <span className="opacity-80">{label}:</span>
+                    {' '}
+                    {cong.level === 'critical' ? 'KẸT XE' : 'MẬT ĐỘ CAO'}
+                    {' — '}
+                    {cong.vehicle_count} xe / {cong.duration_seconds.toFixed(0)}s
+                  </span>
+                </div>
+              </span>
+            ) : null
           )}
           {(streamOn || (appMode === 'video' && playbackActive)) && (
             <>
@@ -846,16 +848,32 @@ export function Dashboard() {
               <h2 className="text-xs font-bold uppercase tracking-wider text-slate-500">Thống kê</h2>
               <span className={`w-2 h-2 rounded-full ${(appMode === 'rtsp' ? streamOn : stats.stream_active) ? 'bg-accent animate-pulse' : 'bg-slate-300'}`} />
             </div>
-            {stats.roi_active && (
+            {/* ROI vehicle count — one block per active camera */}
+            {streamOn && stats.roi_active && (
               <div className="flex items-center justify-between gap-2 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2">
                 <div className="flex items-center gap-2 min-w-0">
                   <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse shrink-0" />
-                  <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-600 leading-tight">
-                    Xe trong vùng ROI
-                  </span>
+                  <div className="min-w-0">
+                    <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400 leading-none mb-0.5">Camera 1</div>
+                    <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-600 leading-tight">Xe trong vùng ROI</div>
+                  </div>
                 </div>
                 <span className="text-xl font-extrabold tabular-nums text-accent leading-none">
                   {stats.roi_count ?? 0}
+                </span>
+              </div>
+            )}
+            {companionStreamActive && companionRoiActive && (
+              <div className="flex items-center justify-between gap-2 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+                  <div className="min-w-0">
+                    <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400 leading-none mb-0.5">Camera 2</div>
+                    <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-600 leading-tight">Xe trong vùng ROI</div>
+                  </div>
+                </div>
+                <span className="text-xl font-extrabold tabular-nums text-accent leading-none">
+                  {companionRoiCount}
                 </span>
               </div>
             )}
@@ -1290,18 +1308,28 @@ export function Dashboard() {
                       onChange={(v) => handleSettingChange('congestion_duration', v)}
                     />
                   </div>
-                  {congestion && (
-                    <div className={`mt-2 px-3 py-2 rounded-lg text-xs font-semibold ${
-                      congestion.level === 'critical' ? 'bg-red-100 text-red-700 border border-red-200' :
-                      congestion.level === 'warning' ? 'bg-amber-100 text-amber-700 border border-amber-200' :
-                      'bg-green-50 text-green-700 border border-green-200'
-                    }`}>
-                      {congestion.level === 'normal'
-                        ? `Binh thuong (${congestion.vehicle_count} xe)`
-                        : `${congestion.level === 'critical' ? 'Nghiem trong' : 'Canh bao'}: ${congestion.vehicle_count} xe / ${congestion.duration_seconds.toFixed(0)}s`
-                      }
-                    </div>
-                  )}
+                  <div className="flex flex-col gap-1 mt-2">
+                    {[
+                      { cong: congestion, label: 'Camera 1' },
+                      { cong: companionStreamActive ? companionCongestion : null, label: 'Camera 2' },
+                    ].map(({ cong, label }) =>
+                      cong ? (
+                        <div key={label} className={`px-3 py-2 rounded-lg text-xs font-semibold flex items-center justify-between gap-2 ${
+                          cong.level === 'critical' ? 'bg-red-100 text-red-700 border border-red-200' :
+                          cong.level === 'warning'  ? 'bg-amber-100 text-amber-700 border border-amber-200' :
+                          'bg-green-50 text-green-700 border border-green-200'
+                        }`}>
+                          <span className="font-bold shrink-0">{label}</span>
+                          <span>
+                            {cong.level === 'normal'
+                              ? `Bình thường (${cong.vehicle_count} xe)`
+                              : `${cong.level === 'critical' ? 'Nghiêm trọng' : 'Cảnh báo'}: ${cong.vehicle_count} xe / ${cong.duration_seconds.toFixed(0)}s`
+                            }
+                          </span>
+                        </div>
+                      ) : null
+                    )}
+                  </div>
                 </div>
               </div>
             </div>
