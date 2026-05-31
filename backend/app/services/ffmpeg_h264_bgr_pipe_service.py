@@ -8,7 +8,6 @@ Boxes are drawn on the frame before encode so video matches detections.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import threading
 import time
@@ -21,27 +20,7 @@ import numpy as np
 from app.core.config import settings
 from app.core.logger import logger
 from app.api.ws_routes import get_h264_manager
-
-
-def _resolve_ffmpeg_bin() -> str:
-    ffmpeg_bin = os.environ.get("FFMPEG_BIN", "").strip()
-    if not ffmpeg_bin:
-        ffmpeg_bin = shutil.which("ffmpeg") or ""
-    if not ffmpeg_bin:
-        user = os.environ.get("USERNAME", "")
-        candidate = os.path.join(
-            "C:\\Users",
-            user,
-            "AppData",
-            "Local",
-            "Microsoft",
-            "WinGet",
-            "Links",
-            "ffmpeg.exe",
-        )
-        if os.path.exists(candidate):
-            ffmpeg_bin = candidate
-    return ffmpeg_bin
+from app.services.ffmpeg_rtsp_decode import resolve_ffmpeg_bin
 
 
 def _nvenc_output_args() -> list[str]:
@@ -335,7 +314,7 @@ class H264BgrMpegTsPipe:
                 pass
 
     def _spawn(self, w: int, h: int, fps: int) -> bool:
-        ffmpeg_bin = _resolve_ffmpeg_bin()
+        ffmpeg_bin = resolve_ffmpeg_bin()
         if not ffmpeg_bin:
             with self._lock:
                 self._last_error = "ffmpeg not found (set FFMPEG_BIN or add ffmpeg to PATH)"

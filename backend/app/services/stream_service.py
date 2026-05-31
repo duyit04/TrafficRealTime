@@ -284,11 +284,6 @@ class StreamService:
             self._extra_urls.pop(s, None)
             self._extra_latest.pop(s, None)
 
-    def get_extra_latest(self, slot: int) -> dict | None:
-        s = int(slot)
-        with self._extra_lock:
-            return self._extra_latest.get(s)
-
     def _do_start_with_stop(self, url: str, companion_url: str = "") -> None:
         self.stop()
         self._do_start(url, companion_url)
@@ -1443,7 +1438,6 @@ class StreamService:
 
         try:
             while self._companion_running:
-                t_start = time.time()
                 fr, backlog = self._drain_latest_frame(frame_q, timeout=1.0)
                 if fr is None:
                     if stop_evt.is_set():
@@ -1471,6 +1465,7 @@ class StreamService:
 
                 dets = []
                 tracks = []
+                do_infer = True
                 if bool(getattr(settings, "COMPANION_DETECT_ENABLED", True)):
                     do_infer = not (backlog > 0)
                     comp_skip = getattr(settings, "COMPANION_SKIP_FRAMES", None)
@@ -1632,10 +1627,7 @@ class StreamService:
                 except Exception as e:
                     logger.debug("Companion publish skipped: %s", e)
 
-                sleep_t = frame_interval - (time.time() - t_start)
-                if sleep_t > 0:
-                    time.sleep(sleep_t)
-                # Deadline-based pacing — same as primary worker to avoid drift
+                # Deadline-based pacing — mirrors primary worker (no duplicate simple sleep)
                 _next_deadline += frame_interval
                 _wait = _next_deadline - time.perf_counter()
                 if _wait > 0.002:
@@ -1678,6 +1670,8 @@ class StreamService:
         frame_interval = 1.0 / max(int(getattr(settings, "EXTRA_MAX_FPS", 12)), 1)
         extra_skip_counter = 0
         extra_last_dets: list = []
+        _extra_read_failures = 0
+        _EXTRA_MAX_FAILURES = 30
 
         while True:
             with self._extra_lock:
@@ -1686,7 +1680,19 @@ class StreamService:
             t_start = time.time()
             ok, fr = self._read_capture_frame(cap, is_rtsp=is_rtsp)
             if not ok or fr is None:
+                _extra_read_failures += 1
+                if _extra_read_failures <= _EXTRA_MAX_FAILURES:
+                    time.sleep(0.1)
+                    continue
+                # Stream đã chết — thử reconnect một lần rồi thoát
+                cap.release()
+                cap = self._open_video_capture(url, is_rtsp=is_rtsp, capture_label=f"extra{s}")
+                if not cap.isOpened():
+                    logger.warning("StreamService: extra slot %d reconnect failed, stopping", s)
+                    break
+                _extra_read_failures = 0
                 continue
+            _extra_read_failures = 0
 
             try:
                 max_w = int(self.max_width or 0)

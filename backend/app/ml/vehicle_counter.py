@@ -60,19 +60,18 @@ class VehicleCounter:
                 self.by_class.get(track.class_name, 0) + 1
             )
 
-            # Phân biệt chiều
-            if track.cy > track.prev_cy:
-                # Xe đi xuống → IN
-                self.count_in += 1
-                self.by_class_in[track.class_name] = (
-                    self.by_class_in.get(track.class_name, 0) + 1
-                )
-            else:
-                # Xe đi lên → OUT
-                self.count_out += 1
-                self.by_class_out[track.class_name] = (
-                    self.by_class_out.get(track.class_name, 0) + 1
-                )
+            if self.mode == "direction":
+                # Phân biệt chiều: IN = xuống, OUT = lên
+                if track.cy > track.prev_cy:
+                    self.count_in += 1
+                    self.by_class_in[track.class_name] = (
+                        self.by_class_in.get(track.class_name, 0) + 1
+                    )
+                else:
+                    self.count_out += 1
+                    self.by_class_out[track.class_name] = (
+                        self.by_class_out.get(track.class_name, 0) + 1
+                    )
 
     def set_mode(self, mode: str) -> None:
         if mode in ("all", "direction"):

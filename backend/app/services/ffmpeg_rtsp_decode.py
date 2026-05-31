@@ -7,7 +7,26 @@ does not corrupt on CPU software decode.
 
 from __future__ import annotations
 
+import os
+import shutil
+
 from app.core.config import settings
+
+
+def resolve_ffmpeg_bin() -> str:
+    """Locate ffmpeg binary: env var → PATH → WinGet fallback."""
+    ffmpeg_bin = os.environ.get("FFMPEG_BIN", "").strip()
+    if not ffmpeg_bin:
+        ffmpeg_bin = shutil.which("ffmpeg") or ""
+    if not ffmpeg_bin:
+        user = os.environ.get("USERNAME", "")
+        candidate = os.path.join(
+            "C:\\Users", user,
+            "AppData", "Local", "Microsoft", "WinGet", "Links", "ffmpeg.exe",
+        )
+        if os.path.exists(candidate):
+            ffmpeg_bin = candidate
+    return ffmpeg_bin
 
 
 def cuda_decode_enabled() -> bool:

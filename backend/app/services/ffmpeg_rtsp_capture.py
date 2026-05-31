@@ -28,6 +28,7 @@ from app.services.ffmpeg_rtsp_decode import (
     cuda_decoder_before_input,
     cuda_hwaccel_before_input,
     ffmpeg_cuda_required,
+    resolve_ffmpeg_bin,
     rtsp_capture_timeout_flags,
     rtsp_demuxer_flags,
 )
@@ -68,27 +69,6 @@ def _probe_size_cached(url: str, ffprobe_bin: str) -> tuple[int, int] | None:
         with _PROBE_CACHE_LOCK:
             _PROBE_CACHE[url] = (size, now)
     return size
-
-
-def _resolve_ffmpeg_bin() -> str:
-    ffmpeg_bin = os.environ.get("FFMPEG_BIN", "").strip()
-    if not ffmpeg_bin:
-        ffmpeg_bin = shutil.which("ffmpeg") or ""
-    if not ffmpeg_bin:
-        user = os.environ.get("USERNAME", "")
-        candidate = os.path.join(
-            "C:\\Users",
-            user,
-            "AppData",
-            "Local",
-            "Microsoft",
-            "WinGet",
-            "Links",
-            "ffmpeg.exe",
-        )
-        if os.path.exists(candidate):
-            ffmpeg_bin = candidate
-    return ffmpeg_bin
 
 
 def _resolve_ffprobe_bin(ffmpeg_bin: str) -> str:
@@ -391,7 +371,7 @@ class FFmpegRtspCapture:
 
     def _open(self) -> None:
         global _live_slots_in_use, _thumb_slots_in_use
-        ffmpeg_bin = _resolve_ffmpeg_bin()
+        ffmpeg_bin = resolve_ffmpeg_bin()
         if not ffmpeg_bin:
             self._last_error = "ffmpeg not found"
             return

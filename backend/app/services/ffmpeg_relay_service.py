@@ -9,7 +9,6 @@ H264 MPEG-TS over WebSocket.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import threading
 import time
@@ -29,6 +28,7 @@ from app.services.ffmpeg_h264_bgr_pipe_service import (
 from app.services.ffmpeg_rtsp_decode import (
     cuda_decode_enabled,
     cuda_hwaccel_before_input,
+    resolve_ffmpeg_bin,
     rtsp_demuxer_flags,
 )
 
@@ -53,25 +53,6 @@ def should_h264_burnin() -> bool:
     return use_h264_ffmpeg_burnin() or use_h264_bgr_burnin()
 
 
-def _resolve_ffmpeg_bin() -> str:
-    ffmpeg_bin = os.environ.get("FFMPEG_BIN", "").strip()
-    if not ffmpeg_bin:
-        ffmpeg_bin = shutil.which("ffmpeg") or ""
-    if not ffmpeg_bin:
-        user = os.environ.get("USERNAME", "")
-        candidate = os.path.join(
-            "C:\\Users",
-            user,
-            "AppData",
-            "Local",
-            "Microsoft",
-            "WinGet",
-            "Links",
-            "ffmpeg.exe",
-        )
-        if os.path.exists(candidate):
-            ffmpeg_bin = candidate
-    return ffmpeg_bin
 
 
 def _nvenc_relay_args() -> list[str]:
@@ -204,7 +185,7 @@ class FFmpegRelayService:
     def _worker(self) -> None:
         with self._lock:
             url = self._url
-        ffmpeg_bin = _resolve_ffmpeg_bin()
+        ffmpeg_bin = resolve_ffmpeg_bin()
         if not ffmpeg_bin:
             with self._lock:
                 self._last_error = "ffmpeg not found (set FFMPEG_BIN or add ffmpeg to PATH)"
