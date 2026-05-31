@@ -57,56 +57,60 @@ function TrafficLightVisual({
   showAdvice: boolean;
   phaseTitles: readonly [string, string];
 }) {
-  /** Mốc đếm ngược cục bộ: luôn giảm từ số gợi ý G/R vừa cập nhật. */
+  /** Mốc đếm ngược cục bộ: giảm từ peak suggestion, không reset khi advice giảm. */
   const anchorsRef = useRef<[AdviceAnchor | null, AdviceAnchor | null]>([null, null]);
+  /** Giá trị gợi ý lớn nhất trong session dừng xe hiện tại (per phase). */
+  const peakAdviceRef = useRef<[number, number]>([0, 0]);
   const prevSnapRef = useRef<{
     queues: [number, number];
     colors: [string, string];
-    advice: [number, number];
   }>({
     queues: [-1, -1],
     colors: ['', ''],
-    advice: [-1, -1],
   });
   const [tick, setTick] = useState(0);
 
   useEffect(() => {
     if (!showAdvice) {
       anchorsRef.current = [null, null];
-      prevSnapRef.current = { queues: [-1, -1], colors: ['', ''], advice: [-1, -1] };
+      peakAdviceRef.current = [0, 0];
+      prevSnapRef.current = { queues: [-1, -1], colors: ['', ''] };
       return;
     }
 
     const q0 = phases[0]?.queue_length ?? 0;
     const q1 = phases[1]?.queue_length ?? 0;
     const prev = prevSnapRef.current;
-    const queuesChanged = q0 !== prev.queues[0] || q1 !== prev.queues[1];
 
     phases.slice(0, 2).forEach((p, idx) => {
       const i = idx as 0 | 1;
       const advice = Math.floor(adviceValueForPhase(p));
       const q = p.queue_length ?? 0;
       const color = p.color;
-      const adviceChanged = advice !== prev.advice[i];
       const colorChanged = color !== prev.colors[i];
-      const queueChanged = q !== prev.queues[i];
+      const prevQ = prev.queues[i];
+      // queue vừa về 0 (hết xe dừng) → kết thúc session
+      const qJustBecameZero = q === 0 && prevQ !== 0 && prevQ !== -1;
 
-      const shouldReset =
-        anchorsRef.current[i] === null ||
-        queuesChanged ||
-        queueChanged ||
-        adviceChanged ||
-        colorChanged;
-
-      if (shouldReset) {
+      if (anchorsRef.current[i] === null) {
+        // Lần đầu hiển thị: khởi tạo
+        anchorsRef.current[i] = { sec: advice, atMs: Date.now() };
+        peakAdviceRef.current[i] = advice;
+      } else if (colorChanged || qJustBecameZero) {
+        // Đổi màu đèn hoặc hết xe → reset session về giá trị hiện tại
+        anchorsRef.current[i] = { sec: advice, atMs: Date.now() };
+        peakAdviceRef.current[i] = advice;
+      } else if (advice > peakAdviceRef.current[i]) {
+        // Gợi ý mới cao hơn peak → cập nhật peak và reset countdown từ peak mới
+        peakAdviceRef.current[i] = advice;
         anchorsRef.current[i] = { sec: advice, atMs: Date.now() };
       }
+      // advice <= peak: giữ nguyên anchor, countdown tiếp tục giảm
     });
 
     prevSnapRef.current = {
       queues: [q0, q1],
       colors: [phases[0]?.color ?? '', phases[1]?.color ?? ''],
-      advice: phases.slice(0, 2).map((ph) => Math.floor(adviceValueForPhase(ph))) as [number, number],
     };
   }, [phases, showAdvice]);
 
