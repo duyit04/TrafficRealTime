@@ -927,41 +927,61 @@ export function Dashboard() {
               </div>
             </div>
             <div className="flex flex-col gap-4">
-              {cameraStatPanels.map((panel, idx) => (
-                <div key={panel.key} className="flex flex-col gap-2">
-                  {panel.roiActive ? (
-                    <div className="flex items-center justify-between gap-2 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse shrink-0" />
-                        <div className="min-w-0">
-                          <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400 leading-none mb-0.5 truncate" title={panel.label}>
-                            {panel.label}
+              {cameraStatPanels.map((panel, idx) => {
+                const isLast = idx === cameraStatPanels.length - 1;
+                return (
+                  <div key={panel.key} className="flex flex-col gap-2">
+                    {panel.roiActive ? (
+                      <div className="flex items-center justify-between gap-2 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+                          <div className="min-w-0">
+                            <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400 leading-none mb-0.5 truncate" title={panel.label}>
+                              {panel.label}
+                            </div>
+                            <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-600 leading-tight">Xe trong vùng ROI</div>
                           </div>
-                          <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-600 leading-tight">Xe trong vùng ROI</div>
                         </div>
+                        <span className="text-xl font-extrabold tabular-nums text-accent leading-none">
+                          {panel.roiCount ?? 0}
+                        </span>
                       </div>
-                      <span className="text-xl font-extrabold tabular-nums text-accent leading-none">
-                        {panel.roiCount ?? 0}
-                      </span>
-                    </div>
-                  ) : null}
-                  <CounterPanel
-                    cameraLabel={panel.label}
-                    compact={cameraStatPanels.length > 1}
-                    stats={
-                      countingEnabled
-                        ? panel.stats
-                        : { ...panel.stats, total: 0, classes: {}, classes_in: {}, classes_out: {}, count_in: 0, count_out: 0 }
-                    }
-                    showActions={idx === cameraStatPanels.length - 1}
-                    onReset={resetCount}
-                    onExport={handleExport}
-                  />
-                  {idx < cameraStatPanels.length - 1 ? (
-                    <hr className="border-slate-100" />
-                  ) : null}
-                </div>
-              ))}
+                    ) : (
+                      <CounterPanel
+                        cameraLabel={panel.label}
+                        compact={cameraStatPanels.length > 1}
+                        stats={
+                          countingEnabled
+                            ? panel.stats
+                            : { ...panel.stats, total: 0, classes: {}, classes_in: {}, classes_out: {}, count_in: 0, count_out: 0 }
+                        }
+                        showActions={false}
+                        onReset={resetCount}
+                        onExport={handleExport}
+                      />
+                    )}
+                    {isLast ? (
+                      <div className="flex gap-2 pt-1">
+                        <button
+                          onClick={resetCount}
+                          className="flex-1 py-2 text-xs font-semibold rounded-lg border border-slate-200 text-slate-700 bg-white hover:bg-slate-50 transition-colors"
+                        >
+                          Reset
+                        </button>
+                        <button
+                          onClick={handleExport}
+                          className="flex-1 py-2 text-xs font-bold rounded-lg bg-accent text-white hover:bg-blue-700 transition-colors"
+                        >
+                          CSV
+                        </button>
+                      </div>
+                    ) : null}
+                    {!isLast ? (
+                      <hr className="border-slate-100" />
+                    ) : null}
+                  </div>
+                );
+              })}
             </div>
             <hr className="border-slate-100" />
           </aside>

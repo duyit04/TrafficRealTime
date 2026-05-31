@@ -1156,7 +1156,8 @@ class StreamService:
                 frame_h = frame.shape[0]
                 frame_w = frame.shape[1]
 
-                if roi_service.active and roi_service.points:
+                _primary_roi_on = bool(roi_service.active and roi_service.points)
+                if _primary_roi_on:
                     active_tracks = [
                         t for t in tracks if roi_service.is_inside(t.cx, t.cy, slot="primary")
                     ]
@@ -1172,7 +1173,8 @@ class StreamService:
                     line_y = self._counting_line_y
                     self._stats.line_position = self.line_position
 
-                self._counter.update(active_tracks, line_y)
+                if not _primary_roi_on:
+                    self._counter.update(active_tracks, line_y)
                 self._stats.total = self._counter.total
                 self._stats.count_in = self._counter.count_in
                 self._stats.count_out = self._counter.count_out
@@ -1527,7 +1529,10 @@ class StreamService:
                     # Keep companion pipeline parity with primary:
                     # counting line + class counters + congestion + model info.
                     frame_h = fr.shape[0]
-                    if roi_service.active_for("companion") and roi_service.points_for("companion"):
+                    _companion_roi_on_check = bool(
+                        roi_service.active_for("companion") and roi_service.points_for("companion")
+                    )
+                    if _companion_roi_on_check:
                         active_tracks = [
                             t for t in tracks if roi_service.is_inside(t.cx, t.cy, slot="companion")
                         ]
@@ -1538,16 +1543,14 @@ class StreamService:
                         if self._companion_counting_line_y is None:
                             self._companion_counting_line_y = int(frame_h * self.line_position)
                         companion_line_y = self._companion_counting_line_y
-                    self._companion_counter.update(active_tracks, companion_line_y)
+                    if not _companion_roi_on_check:
+                        self._companion_counter.update(active_tracks, companion_line_y)
                     # Only update count on real inference; skipped frames have tracks=[] which
                     # would falsely reset the congestion timer.
                     if do_infer:
                         _last_companion_active_count = len(active_tracks)
                     self._companion_line_position = float(companion_line_y) / float(max(frame_h, 1))
-                    _companion_roi_on = bool(
-                        roi_service.active_for("companion")
-                        and roi_service.points_for("companion")
-                    )
+                    _companion_roi_on = _companion_roi_on_check
                     self._companion_roi_count = (
                         int(_last_companion_active_count) if _companion_roi_on else 0
                     )
@@ -1756,7 +1759,10 @@ class StreamService:
                 tracks = self._extra_trackers[s].update(dets, fr)
                 frame_h = int(fr.shape[0])
                 slot_key = str(int(slot))
-                if roi_service.active_for(slot_key) and len(roi_service.points_for(slot_key)) >= 3:
+                _extra_roi_on = bool(
+                    roi_service.active_for(slot_key) and len(roi_service.points_for(slot_key)) >= 3
+                )
+                if _extra_roi_on:
                     active_tracks = [
                         t for t in tracks if roi_service.is_inside(t.cx, t.cy, slot=slot_key)
                     ]
@@ -1767,7 +1773,8 @@ class StreamService:
                     if self._extra_counting_line_y.get(s) is None:
                         self._extra_counting_line_y[s] = int(frame_h * self.line_position)
                     line_y = float(self._extra_counting_line_y[s])
-                self._extra_counters[s].update(active_tracks, line_y)
+                if not _extra_roi_on:
+                    self._extra_counters[s].update(active_tracks, line_y)
             except Exception as xec:
                 logger.debug("extra slot %d VehicleCounter: %s", s, xec)
 
