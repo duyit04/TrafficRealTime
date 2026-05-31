@@ -54,6 +54,8 @@ class VehicleStats(BaseModel):
     model_name: str = ""
     roi_active: bool = False
     roi_count: int = 0              # vehicles currently INSIDE the ROI (live, this frame)
+    roi_total: int = 0              # cumulative vehicles that entered ROI (unique track IDs)
+    roi_classes: dict[str, int] = {}  # per-class ROI entry count
     conf_threshold: float = 0.35
     line_position: float = 0.55
     stream_error: str = ""

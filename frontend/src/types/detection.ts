@@ -36,6 +36,8 @@ export interface LaneStats {
   line_position: number;
   roi_active: boolean;
   roi_count: number;
+  roi_total?: number;           // cumulative vehicles that entered ROI
+  roi_classes?: Record<string, number>;  // per-class ROI entry count
   fps?: number;
   congestion?: CongestionInfo;
 }
@@ -61,6 +63,8 @@ export interface VehicleStats {
   model_name: string;
   roi_active: boolean;
   roi_count: number;               // vehicles currently INSIDE the ROI (live)
+  roi_total?: number;              // cumulative vehicles that entered ROI
+  roi_classes?: Record<string, number>;  // per-class ROI entry count
   conf_threshold: number;
   line_position: number;
   stream_error?: string;

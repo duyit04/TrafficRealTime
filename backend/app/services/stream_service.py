@@ -24,6 +24,7 @@ from app.models.detection_model import VehicleStats, CongestionInfo
 from app.ml.yolo_model import yolo_model, is_tracker_kalman_error, is_tracker_state_error
 from app.ml.tracker import get_tracker
 from app.ml.vehicle_counter import VehicleCounter
+from app.ml.roi_counter import RoiCounter
 from app.ml.congestion_monitor import CongestionMonitor
 
 # ── Service Layer ─────────────────────────────────────────────────────────────
@@ -76,8 +77,10 @@ class StreamService:
             vehicle_threshold=settings.CONGESTION_VEHICLE_THRESHOLD,
             stable_duration=settings.CONGESTION_STABLE_DURATION,
         )
+        self._roi_counter = RoiCounter()
         self._companion_tracker = get_tracker(self._tracker_type)
         self._companion_counter = VehicleCounter()
+        self._companion_roi_counter = RoiCounter()
         self._companion_congestion = CongestionMonitor(
             vehicle_threshold=settings.CONGESTION_VEHICLE_THRESHOLD,
             stable_duration=settings.CONGESTION_STABLE_DURATION,
@@ -128,6 +131,7 @@ class StreamService:
         # Extra slots: per-slot tracker + counter (gộp vào GET /stats)
         self._extra_trackers: dict[int, object] = {}
         self._extra_counters: dict[int, VehicleCounter] = {}
+        self._extra_roi_counters: dict[int, RoiCounter] = {}
         self._extra_counting_line_y: dict[int, int] = {}
         self._merge_lock = threading.RLock()
 
@@ -379,6 +383,10 @@ class StreamService:
                 pass
         for c in self._extra_counters.values():
             c.reset()
+        self._roi_counter.reset()
+        self._companion_roi_counter.reset()
+        for rc in self._extra_roi_counters.values():
+            rc.reset()
         self._congestion.reset()
         self._companion_congestion.reset()
         self._stats.total = 0
@@ -387,6 +395,8 @@ class StreamService:
         self._stats.classes = {}
         self._stats.classes_in = {}
         self._stats.classes_out = {}
+        self._stats.roi_total = 0
+        self._stats.roi_classes = {}
         self._stats.congestion = CongestionInfo()
         self._timeline.clear()
         self._timeline_last = 0
@@ -799,6 +809,7 @@ class StreamService:
         line_position: float,
         roi_active: bool,
         roi_count: int,
+        roi_counter: RoiCounter | None = None,
         fps: float = 0.0,
         congestion: CongestionInfo | None = None,
     ) -> dict:
@@ -814,6 +825,8 @@ class StreamService:
             "line_position": float(line_position),
             "roi_active": bool(roi_active),
             "roi_count": int(roi_count) if roi_active else 0,
+            "roi_total": int(roi_counter.total) if roi_counter is not None else 0,
+            "roi_classes": dict(roi_counter.by_class) if roi_counter is not None else {},
             "fps": float(fps),
         }
         if congestion is not None:
@@ -836,6 +849,7 @@ class StreamService:
             line_position=float(self._stats.line_position),
             roi_active=bool(roi_service.active_for("primary")),
             roi_count=int(self._stats.roi_count),
+            roi_counter=self._roi_counter,
             fps=float(self._stats.fps),
             congestion=self._stats.congestion,
         )
@@ -845,6 +859,7 @@ class StreamService:
                 line_position=float(self._companion_line_position),
                 roi_active=bool(roi_service.active_for("companion")),
                 roi_count=int(self._companion_roi_count),
+                roi_counter=self._companion_roi_counter,
                 fps=float(self._companion_fps),
                 congestion=self._companion_congestion.state,
             )
@@ -857,6 +872,7 @@ class StreamService:
                 line_position=lp,
                 roi_active=bool(roi_service.active_for(sk)),
                 roi_count=0,
+                roi_counter=self._extra_roi_counters.get(s),
                 fps=0.0,
             )
         return out
@@ -890,6 +906,15 @@ class StreamService:
                 )
             except Exception:
                 base.roi_active = bool(roi_service.active_for("primary"))
+            base.roi_total = int(self._roi_counter.total) + int(self._companion_roi_counter.total)
+            for rc in self._extra_roi_counters.values():
+                base.roi_total += int(rc.total)
+            extra_roi_maps = [rc.by_class for rc in self._extra_roi_counters.values()]
+            base.roi_classes = self._merge_class_maps(
+                self._roi_counter.by_class,
+                self._companion_roi_counter.by_class,
+                *extra_roi_maps,
+            )
             return base
 
     @property
@@ -1175,6 +1200,8 @@ class StreamService:
 
                 if not _primary_roi_on:
                     self._counter.update(active_tracks, line_y)
+                else:
+                    self._roi_counter.update(active_tracks)
                 self._stats.total = self._counter.total
                 self._stats.count_in = self._counter.count_in
                 self._stats.count_out = self._counter.count_out
@@ -1272,6 +1299,8 @@ class StreamService:
                     "model_name": _s.model_name,
                     "roi_active": _s.roi_active,
                     "roi_count": int(_s.roi_count),
+                    "roi_total": int(self._roi_counter.total),
+                    "roi_classes": dict(self._roi_counter.by_class),
                     "conf_threshold": _s.conf_threshold,
                     "line_position": _s.line_position,
                     "congestion": {
@@ -1545,6 +1574,8 @@ class StreamService:
                         companion_line_y = self._companion_counting_line_y
                     if not _companion_roi_on_check:
                         self._companion_counter.update(active_tracks, companion_line_y)
+                    else:
+                        self._companion_roi_counter.update(active_tracks)
                     # Only update count on real inference; skipped frames have tracks=[] which
                     # would falsely reset the congestion timer.
                     if do_infer:
@@ -1609,6 +1640,8 @@ class StreamService:
                             "line_position": (float(companion_line_y) / float(max(frame_h, 1))),
                             "roi_active": _companion_roi_on,
                             "roi_count": int(_last_companion_active_count) if _companion_roi_on else 0,
+                            "roi_total": int(self._companion_roi_counter.total),
+                            "roi_classes": dict(self._companion_roi_counter.by_class),
                             "congestion": companion_congestion_payload,
                             "model_loaded": companion_model_loaded,
                             "model_name": companion_model_name,
@@ -1756,6 +1789,8 @@ class StreamService:
                     ec = VehicleCounter()
                     ec.set_mode(self._counter.mode)
                     self._extra_counters[s] = ec
+                if s not in self._extra_roi_counters:
+                    self._extra_roi_counters[s] = RoiCounter()
                 tracks = self._extra_trackers[s].update(dets, fr)
                 frame_h = int(fr.shape[0])
                 slot_key = str(int(slot))
@@ -1775,6 +1810,8 @@ class StreamService:
                     line_y = float(self._extra_counting_line_y[s])
                 if not _extra_roi_on:
                     self._extra_counters[s].update(active_tracks, line_y)
+                else:
+                    self._extra_roi_counters[s].update(active_tracks)
             except Exception as xec:
                 logger.debug("extra slot %d VehicleCounter: %s", s, xec)
 
@@ -1825,6 +1862,7 @@ class StreamService:
                         line_position=float(line_y) / float(max(frame_h, 1)),
                         roi_active=_extra_roi_on,
                         roi_count=len(active_tracks) if _extra_roi_on else 0,
+                        roi_counter=self._extra_roi_counters.get(s),
                         fps=float(fps_val),
                     )
                 with self._extra_lock:
@@ -2188,6 +2226,8 @@ class StreamService:
         yolo_model.reset_tracker()
         self._counter.reset()
         self._companion_counter.reset()
+        self._roi_counter.reset()
+        self._companion_roi_counter.reset()
         self._congestion.reset()
         self._companion_congestion.reset()
         self._stats = VehicleStats(

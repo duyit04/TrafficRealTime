@@ -77,6 +77,8 @@ function laneStatsToVehicleStats(lane: LaneStats, base: VehicleStats): VehicleSt
     line_position: lane.line_position ?? base.line_position,
     roi_active: lane.roi_active ?? false,
     roi_count: lane.roi_count ?? 0,
+    roi_total: lane.roi_total ?? 0,
+    roi_classes: lane.roi_classes ?? {},
     fps: lane.fps ?? base.fps,
     congestion: lane.congestion ?? base.congestion,
   };
@@ -338,6 +340,8 @@ export function useDetection() {
               classes: {},
               classes_in: {},
               classes_out: {},
+              roi_total: 0,
+              roi_classes: {},
             };
           }
         });
