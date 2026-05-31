@@ -140,7 +140,7 @@ class YOLOModel:
         self._device = "cpu"
         self._use_half = False
         self._runtime_backend: str = "torch"
-        self._infer_lock = threading.Lock()
+        self._infer_lock = threading.RLock()
         self._fixed_imgsz_override: int | None = None
         self._tracker_err_log_ts: float = 0.0
         self._tracker_broken_until: float = 0.0
