@@ -361,6 +361,21 @@ class StreamService:
             logger.debug("TrafficLight detach(stop): %s", e)
         logger.info("StreamService: stopped")
 
+    def reset_roi_counter(self, slot: str | int) -> None:
+        """Reset ROI entry counter cho 1 slot cụ thể (gọi khi vẽ lại hoặc xóa ROI)."""
+        s = str(slot)
+        if s == "primary":
+            self._roi_counter.reset()
+        elif s == "companion":
+            self._companion_roi_counter.reset()
+        else:
+            try:
+                k = int(s)
+                if k in self._extra_roi_counters:
+                    self._extra_roi_counters[k].reset()
+            except (ValueError, TypeError):
+                pass
+
     def reset_counters(self) -> None:
         self._counter.reset()
         self._tracker.reset()
