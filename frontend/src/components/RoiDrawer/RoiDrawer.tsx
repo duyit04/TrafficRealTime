@@ -10,6 +10,18 @@ import { IconPencil, IconCheck, IconUndo, IconTrash } from '../icons/Icons';
 
 export type RoiPoint = { x: number; y: number };
 
+/** Size backing store for HiDPI; ctx draws in CSS pixels. */
+function fitCanvasToDisplay(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.offsetWidth;
+  const h = canvas.offsetHeight;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  const ctx = canvas.getContext('2d')!;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return ctx;
+}
+
 interface Props {
   onApply: (points: number[][]) => void;
   onClear: () => void;
@@ -35,9 +47,9 @@ export function RoiDrawer({ onApply, onClear, active, points: controlledPoints, 
   // Redraw whenever points or active state change
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d')!;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!canvas || canvas.offsetWidth === 0) return;
+    const ctx = fitCanvasToDisplay(canvas);
+    ctx.clearRect(0, 0, canvas.offsetWidth, canvas.offsetHeight);
     drawRoi(ctx, points, active);
   }, [points, active]);
 
@@ -46,10 +58,8 @@ export function RoiDrawer({ onApply, onClear, active, points: controlledPoints, 
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ro = new ResizeObserver(() => {
-      canvas.width  = canvas.offsetWidth;
-      canvas.height = canvas.offsetHeight;
-      const ctx = canvas.getContext('2d')!;
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const ctx = fitCanvasToDisplay(canvas);
+      ctx.clearRect(0, 0, canvas.offsetWidth, canvas.offsetHeight);
       drawRoi(ctx, points, active);
     });
     ro.observe(canvas.parentElement!);
@@ -173,9 +183,9 @@ export function RoiCanvasOverlay({ points, setPoints, isDrawing, setIsDrawing, o
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d')!;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!canvas || canvas.offsetWidth === 0) return;
+    const ctx = fitCanvasToDisplay(canvas);
+    ctx.clearRect(0, 0, canvas.offsetWidth, canvas.offsetHeight);
     drawRoi(ctx, points, active);
   }, [points, active]);
 
@@ -183,10 +193,8 @@ export function RoiCanvasOverlay({ points, setPoints, isDrawing, setIsDrawing, o
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ro = new ResizeObserver(() => {
-      canvas.width = canvas.offsetWidth;
-      canvas.height = canvas.offsetHeight;
-      const ctx = canvas.getContext('2d')!;
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const ctx = fitCanvasToDisplay(canvas);
+      ctx.clearRect(0, 0, canvas.offsetWidth, canvas.offsetHeight);
       drawRoi(ctx, points, active);
     });
     ro.observe(canvas.parentElement!);

@@ -35,7 +35,9 @@ async function apiFetch<T>(url: string, options?: RequestInit): Promise<T> {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(err.detail || 'Request failed');
   }
-  return res.json();
+  return res.json().catch(() => {
+    throw new Error('Invalid JSON response from server');
+  });
 }
 
 // ── Models ────────────────────────────────────────────────────────────────────
@@ -51,7 +53,9 @@ export const modelApi = {
       const err = await res.json().catch(() => ({ detail: res.statusText }));
       throw new Error(err.detail || 'Upload failed');
     }
-    return res.json();
+    return res.json().catch(() => {
+      throw new Error('Invalid JSON response from server');
+    });
   },
 
   load: (name: string) =>
@@ -219,7 +223,9 @@ export const mediaApi = {
       const err = await res.json().catch(() => ({ detail: res.statusText }));
       throw new Error(err.detail || 'Detection failed');
     }
-    return res.json();
+    return res.json().catch(() => {
+      throw new Error('Invalid JSON response from server');
+    });
   },
 
   startVideo: async (file: File): Promise<{ success: boolean; filename: string; size: number }> => {
@@ -230,7 +236,9 @@ export const mediaApi = {
       const err = await res.json().catch(() => ({ detail: res.statusText }));
       throw new Error(err.detail || 'Upload failed');
     }
-    return res.json();
+    return res.json().catch(() => {
+      throw new Error('Invalid JSON response from server');
+    });
   },
 
   stopVideo: () => apiFetch<SuccessResponse>('/media/stop-video', { method: 'POST' }),

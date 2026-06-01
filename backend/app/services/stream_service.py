@@ -438,7 +438,8 @@ class StreamService:
             self.line_position = max(0.05, min(0.95, line))
             self._counting_line_y = None
             self._companion_counting_line_y = None
-            self._extra_counting_line_y.clear()
+            with self._merge_lock:
+                self._extra_counting_line_y.clear()
         if fps is not None:
             self.max_fps = max(1, min(60, fps))
         if jpeg_quality is not None:
@@ -453,13 +454,15 @@ class StreamService:
                 self._tracker_type = t
                 self._tracker = get_tracker(t)
                 self._companion_tracker = get_tracker(t)
-                self._extra_trackers.clear()
+                with self._merge_lock:
+                    self._extra_trackers.clear()
                 yolo_model.reset_tracker()
         if counting_mode is not None:
             self._counter.set_mode(counting_mode)
             self._companion_counter.set_mode(counting_mode)
-            for c in self._extra_counters.values():
-                c.set_mode(counting_mode)
+            with self._merge_lock:
+                for c in self._extra_counters.values():
+                    c.set_mode(counting_mode)
         self._congestion.update_settings(
             threshold=congestion_threshold,
             duration=congestion_duration,
