@@ -1487,15 +1487,32 @@ class StreamService:
         skip_counter = 0
         last_dets: list = []
         _next_deadline = time.perf_counter()
-        _last_companion_active_count: int = 0  # hold count across skipped/backlog frames
+        _last_good_frame: np.ndarray | None = None
+        _holdover_count = 0
+        _last_companion_active_count: int = 0  # hold count across skipped/backlog/holdover frames
 
         try:
             while self._companion_running:
-                fr, backlog = self._drain_latest_frame(frame_q, timeout=1.0)
+                fr, backlog = self._drain_latest_frame(
+                    frame_q, timeout=min(frame_interval * 2, 0.15)
+                )
+                _is_holdover = False
                 if fr is None:
                     if stop_evt.is_set():
                         break
-                    continue
+                    if _last_good_frame is not None:
+                        if not cap_thread.is_alive():
+                            break
+                        fr = _last_good_frame
+                        _holdover_count += 1
+                        _is_holdover = True
+                    else:
+                        continue
+                else:
+                    if _holdover_count > 0:
+                        _next_deadline = time.perf_counter()
+                    _last_good_frame = fr
+                    _holdover_count = 0
 
                 self._companion_frame_count += 1
                 fps_cnt += 1
@@ -1520,7 +1537,7 @@ class StreamService:
                 tracks = []
                 do_infer = True
                 if bool(getattr(settings, "COMPANION_DETECT_ENABLED", True)):
-                    do_infer = not (backlog > 0)
+                    do_infer = not _is_holdover and not (backlog > 0)
                     comp_skip = getattr(settings, "COMPANION_SKIP_FRAMES", None)
                     skip_n = max(
                         0,
