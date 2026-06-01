@@ -171,6 +171,7 @@ async def export_engine(body: ModelExportEngineRequest):
                         "ok": False,
                         "error": str(exc),
                         "ended_at": time.time(),
+                        "progress": 0,
                         "progress_message": "Export thất bại",
                     }
                 )

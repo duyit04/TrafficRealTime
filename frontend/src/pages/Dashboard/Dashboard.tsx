@@ -84,6 +84,8 @@ export function Dashboard() {
   const roiCanvasCompanionRef = useRef<HTMLCanvasElement>(null);
   const roiCanvasExtra2Ref = useRef<HTMLCanvasElement>(null);
   const roiCanvasExtra3Ref = useRef<HTMLCanvasElement>(null);
+  const connectPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  useEffect(() => () => { if (connectPollRef.current !== null) clearInterval(connectPollRef.current); }, []);
   const [countingEnabled, setCountingEnabled] = useState(true);
   const [deviceInfo, setDeviceInfo] = useState<DeviceInfo>({ cuda_available: false, device_name: null });
   /** Số màn preview RTSP thêm cạnh luồng chính (0 = chỉ một màn LIVE). */
@@ -381,10 +383,12 @@ export function Dashboard() {
       await startStream(url);
       setStreamOn(true);
       addToast('Stream dang ket noi...', 'info');
+      if (connectPollRef.current !== null) clearInterval(connectPollRef.current);
       const deadline = Date.now() + 35000;
-      const t = setInterval(async () => {
+      connectPollRef.current = setInterval(async () => {
+        const t = connectPollRef.current;
         if (Date.now() > deadline) {
-          clearInterval(t);
+          clearInterval(t!); connectPollRef.current = null;
           setStreamOn(false);
           addToast('Khong the khoi dong stream.', 'error');
           return;
@@ -392,11 +396,11 @@ export function Dashboard() {
         try {
           const status = await streamApi.getStatus();
           if (status.error) {
-            clearInterval(t);
+            clearInterval(t!); connectPollRef.current = null;
             addToast(status.error, 'error');
             setStreamOn(false);
           } else if (status.active) {
-            clearInterval(t);
+            clearInterval(t!); connectPollRef.current = null;
           }
         } catch {
           // ignore
@@ -1139,13 +1143,15 @@ export function Dashboard() {
                       await startStream(turl);
                       setStreamOn(true);
                       addToast(`Dang ket noi: ${turl.split('/').pop()}`, 'info');
+                      if (connectPollRef.current !== null) clearInterval(connectPollRef.current);
                       const deadline = Date.now() + 35000;
-                      const t = setInterval(async () => {
-                        if (Date.now() > deadline) { clearInterval(t); setStreamOn(false); addToast('Timeout ket noi', 'error'); return; }
+                      connectPollRef.current = setInterval(async () => {
+                        const t = connectPollRef.current;
+                        if (Date.now() > deadline) { clearInterval(t!); connectPollRef.current = null; setStreamOn(false); addToast('Timeout ket noi', 'error'); return; }
                         try {
                           const status = await streamApi.getStatus();
-                          if (status.active) clearInterval(t);
-                          else if (status.error) { clearInterval(t); setStreamOn(false); addToast(status.error, 'error'); }
+                          if (status.active) { clearInterval(t!); connectPollRef.current = null; }
+                          else if (status.error) { clearInterval(t!); connectPollRef.current = null; setStreamOn(false); addToast(status.error, 'error'); }
                         } catch { /* ignore */ }
                       }, 1500);
                     } catch (e: any) {

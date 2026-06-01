@@ -878,8 +878,12 @@ class StreamService:
                 fps=float(self._companion_fps),
                 congestion=self._companion_congestion.state,
             )
-        for s, c in self._extra_counters.items():
-            ly = self._extra_counting_line_y.get(int(s))
+        with self._merge_lock:
+            extra_snap = list(self._extra_counters.items())
+            line_y_snap = dict(self._extra_counting_line_y)
+            roi_ctrs_snap = dict(self._extra_roi_counters)
+        for s, c in extra_snap:
+            ly = line_y_snap.get(int(s))
             lp = float(ly) / 1080.0 if ly else float(self.line_position)
             sk = str(int(s))
             out[sk] = self._lane_stats_payload(
@@ -887,7 +891,7 @@ class StreamService:
                 line_position=lp,
                 roi_active=bool(roi_service.active_for(sk)),
                 roi_count=0,
-                roi_counter=self._extra_roi_counters.get(s),
+                roi_counter=roi_ctrs_snap.get(s),
                 fps=0.0,
             )
         return out
@@ -1901,9 +1905,10 @@ class StreamService:
         with self._extra_lock:
             self._extra_latest.pop(int(slot), None)
             self._extra_yolo.pop(int(slot), None)
-        self._extra_trackers.pop(int(slot), None)
-        self._extra_counters.pop(int(slot), None)
-        self._extra_counting_line_y.pop(int(slot), None)
+        with self._merge_lock:
+            self._extra_trackers.pop(int(slot), None)
+            self._extra_counters.pop(int(slot), None)
+            self._extra_counting_line_y.pop(int(slot), None)
         logger.info("StreamService: extra slot %d worker exited", int(slot))
 
     def _compute_stopped_in_roi(self, slot_key: str, dets: list) -> tuple[int, int]:
