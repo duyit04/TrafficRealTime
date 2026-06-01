@@ -223,19 +223,19 @@ class DisplayOnlyTrafficLightService:
 
     def _coupled_green_duration(self, waiting_phase: int, serving_phase: int, q0: int, q1: int) -> float:
         """
-        Một đồng hồ xanh G cho pha được phục vụ (= thời gian đèn đỏ thuần của pha chờ trong giai đoạn này,
-        không kể vàng + all_red).
-        G = clamp( B + α·q_waiting − β·q_serving, MIN, MAX )
+        Một đồng hồ xanh G cho pha được phục vụ.
+        G = clamp( base + α·max(0, q_waiting−1) − β·q_serving, MIN, MAX )
+        base = TLC_ADVICE_DEFAULT_SECONDS (thời gian khi q_waiting = 1).
         """
         ql = [int(q0), int(q1)]
         qw = float(ql[int(waiting_phase)])
         qs = float(ql[int(serving_phase)])
-        base = float(getattr(settings, "TLC_ADVICE_DEFAULT_SECONDS", 30.0) or 30.0)
-        a = float(getattr(settings, "TLC_STOPPED_GREEN_COEFF", 2.5) or 2.5)
+        base = float(getattr(settings, "TLC_ADVICE_DEFAULT_SECONDS", 20.0) or 20.0)
+        a = float(getattr(settings, "TLC_STOPPED_GREEN_COEFF", 5.0) or 5.0)
         b = float(getattr(settings, "TLC_ADVICE_CROSS_QUEUE_COEFF", 1.5) or 1.5)
         lo = float(settings.TLC_MIN_GREEN)
         hi = float(settings.TLC_MAX_GREEN)
-        return float(max(lo, min(hi, base + a * qw - b * qs)))
+        return float(max(lo, min(hi, base + a * max(0.0, qw - 1.0) - b * qs)))
 
     def _apply_phase_advice_display_locked(
         self,
@@ -248,7 +248,7 @@ class DisplayOnlyTrafficLightService:
         UI gợi ý: pha đỏ → green_time = G (xanh tiếp theo);
         pha xanh/vàng → red_time_hint = R (khối đỏ tiếp theo ≈ G + clearance).
         """
-        default_g = float(getattr(settings, "TLC_ADVICE_DEFAULT_SECONDS", 30.0) or 30.0)
+        default_g = float(getattr(settings, "TLC_ADVICE_NO_DEMAND_SECONDS", 30.0) or 30.0)
         clearance_full = float(self._yellow_seconds + self._all_red_seconds)
 
         for p in self._state.phases[:2]:

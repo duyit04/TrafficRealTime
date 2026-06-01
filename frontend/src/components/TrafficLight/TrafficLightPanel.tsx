@@ -92,20 +92,22 @@ function TrafficLightVisual({
       // queue vừa về 0 (hết xe dừng) → kết thúc session
       const qJustBecameZero = q === 0 && prevQ !== 0 && prevQ !== -1;
 
+      const otherColor = phases[1 - i]?.color ?? '';
+      const otherColorChanged = otherColor !== prev.colors[1 - i];
+
       if (anchorsRef.current[i] === null) {
         // Lần đầu hiển thị: khởi tạo
         anchorsRef.current[i] = { sec: advice, atMs: Date.now() };
         peakAdviceRef.current[i] = advice;
-      } else if (colorChanged || qJustBecameZero) {
-        // Đổi màu đèn hoặc hết xe → reset session về giá trị hiện tại
+      } else if (colorChanged || otherColorChanged || qJustBecameZero) {
+        // Đổi màu đèn (bản thân hoặc pha kia) hoặc hết xe → reset về giá trị hiện tại
         anchorsRef.current[i] = { sec: advice, atMs: Date.now() };
         peakAdviceRef.current[i] = advice;
-      } else if (advice > peakAdviceRef.current[i]) {
-        // Gợi ý mới cao hơn peak → cập nhật peak và reset countdown từ peak mới
+      } else if (advice !== peakAdviceRef.current[i]) {
+        // Gợi ý thay đổi (tăng hoặc giảm) → cập nhật anchor
         peakAdviceRef.current[i] = advice;
         anchorsRef.current[i] = { sec: advice, atMs: Date.now() };
       }
-      // advice <= peak: giữ nguyên anchor, countdown tiếp tục giảm
     });
 
     prevSnapRef.current = {

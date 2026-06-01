@@ -1956,7 +1956,7 @@ class StreamService:
             if sp <= stop_speed:
                 streak += 1
             else:
-                streak = 0
+                streak = max(0, streak - 1)
             prev.update({"cx": cx, "cy": cy, "t": now, "streak": streak})
 
         # Prune tracks not present

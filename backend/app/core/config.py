@@ -138,7 +138,7 @@ class Settings(BaseSettings):
     TLC_EXTENSION_MIN_APPROACHING: int = 2
     TLC_YELLOW_SECONDS: float = 3.0
     TLC_ALL_RED_SECONDS: float = 1.5
-    TLC_MIN_GREEN: float = 10.0
+    TLC_MIN_GREEN: float = 20.0
     TLC_MAX_GREEN: float = 70.0
     TLC_MAX_RED_WAIT: float = 90.0        # opposite max track wait -> force end green
     TLC_WAIT_PENALTY_MAX: float = 15.0    # reduces planned green when opposite waits (scale to MAX_RED)
@@ -155,9 +155,11 @@ class Settings(BaseSettings):
     TLC_FUZZY_APPROACH_BOOST: float = 0.55
     TLC_FUZZY_APPROACH_BOOST_MAX: float = 14.0
     # Suggested green-time from stopped queue in ROI (seconds per stopped vehicle)
-    TLC_STOPPED_GREEN_COEFF: float = 2.5
-    # Joint two-ROI advice: baseline when queues empty (replaces TLC_MIN_GREEN for the formula base)
-    TLC_ADVICE_DEFAULT_SECONDS: float = 30.0
+    TLC_STOPPED_GREEN_COEFF: float = 5.0
+    # Demand formula base: G = base + coeff*(q_waiting-1), so q=1 → base seconds.
+    TLC_ADVICE_DEFAULT_SECONDS: float = 20.0
+    # Display value when advice is on but no vehicles detected in any ROI.
+    TLC_ADVICE_NO_DEMAND_SECONDS: float = 30.0
     # Subtract from coupled green G per stopped vehicle on the approach holding ROW (density on green side ⇒ red block shrinks).
     TLC_ADVICE_CROSS_QUEUE_COEFF: float = 1.5
     # After all-red: if the scheduled green phase has no queue/approaching but the other does, serve the other first
