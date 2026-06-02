@@ -110,14 +110,16 @@ class TrafficLightPhase(BaseModel):
     """Current state of one traffic light phase."""
     phase_id: int = 0
     color: str = "red"                  # "red" | "yellow" | "green"
-    green_time: float = 30.0            # recommended green duration (s)
-    # When this approach is currently green: estimated red block after yielding (opp. green + clearance)
+    # Đồng hồ gợi ý (giảm dần): đỏ → green_time (G rồi vàng); xanh/vàng → red_time_hint (R)
+    green_time: float = 30.0
     red_time_hint: float = 0.0
-    remaining: float = 0.0              # pillar-specific: green/yellow countdown, or ETA for red
+    # Loại gợi ý đang đếm (UI): green | yellow | red
+    advice_countdown: str = ""
+    # Giây gợi ý cố định (nhãn cạnh chấm tròn — không đếm ngược)
+    advice_peak_sec: float = 0.0
     queue_length: int = 0               # stopped / waiting vehicles (for TLC decisions)
     approaching_count: int = 0        # moving vehicles in approach (extension heuristic)
     avg_wait: float = 0.0               # max observed wait on stopped tracks (s)
-    time_until_green: float = 0.0       # when red: seconds until this approach gets green
 
 
 class TrafficLightState(BaseModel):
@@ -129,7 +131,6 @@ class TrafficLightState(BaseModel):
     active_phase: int = 0
     cycle_count: int = 0
     mode: str = "manual"                # "manual" | "fuzzy" | "rl" | "auto"
-    time_elapsed: float = 0.0
     # True while a camera stream worker is feeding the TLC (otherwise UI stays idle)
     stream_attached: bool = False
     # Intersection sub-state: green / yellow / all_red (clearance)

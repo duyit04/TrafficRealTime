@@ -182,12 +182,15 @@ export const detectionApi = {
 export interface TLPhase {
   phase_id: number;
   color: 'red' | 'yellow' | 'green';
-  remaining: number;
+  /** Gợi ý xanh còn lại (pha đỏ) — backend đếm ngược */
   green_time?: number;
-  /** Estimated red stint after yielding (yellow + all-red + opposite suggested green); when absent treat as 0 */
+  /** Gợi ý khối đỏ còn lại (pha xanh/vàng) — backend đếm ngược */
   red_time_hint?: number;
+  /** Loại gợi ý đang đếm: green | yellow | red */
+  advice_countdown?: '' | 'green' | 'yellow' | 'red';
+  /** Giây gợi ý cố định (nhãn cạnh chấm tròn, không đếm ngược) */
+  advice_peak_sec?: number;
   queue_length?: number;
-  time_until_green?: number;
 }
 
 export interface TLState {
@@ -209,7 +212,7 @@ export interface ImageDetectResult {
   height: number;
   detections: Array<{
     x1: number; y1: number; x2: number; y2: number;
-    class_name: string; confidence: number; track_id: null;
+    class_name: string; confidence: number; track_id?: number;
   }>;
   count: number;
 }

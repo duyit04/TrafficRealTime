@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type MutableRefObject } from 'react';
 import { trafficLightApi } from '../../services/api';
 import type { TLState } from '../../services/api';
 import { CameraWall } from '../CameraWall/CameraWall';
@@ -42,103 +42,136 @@ function shortCameraLabel(raw: string, fallbackIndex: number): string {
   return `Camera ${fallbackIndex + 1}`;
 }
 
-function adviceValueForPhase(p: TLState['phases'][number]): number {
-  return p.color === 'red' ? (p.green_time ?? 0) : (p.red_time_hint ?? 0);
+type AdviceKind = 'green' | 'yellow' | 'red';
+
+function adviceKindForPhase(p: TLState['phases'][number]): AdviceKind {
+  const k = p.advice_countdown;
+  if (k === 'green' || k === 'yellow' || k === 'red') return k;
+  return 'red';
 }
 
-type AdviceAnchor = { sec: number; atMs: number };
+function adviceValueForPhase(p: TLState['phases'][number]): number {
+  const kind = adviceKindForPhase(p);
+  if (kind === 'red') return p.red_time_hint ?? 0;
+  return p.green_time ?? 0;
+}
+
+/** Hiển thị giây đếm ngược (làm tròn lên, tránh kẹt 0 sớm khi còn 0.xs). */
+function adviceSecondsDisplay(sec: number): number {
+  if (sec <= 0) return 0;
+  return Math.ceil(sec - 1e-6);
+}
+
+type AdviceSnap = { remain: number; atMs: number; kind: AdviceKind };
+
+/** Đồng bộ mốc đếm ngược mượt: giữ giây thực (float), chỉ chỉnh khi lệch server. */
+function syncAdviceSnaps(
+  snaps: [AdviceSnap, AdviceSnap],
+  phases: TLState['phases'],
+  showAdvice: boolean,
+): void {
+  if (!showAdvice) {
+    snaps[0] = { remain: 0, atMs: 0, kind: 'green' };
+    snaps[1] = { remain: 0, atMs: 0, kind: 'green' };
+    return;
+  }
+  const now = Date.now();
+  phases.slice(0, 2).forEach((p, idx) => {
+    const kind = adviceKindForPhase(p);
+    const serverRemain = Math.max(0, adviceValueForPhase(p));
+    const prev = snaps[idx];
+    if (prev.atMs === 0 || prev.kind !== kind) {
+      const peak = Math.max(0, p.advice_peak_sec ?? 0);
+      let initial = serverRemain;
+      // Chỉ khi vừa chuyển xanh→vàng: server có thể gửi số nhỏ do poll trễ — không áp dụng cuối vàng (tránh nhảy 3→2→3).
+      if (kind === 'yellow' && prev.kind === 'green' && peak > 0) {
+        initial = Math.max(serverRemain, peak);
+      }
+      snaps[idx] = { remain: initial, atMs: now, kind };
+      return;
+    }
+    const predicted = Math.max(0, prev.remain - (now - prev.atMs) / 1000);
+    const drift = serverRemain - predicted;
+    // Chu kỳ mới: server nhảy 0→30/33 — phải bắt lại mốc (kind vẫn 'red' trên pha phục vụ).
+    const rolledOver = serverRemain > 1 && predicted <= 0.05;
+    if (drift > 0.35 || predicted - serverRemain > 0.35 || rolledOver) {
+      snaps[idx] = { remain: serverRemain, atMs: now, kind };
+    }
+  });
+}
 
 function TrafficLightVisual({
   phases,
   showAdvice,
   phaseTitles,
+  adviceSnapsRef,
 }: {
   phases: TLState['phases'];
   showAdvice: boolean;
   phaseTitles: readonly [string, string];
+  adviceSnapsRef: MutableRefObject<[AdviceSnap, AdviceSnap]>;
 }) {
-  /** Mốc đếm ngược cục bộ: giảm từ peak suggestion, không reset khi advice giảm. */
-  const anchorsRef = useRef<[AdviceAnchor | null, AdviceAnchor | null]>([null, null]);
-  /** Giá trị gợi ý lớn nhất trong session dừng xe hiện tại (per phase). */
-  const peakAdviceRef = useRef<[number, number]>([0, 0]);
-  const prevSnapRef = useRef<{
-    queues: [number, number];
-    colors: [string, string];
-  }>({
-    queues: [-1, -1],
-    colors: ['', ''],
-  });
+  const snapsRef = adviceSnapsRef;
+  const phasesRef = useRef<TLState['phases']>(phases);
   const [tick, setTick] = useState(0);
+  const lastShownRef = useRef<[number, number]>([-1, -1]);
 
   useEffect(() => {
-    if (!showAdvice) {
-      anchorsRef.current = [null, null];
-      peakAdviceRef.current = [0, 0];
-      prevSnapRef.current = { queues: [-1, -1], colors: ['', ''] };
-      return;
-    }
-
-    const q0 = phases[0]?.queue_length ?? 0;
-    const q1 = phases[1]?.queue_length ?? 0;
-    const prev = prevSnapRef.current;
-
-    phases.slice(0, 2).forEach((p, idx) => {
-      const i = idx as 0 | 1;
-      const advice = Math.floor(adviceValueForPhase(p));
-      const q = p.queue_length ?? 0;
-      const color = p.color;
-      const colorChanged = color !== prev.colors[i];
-      const prevQ = prev.queues[i];
-      // queue vừa về 0 (hết xe dừng) → kết thúc session
-      const qJustBecameZero = q === 0 && prevQ !== 0 && prevQ !== -1;
-
-      const otherColor = phases[1 - i]?.color ?? '';
-      const otherColorChanged = otherColor !== prev.colors[1 - i];
-
-      if (anchorsRef.current[i] === null) {
-        // Lần đầu hiển thị: khởi tạo
-        anchorsRef.current[i] = { sec: advice, atMs: Date.now() };
-        peakAdviceRef.current[i] = advice;
-      } else if (colorChanged || otherColorChanged || qJustBecameZero) {
-        // Đổi màu đèn (bản thân hoặc pha kia) hoặc hết xe → reset về giá trị hiện tại
-        anchorsRef.current[i] = { sec: advice, atMs: Date.now() };
-        peakAdviceRef.current[i] = advice;
-      } else if (advice !== peakAdviceRef.current[i]) {
-        // Gợi ý thay đổi (tăng hoặc giảm) → cập nhật anchor
-        peakAdviceRef.current[i] = advice;
-        anchorsRef.current[i] = { sec: advice, atMs: Date.now() };
-      }
-    });
-
-    prevSnapRef.current = {
-      queues: [q0, q1],
-      colors: [phases[0]?.color ?? '', phases[1]?.color ?? ''],
-    };
+    phasesRef.current = phases;
+    syncAdviceSnaps(snapsRef.current, phases, showAdvice);
   }, [phases, showAdvice]);
 
   useEffect(() => {
-    if (!showAdvice) return;
-    const id = window.setInterval(() => setTick((n) => n + 1), 500);
-    return () => window.clearInterval(id);
+    if (!showAdvice) {
+      lastShownRef.current = [-1, -1];
+      return;
+    }
+    let raf = 0;
+    const loop = () => {
+      const now = Date.now();
+      let changed = false;
+      for (let idx = 0; idx < 2; idx++) {
+        let snap = snapsRef.current[idx];
+        const raw = Math.max(0, snap.remain - (now - snap.atMs) / 1000);
+
+        const shown = adviceSecondsDisplay(raw);
+        if (shown !== lastShownRef.current[idx]) {
+          lastShownRef.current[idx] = shown;
+          changed = true;
+        }
+      }
+      if (changed) setTick((n) => n + 1);
+      raf = window.requestAnimationFrame(loop);
+    };
+    raf = window.requestAnimationFrame(loop);
+    return () => window.cancelAnimationFrame(raf);
   }, [showAdvice]);
 
   return (
     <div className="grid grid-cols-2 gap-3">
       {phases.slice(0, 2).map((p, idx) => {
         const color = p.color;
+        const adviceKind = adviceKindForPhase(p);
         const titleFull = (phaseTitles[idx] ?? '').trim();
         const titleShort = shortCameraLabel(titleFull, idx);
         const q = p.queue_length ?? 0;
 
-        const anchor = anchorsRef.current[idx];
         void tick;
+        const snap = snapsRef.current[idx];
         const countdownSec = showAdvice
-          ? anchor
-            ? Math.max(0, Math.floor(anchor.sec - (Date.now() - anchor.atMs) / 1000))
-            : Math.max(0, Math.floor(adviceValueForPhase(p)))
+          ? Math.max(
+              0,
+              adviceSecondsDisplay(
+                snap.remain - (Date.now() - snap.atMs) / 1000,
+              ),
+            )
+          : 0;
+        /** Nhãn cạnh chấm tròn: giây gợi ý cố định (không giảm). Số lớn giữa đèn: đếm ngược. */
+        const badgeSuggestedSec = showAdvice
+          ? Math.max(0, Math.floor(p.advice_peak_sec ?? 0))
           : 0;
 
-        /** Chấm bên cạnh: chỉ báo phase khi bật gợi ý; tắt gợi ý → xám (không nhảy theo đỏ/vàng/xanh). */
+        /** Chấm tròn + đèn 3 màu = pha hiện tại (mô phỏng). */
         const badgeTone = showAdvice
           ? color === 'red'
             ? 'bg-red-500'
@@ -147,24 +180,31 @@ function TrafficLightVisual({
               : 'bg-emerald-500'
           : 'bg-slate-400';
 
-        /**
-         * Bật gợi ý: số = G/R vừa cập nhật, rồi giảm dần từ đó; có xe ROI → cập nhật gợi ý mới → giảm tiếp.
-         */
         const adviceNumCls =
-          color === 'red' ? 'text-emerald-400' : 'text-red-400';
+          adviceKind === 'green'
+            ? 'text-emerald-400'
+            : adviceKind === 'yellow'
+              ? 'text-amber-300'
+              : 'text-red-400';
 
-        /** Số giây gợi ý pha tiếp theo (G/R) — cố định đến lần cập nhật ROI tiếp theo. */
-        const suggestedSec = showAdvice
-          ? anchor
-            ? Math.max(0, Math.floor(anchor.sec))
-            : Math.max(0, Math.floor(adviceValueForPhase(p)))
-          : 0;
         const suggestedLabelCls =
-          color === 'red' ? 'text-emerald-500' : 'text-red-500';
-        const suggestedTitle =
-          color === 'red'
-            ? `Đã gợi ý xanh tiếp theo (G): ${suggestedSec}s`
-            : `Đã gợi ý đỏ tiếp theo (R): ${suggestedSec}s`;
+          adviceKind === 'green'
+            ? 'text-emerald-500'
+            : adviceKind === 'yellow'
+              ? 'text-amber-500'
+              : 'text-red-500';
+        const badgeTitle =
+          adviceKind === 'green'
+            ? `Gợi ý xanh (G): ${badgeSuggestedSec}s`
+            : adviceKind === 'yellow'
+              ? `Gợi ý vàng: ${badgeSuggestedSec}s`
+              : `Gợi ý đỏ (R): ${badgeSuggestedSec}s`;
+        const countdownTitle =
+          adviceKind === 'green'
+            ? `Gợi ý xanh (G): còn ${countdownSec}s`
+            : adviceKind === 'yellow'
+              ? `Gợi ý vàng: còn ${countdownSec}s`
+              : `Gợi ý đỏ (R): còn ${countdownSec}s`;
 
         return (
           <div key={idx} className="rounded-xl border border-slate-200 bg-white px-2 py-3 shadow-sm">
@@ -182,10 +222,10 @@ function TrafficLightVisual({
                   title={
                     showAdvice
                       ? color === 'red'
-                        ? 'Đang đỏ'
+                        ? 'Pha hiện tại: đỏ'
                         : color === 'yellow'
-                          ? 'Đang vàng'
-                          : 'Đang xanh'
+                          ? 'Pha hiện tại: vàng'
+                          : 'Pha hiện tại: xanh'
                       : 'Tắt gợi ý — không chỉ báo phase'
                   }
                   aria-hidden
@@ -193,9 +233,9 @@ function TrafficLightVisual({
                 {showAdvice ? (
                   <span
                     className={`text-[11px] font-black tabular-nums leading-none ${suggestedLabelCls}`}
-                    title={suggestedTitle}
+                    title={badgeTitle}
                   >
-                    {suggestedSec}s
+                    {badgeSuggestedSec}s
                   </span>
                 ) : null}
               </div>
@@ -225,11 +265,7 @@ function TrafficLightVisual({
                 {showAdvice ? (
                   <div
                     className="pointer-events-none absolute inset-0 flex items-center justify-center rounded-2xl"
-                    title={
-                      color === 'red'
-                        ? `Gợi ý xanh (G): còn ${countdownSec}s`
-                        : `Gợi ý đỏ (R): còn ${countdownSec}s`
-                    }
+                    title={countdownTitle}
                   >
                     <span
                       className={`font-black tabular-nums text-[28px] leading-none drop-shadow-[0_2px_10px_rgba(0,0,0,0.95)] ${adviceNumCls}`}
@@ -367,6 +403,10 @@ export function TrafficLightPanel({
   const [state, setState] = useState<TLState | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval>>();
   const [adviceEnabled, setAdviceEnabled] = useState(false);
+  const adviceSnapsRef = useRef<[AdviceSnap, AdviceSnap]>([
+    { remain: 0, atMs: 0, kind: 'green' },
+    { remain: 0, atMs: 0, kind: 'green' },
+  ]);
 
   const phaseTitles = useMemo((): [string, string] => {
     const labelFor = (i: 0 | 1): string => {
@@ -388,6 +428,9 @@ export function TrafficLightPanel({
       try {
         const s = await trafficLightApi.getState();
         if (dead) return;
+        if (Boolean(s.lane_density_advice?.enabled)) {
+          syncAdviceSnaps(adviceSnapsRef.current, s.phases, true);
+        }
         setState(s);
         setAdviceEnabled(Boolean(s.lane_density_advice?.enabled));
       } catch {
@@ -404,7 +447,7 @@ export function TrafficLightPanel({
       };
     }
 
-    const intervalMs = adviceEnabled ? 500 : 2000;
+    const intervalMs = adviceEnabled ? 100 : 2000;
     pollRef.current = setInterval(() => void poll(), intervalMs);
     return () => {
       dead = true;
@@ -518,6 +561,7 @@ export function TrafficLightPanel({
             phases={state.phases}
             showAdvice={adviceEnabled}
             phaseTitles={phaseTitles}
+            adviceSnapsRef={adviceSnapsRef}
           />
         </div>
       ) : null}
