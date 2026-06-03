@@ -155,7 +155,7 @@ class Settings(BaseSettings):
     TLC_FUZZY_APPROACH_BOOST: float = 0.55
     TLC_FUZZY_APPROACH_BOOST_MAX: float = 14.0
     # Suggested green-time from stopped queue in ROI (seconds per stopped vehicle)
-    TLC_STOPPED_GREEN_COEFF: float = 5.0
+    TLC_STOPPED_GREEN_COEFF: float = 6.0
     # Demand formula base: G = base + coeff*(q_waiting-1), so q=1 → base seconds.
     TLC_ADVICE_DEFAULT_SECONDS: float = 20.0
     # Display value when advice is on but no vehicles detected in any ROI.

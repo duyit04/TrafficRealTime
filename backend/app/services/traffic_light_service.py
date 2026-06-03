@@ -256,6 +256,7 @@ class DisplayOnlyTrafficLightService:
         self._green_seconds = float(geff)
         self._phase_green_seconds[0] = float(geff)
         self._phase_green_seconds[1] = float(geff)
+        self._arm_ui_advice_cycle_locked(float(geff), int(nh), float(now))
 
     def _coupled_green_duration(self, waiting_phase: int, serving_phase: int, q0: int, q1: int) -> float:
         """
@@ -267,7 +268,7 @@ class DisplayOnlyTrafficLightService:
         ql = [int(q0), int(q1)]
         qw = float(ql[int(waiting_phase)])
         base = float(getattr(settings, "TLC_ADVICE_DEFAULT_SECONDS", 20.0) or 20.0)
-        a = float(getattr(settings, "TLC_STOPPED_GREEN_COEFF", 5.0) or 5.0)
+        a = float(settings.TLC_STOPPED_GREEN_COEFF)
         lo = float(settings.TLC_MIN_GREEN)
         hi = float(settings.TLC_MAX_GREEN)
         return float(max(lo, min(hi, base + a * max(0.0, qw - 1.0))))
@@ -363,14 +364,24 @@ class DisplayOnlyTrafficLightService:
                 else default_g
             )
 
-            # Cập nhật g_sec khi xe vào/ra ROI giữa pha (không reset anchor, giữ elapsed)
-            if (
-                self._ui_cycle_armed
-                and sub == "green"
-                and self._ui_cycle_active_phase == ap
-                and abs(g_nom - float(self._ui_cycle_g_sec)) > 0.5
-            ):
-                self._ui_cycle_g_sec = float(max(0.0, g_nom))
+            # Cập nhật g_sec theo xe trong ROI:
+            # - Có xe: chỉ tăng (lấy max), không giảm khi bớt xe giữa pha
+            # - Hết xe (q=0): về lại default
+            if self._ui_cycle_armed and sub == "green" and self._ui_cycle_active_phase == ap:
+                if demand_here:
+                    if not self._ui_prev_demand_any:
+                        # Xe vừa xuất hiện: bắt đầu fresh từ giá trị xe, không so với 30s
+                        self._ui_cycle_g_sec = float(max(0.0, g_nom))
+                        self._ui_cycle_anchor_started_at = float(now)
+                        self._ui_post_cycle_rolled = False
+                    elif g_nom > float(self._ui_cycle_g_sec) + 0.5:
+                        # Thêm xe: chỉ tăng (lấy max)
+                        self._ui_cycle_g_sec = float(max(0.0, g_nom))
+                        self._ui_cycle_anchor_started_at = float(now)
+                        self._ui_post_cycle_rolled = False
+                else:
+                    if abs(float(self._ui_cycle_g_sec) - default_g) > 0.5:
+                        self._ui_cycle_g_sec = default_g
 
             need_arm = (
                 not self._ui_cycle_armed
