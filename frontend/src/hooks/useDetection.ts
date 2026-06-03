@@ -18,12 +18,7 @@ import type {
 
 const DEFAULT_STATS: VehicleStats = {
   total: 0,
-  count_in: 0,
-  count_out: 0,
   classes: {},
-  classes_in: {},
-  classes_out: {},
-  counting_mode: 'all',
   fps: 0,
   fps_capture: 0,
   fps_inference: 0,
@@ -68,12 +63,7 @@ function laneStatsToVehicleStats(lane: LaneStats, base: VehicleStats): VehicleSt
   return {
     ...base,
     total: lane.total ?? 0,
-    count_in: lane.count_in ?? 0,
-    count_out: lane.count_out ?? 0,
     classes: lane.classes ?? {},
-    classes_in: lane.classes_in ?? {},
-    classes_out: lane.classes_out ?? {},
-    counting_mode: lane.counting_mode ?? base.counting_mode,
     line_position: lane.line_position ?? base.line_position,
     roi_active: lane.roi_active ?? false,
     roi_count: lane.roi_count ?? 0,
@@ -335,11 +325,7 @@ export function useDetection() {
             cleared[k] = {
               ...cleared[k]!,
               total: 0,
-              count_in: 0,
-              count_out: 0,
               classes: {},
-              classes_in: {},
-              classes_out: {},
               roi_total: 0,
               roi_classes: {},
             };

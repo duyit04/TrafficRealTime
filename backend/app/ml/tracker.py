@@ -103,15 +103,12 @@ def get_tracker(tracker_type: str, **kwargs: Any):
 
     tracker_type:
       - "bytetrack" → ultralytics built-in ByteTrack (default)
-      - "botsort"   → ultralytics built-in BoT-SORT
       - "sort"      → pure Python SORT (Kalman + Hungarian IoU)
       - "deepsort"  → DeepSORT (SORT + HSV appearance matching)
     """
     t = (tracker_type or "bytetrack").strip().lower()
     if t == "bytetrack":
         return BuiltinTracker(tracker_yaml="bytetrack.yaml", **kwargs)
-    if t == "botsort":
-        return BuiltinTracker(tracker_yaml="botsort.yaml", **kwargs)
     if t == "sort":
         from app.ml.sort_tracker import SortTracker
         return SortTracker(**kwargs)

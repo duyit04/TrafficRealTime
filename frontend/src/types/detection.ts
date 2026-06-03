@@ -27,12 +27,7 @@ export interface CongestionInfo {
 /** Per-camera counting snapshot (WebSocket lane_stats / API by_slot). */
 export interface LaneStats {
   total: number;
-  count_in: number;
-  count_out: number;
   classes: Record<string, number>;
-  classes_in: Record<string, number>;
-  classes_out: Record<string, number>;
-  counting_mode: 'all' | 'direction';
   line_position: number;
   roi_active: boolean;
   roi_count: number;
@@ -46,12 +41,7 @@ export type StatsSlotKey = 'primary' | 'companion' | '2' | '3';
 
 export interface VehicleStats {
   total: number;
-  count_in: number;                // vehicles going IN  (top → bottom)
-  count_out: number;               // vehicles going OUT (bottom → top)
   classes: Record<string, number>;
-  classes_in: Record<string, number>;
-  classes_out: Record<string, number>;
-  counting_mode: 'all' | 'direction';
   fps: number;
   fps_capture: number;
   fps_inference: number;
@@ -120,8 +110,7 @@ export interface Settings {
   conf_threshold: number;
   line_position: number;
   max_fps: number;
-  tracker_type?: string;  // bytetrack | botsort
-  counting_mode?: 'all' | 'direction';
+  tracker_type?: string;  // bytetrack | sort | deepsort
   congestion_threshold?: number;
   congestion_duration?: number;
   jpeg_quality?: number;   // 30–95

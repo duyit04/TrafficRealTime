@@ -55,7 +55,6 @@ class DisplayOnlyTrafficLightService:
         self._green_seconds: float = 30.0
         self._phase_green_seconds = [30.0, 30.0]
         self._yellow_seconds: float = float(settings.TLC_YELLOW_SECONDS)
-        self._all_red_seconds: float = float(settings.TLC_ALL_RED_SECONDS)
 
         # Sub-state: green → yellow → next green
         self._movement_substate: str = "green"
@@ -260,19 +259,18 @@ class DisplayOnlyTrafficLightService:
 
     def _coupled_green_duration(self, waiting_phase: int, serving_phase: int, q0: int, q1: int) -> float:
         """
-        Một đồng hồ xanh G cho pha được phục vụ.
-        G = clamp( base + α·max(0, q_waiting−1) − β·q_serving, MIN, MAX )
+        Thời gian xanh G dựa trên số xe dừng ở pha chờ (đỏ):
+        G = clamp( base + α·max(0, q_waiting−1), MIN, MAX )
         base = TLC_ADVICE_DEFAULT_SECONDS (thời gian khi q_waiting = 1).
+        Mỗi xe thêm ở pha đỏ cộng α giây. Pha xanh luôn ít xe hơn nên không tính.
         """
         ql = [int(q0), int(q1)]
         qw = float(ql[int(waiting_phase)])
-        qs = float(ql[int(serving_phase)])
         base = float(getattr(settings, "TLC_ADVICE_DEFAULT_SECONDS", 20.0) or 20.0)
         a = float(getattr(settings, "TLC_STOPPED_GREEN_COEFF", 5.0) or 5.0)
-        b = float(getattr(settings, "TLC_ADVICE_CROSS_QUEUE_COEFF", 1.5) or 1.5)
         lo = float(settings.TLC_MIN_GREEN)
         hi = float(settings.TLC_MAX_GREEN)
-        return float(max(lo, min(hi, base + a * max(0.0, qw - 1.0) - b * qs)))
+        return float(max(lo, min(hi, base + a * max(0.0, qw - 1.0))))
 
     def _apply_phase_advice_display_locked(
         self,
@@ -365,6 +363,15 @@ class DisplayOnlyTrafficLightService:
                 else default_g
             )
 
+            # Cập nhật g_sec khi xe vào/ra ROI giữa pha (không reset anchor, giữ elapsed)
+            if (
+                self._ui_cycle_armed
+                and sub == "green"
+                and self._ui_cycle_active_phase == ap
+                and abs(g_nom - float(self._ui_cycle_g_sec)) > 0.5
+            ):
+                self._ui_cycle_g_sec = float(max(0.0, g_nom))
+
             need_arm = (
                 not self._ui_cycle_armed
                 or (sub == "green" and prev_sub == "yellow")
@@ -416,7 +423,8 @@ class DisplayOnlyTrafficLightService:
                             # Đỏ tiếp tục 3→0 (phần cuối của total_r)
                             p.advice_countdown = "red"
                             p.red_time_hint = y_rem
-                            p.advice_peak_sec = float(total_r)
+                            # Dùng _green_seconds + yellow thay vì total_r (tránh sai khi roll-over đã fire)
+                            p.advice_peak_sec = float(self._green_seconds) + float(self._yellow_seconds)
                         else:
                             # Xanh hết 30s → chạy tiếp 3s vàng
                             p.advice_countdown = "yellow"
@@ -432,15 +440,6 @@ class DisplayOnlyTrafficLightService:
                         p.advice_countdown = "green"
                         p.green_time = float(max(0.0, g - elapsed))
                         p.advice_peak_sec = float(g)
-        elif advice_ready:
-            for p in self._state.phases[:2]:
-                if str(p.advice_countdown) == "red":
-                    p.advice_peak_sec = float(max(0.0, p.red_time_hint))
-                elif str(p.advice_countdown) == "yellow":
-                    p.advice_peak_sec = float(self._yellow_seconds)
-                else:
-                    p.advice_peak_sec = float(max(0.0, p.green_time))
-
         self._ui_prev_movement_substate = sub
         self._ui_prev_demand_any = bool(demand_here)
 
@@ -540,23 +539,12 @@ class DisplayOnlyTrafficLightService:
         q0, q1 = self._effective_queues_locked()
         demand_here = bool(advice_ready) and self._has_demand_locked(q0, q1)
 
-        if not advice_ready:
+        if not advice_ready or not demand_here:
             geff_ui = 30.0
-        elif demand_here:
-            if self._movement_substate == "green":
-                wix = int(1 - self._active_phase)
-                six = int(self._active_phase)
-                geff_ui = self._coupled_green_duration(wix, six, q0, q1)
-            elif self._movement_substate == "yellow":
-                wix = int(1 - self._active_phase)
-                six = int(self._active_phase)
-                geff_ui = self._coupled_green_duration(wix, six, q0, q1)
-            else:
-                wix = int(1 - self._active_phase)
-                six = int(self._active_phase)
-                geff_ui = self._coupled_green_duration(wix, six, q0, q1)
         else:
-            geff_ui = 30.0
+            wix = int(1 - self._active_phase)
+            six = int(self._active_phase)
+            geff_ui = self._coupled_green_duration(wix, six, q0, q1)
 
         self._phase_green_seconds[0] = float(geff_ui)
         self._phase_green_seconds[1] = float(geff_ui)

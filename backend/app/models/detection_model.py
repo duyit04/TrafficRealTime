@@ -37,12 +37,7 @@ class CongestionInfo(BaseModel):
 
 class VehicleStats(BaseModel):
     total: int = 0
-    count_in: int = 0               # vehicles going IN  (top → bottom)
-    count_out: int = 0              # vehicles going OUT (bottom → top)
     classes: dict[str, int] = {}
-    classes_in: dict[str, int] = {}
-    classes_out: dict[str, int] = {}
-    counting_mode: str = "all"      # "all" | "direction"
     fps: float = 0.0
     fps_capture: float = 0.0        # frames read from RTSP per second
     fps_inference: float = 0.0      # YOLO inference frames per second
@@ -107,7 +102,6 @@ class SettingsUpdate(BaseModel):
     line_position: Optional[float] = Field(None, ge=0.05, le=0.95)
     max_fps: Optional[int] = Field(None, ge=1, le=60)
     tracker_type: Optional[str] = Field(None, description="sort | deepsort | bytetrack")
-    counting_mode: Optional[str] = Field(None, description="all | direction")
     congestion_threshold: Optional[int] = Field(None, ge=1, le=100)
     congestion_duration: Optional[float] = Field(None, ge=1.0, le=120.0)
     jpeg_quality: Optional[int] = Field(None, ge=30, le=95)

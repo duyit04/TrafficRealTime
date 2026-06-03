@@ -66,7 +66,6 @@ export function Dashboard() {
     max_fps: 30,
     skip_frames: 0,
     tracker_type: 'bytetrack',
-    counting_mode: 'all',
     congestion_threshold: 10,
     congestion_duration: 5,
   });
@@ -200,7 +199,7 @@ export function Dashboard() {
         label: previewSlots[1]?.label ?? 'Camera 3',
         stats: slotStats
           ? { ...statsForView, ...slotStats, line_position: slotStats.line_position ?? statsForView.line_position }
-          : { ...statsForView, total: 0, count_in: 0, count_out: 0, classes: {}, classes_in: {}, classes_out: {} },
+          : { ...statsForView, total: 0, classes: {} },
       });
     }
     if (isExtra3Live) {
@@ -210,7 +209,7 @@ export function Dashboard() {
         label: previewSlots[2]?.label ?? 'Camera 4',
         stats: slotStats
           ? { ...statsForView, ...slotStats, line_position: slotStats.line_position ?? statsForView.line_position }
-          : { ...statsForView, total: 0, count_in: 0, count_out: 0, classes: {}, classes_in: {}, classes_out: {} },
+          : { ...statsForView, total: 0, classes: {} },
       });
     }
     return panels;
@@ -510,8 +509,6 @@ export function Dashboard() {
         }
       } else {
         rows.push([panel.label, 'Total', s.total]);
-        rows.push([panel.label, 'IN', s.count_in ?? 0]);
-        rows.push([panel.label, 'OUT', s.count_out ?? 0]);
         rows.push([panel.label, 'FPS', s.fps ?? 0]);
         for (const [cls, count] of Object.entries(s.classes)) {
           rows.push([panel.label, cls, count]);
@@ -939,10 +936,6 @@ export function Dashboard() {
                               ...panel.stats,
                               total: 0,
                               classes: {},
-                              classes_in: {},
-                              classes_out: {},
-                              count_in: 0,
-                              count_out: 0,
                               roi_total: 0,
                               roi_classes: {},
                               roi_count: 0,
@@ -1321,6 +1314,11 @@ export function Dashboard() {
                     <div className="text-[11px] font-bold text-slate-600 uppercase tracking-wide mb-2">Đếm xe</div>
 
                     <div className="mb-3">
+                      <span className="text-[11px] text-slate-500 block mb-1">Chế độ đếm</span>
+                      <div className="text-xs font-semibold text-slate-700 px-2 py-2 rounded-lg border border-slate-200 bg-slate-50">Tổng hợp</div>
+                    </div>
+
+                    <div className="mb-3">
                       <span className="text-[11px] text-slate-500 block mb-1">Tracker</span>
                       <select
                         value={settings.tracker_type ?? 'bytetrack'}
@@ -1328,34 +1326,17 @@ export function Dashboard() {
                           const v = e.target.value;
                           setSettings((s) => ({ ...s, tracker_type: v }));
                           updateSettings({ tracker_type: v });
-                          const names: Record<string, string> = { bytetrack: 'ByteTrack', botsort: 'BoT-SORT', sort: 'SORT', deepsort: 'DeepSORT' };
+                          const names: Record<string, string> = { bytetrack: 'ByteTrack', sort: 'SORT', deepsort: 'DeepSORT' };
                           addToast(`Tracker: ${names[v] ?? v}`, 'success');
                         }}
                         className="w-full text-xs border border-slate-300 rounded-lg px-2 py-2 bg-white text-slate-700"
                       >
                         <option value="bytetrack">ByteTrack (recommended)</option>
-                        <option value="botsort">BoT-SORT</option>
                         <option value="sort">SORT</option>
                         <option value="deepsort">DeepSORT</option>
                       </select>
                     </div>
 
-                    <div className="mb-3">
-                      <span className="text-[11px] text-slate-500 block mb-1">Che do dem</span>
-                      <select
-                        value={settings.counting_mode ?? 'all'}
-                        onChange={(e) => {
-                          const v = e.target.value as 'all' | 'direction';
-                          setSettings((s) => ({ ...s, counting_mode: v }));
-                          updateSettings({ counting_mode: v });
-                          addToast(v === 'all' ? 'Chế độ: Đếm tổng hợp' : 'Chế độ: Đếm theo chiều IN / OUT', 'success');
-                        }}
-                        className="w-full text-xs border border-slate-300 rounded-lg px-2 py-2 bg-white text-slate-700"
-                      >
-                        <option value="all">Dem tat ca (tong hop)</option>
-                        <option value="direction">Dem theo chieu (IN / OUT)</option>
-                      </select>
-                    </div>
 
                     <div className="flex items-center justify-between">
                       <span className="text-[11px] text-slate-500">Enable Counting</span>

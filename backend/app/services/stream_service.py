@@ -405,11 +405,7 @@ class StreamService:
         self._congestion.reset()
         self._companion_congestion.reset()
         self._stats.total = 0
-        self._stats.count_in = 0
-        self._stats.count_out = 0
         self._stats.classes = {}
-        self._stats.classes_in = {}
-        self._stats.classes_out = {}
         self._stats.roi_total = 0
         self._stats.roi_classes = {}
         self._stats.congestion = CongestionInfo()
@@ -425,7 +421,6 @@ class StreamService:
         line: float | None = None,
         fps: int | None = None,
         tracker_type: str | None = None,
-        counting_mode: str | None = None,
         congestion_threshold: int | None = None,
         congestion_duration: float | None = None,
         jpeg_quality: int | None = None,
@@ -450,19 +445,13 @@ class StreamService:
             self.skip_frames = max(0, min(10, int(skip_frames)))
         if tracker_type is not None:
             t = str(tracker_type).strip().lower()
-            if t in ("bytetrack", "botsort", "sort", "deepsort"):
+            if t in ("bytetrack", "sort", "deepsort"):
                 self._tracker_type = t
                 self._tracker = get_tracker(t)
                 self._companion_tracker = get_tracker(t)
                 with self._merge_lock:
                     self._extra_trackers.clear()
                 yolo_model.reset_tracker()
-        if counting_mode is not None:
-            self._counter.set_mode(counting_mode)
-            self._companion_counter.set_mode(counting_mode)
-            with self._merge_lock:
-                for c in self._extra_counters.values():
-                    c.set_mode(counting_mode)
         self._congestion.update_settings(
             threshold=congestion_threshold,
             duration=congestion_duration,
@@ -834,12 +823,7 @@ class StreamService:
         """Per-camera counting snapshot for dashboard / WebSocket lane_stats."""
         payload: dict = {
             "total": int(counter.total),
-            "count_in": int(counter.count_in),
-            "count_out": int(counter.count_out),
             "classes": dict(counter.by_class),
-            "classes_in": dict(counter.by_class_in),
-            "classes_out": dict(counter.by_class_out),
-            "counting_mode": counter.mode,
             "line_position": float(line_position),
             "roi_active": bool(roi_active),
             "roi_count": int(roi_count) if roi_active else 0,
@@ -904,22 +888,8 @@ class StreamService:
         with self._merge_lock:
             base = self._stats.model_copy(deep=True)
             base.total = self._merged_total()
-            base.count_in = int(self._counter.count_in) + int(self._companion_counter.count_in)
-            base.count_out = int(self._counter.count_out) + int(self._companion_counter.count_out)
-            for c in self._extra_counters.values():
-                base.count_in += int(c.count_in)
-                base.count_out += int(c.count_out)
             extra_maps = [c.by_class for c in self._extra_counters.values()]
             base.classes = self._merge_class_maps(self._counter.by_class, self._companion_counter.by_class, *extra_maps)
-            extra_in = [c.by_class_in for c in self._extra_counters.values()]
-            base.classes_in = self._merge_class_maps(
-                self._counter.by_class_in, self._companion_counter.by_class_in, *extra_in
-            )
-            extra_out = [c.by_class_out for c in self._extra_counters.values()]
-            base.classes_out = self._merge_class_maps(
-                self._counter.by_class_out, self._companion_counter.by_class_out, *extra_out
-            )
-            base.counting_mode = self._counter.mode
             try:
                 base.roi_active = bool(
                     roi_service.active_for("primary")
@@ -1225,12 +1195,7 @@ class StreamService:
                 else:
                     self._roi_counter.update(active_tracks)
                 self._stats.total = self._counter.total
-                self._stats.count_in = self._counter.count_in
-                self._stats.count_out = self._counter.count_out
                 self._stats.classes = dict(self._counter.by_class)
-                self._stats.classes_in = dict(self._counter.by_class_in)
-                self._stats.classes_out = dict(self._counter.by_class_out)
-                self._stats.counting_mode = self._counter.mode
 
                 # TLC fixed-cycle is display-only; we intentionally do not compute
                 # any per-frame TLC queue/approach inference here.
@@ -1304,12 +1269,7 @@ class StreamService:
                 _s = self._stats
                 stats_dict = {
                     "total": int(self._counter.total),
-                    "count_in": int(self._counter.count_in),
-                    "count_out": int(self._counter.count_out),
                     "classes": dict(self._counter.by_class),
-                    "classes_in": dict(self._counter.by_class_in),
-                    "classes_out": dict(self._counter.by_class_out),
-                    "counting_mode": _s.counting_mode,
                     "fps": _s.fps,
                     "fps_capture": _s.fps_capture,
                     "fps_inference": _s.fps_inference,
@@ -1670,12 +1630,7 @@ class StreamService:
                         "stream_active": True,
                         "lane_stats": {
                             "total": int(self._companion_counter.total),
-                            "count_in": int(self._companion_counter.count_in),
-                            "count_out": int(self._companion_counter.count_out),
                             "classes": dict(self._companion_counter.by_class),
-                            "classes_in": dict(self._companion_counter.by_class_in),
-                            "classes_out": dict(self._companion_counter.by_class_out),
-                            "counting_mode": self._companion_counter.mode,
                             "line_position": (float(companion_line_y) / float(max(frame_h, 1))),
                             "roi_active": _companion_roi_on,
                             "roi_count": int(_last_companion_active_count) if _companion_roi_on else 0,
@@ -1826,7 +1781,6 @@ class StreamService:
             try:
                 if s not in self._extra_counters:
                     ec = VehicleCounter()
-                    ec.set_mode(self._counter.mode)
                     self._extra_counters[s] = ec
                 if s not in self._extra_roi_counters:
                     self._extra_roi_counters[s] = RoiCounter()
@@ -2085,11 +2039,7 @@ class StreamService:
 
                 self._counter.update(active_tracks, line_y)
                 self._stats.total = self._counter.total
-                self._stats.count_in = self._counter.count_in
-                self._stats.count_out = self._counter.count_out
                 self._stats.classes = dict(self._counter.by_class)
-                self._stats.classes_in = dict(self._counter.by_class_in)
-                self._stats.classes_out = dict(self._counter.by_class_out)
 
                 # Congestion — video file mode (tracks always fresh per frame)
                 _vid_cong = self._congestion.update(len(active_tracks))
@@ -2146,12 +2096,7 @@ class StreamService:
                 _vc = _s.congestion
                 stats_dict = {
                     "total": int(_s.total),
-                    "count_in": int(_s.count_in),
-                    "count_out": int(_s.count_out),
                     "classes": dict(_s.classes),
-                    "classes_in": dict(_s.classes_in),
-                    "classes_out": dict(_s.classes_out),
-                    "counting_mode": _s.counting_mode,
                     "fps": _s.fps,
                     "fps_capture": 0.0,
                     "fps_inference": 0.0,
@@ -2218,12 +2163,7 @@ class StreamService:
                     _vc = _s.congestion
                     end_stats = {
                         "total": int(_s.total),
-                        "count_in": int(_s.count_in),
-                        "count_out": int(_s.count_out),
                         "classes": dict(_s.classes),
-                        "classes_in": dict(_s.classes_in),
-                        "classes_out": dict(_s.classes_out),
-                        "counting_mode": _s.counting_mode,
                         "fps": 0.0,
                         "fps_capture": 0.0,
                         "fps_inference": 0.0,

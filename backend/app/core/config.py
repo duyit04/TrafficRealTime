@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     CONF_THRESHOLD: float = 0.35
     LINE_POSITION: float = 0.55
     MAX_FPS: int = 30
-    TRACKER_TYPE: str = "bytetrack"  # bytetrack | botsort | sort | deepsort
+    TRACKER_TYPE: str = "bytetrack"  # bytetrack | sort | deepsort
 
     # YOLO: prefer GPU (cuda:0). Falls back to CPU with a log line if CUDA is unavailable.
     YOLO_DEVICE: str = "cuda"
