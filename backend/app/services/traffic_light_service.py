@@ -348,7 +348,7 @@ class DisplayOnlyTrafficLightService:
           (elapsed tăng tự nhiên trong flash → tự trừ 1-2s khỏi countdown cố định)
         - Hình tròn (advice_peak_sec): giá trị gợi ý lớn nhất pha này
         """
-        _FLASH_SEC = 1.5
+        _FLASH_SEC = 0.5
         default_g = float(getattr(settings, "TLC_ADVICE_NO_DEMAND_SECONDS", 30.0) or 30.0)
         now = time.monotonic()
         sub = self._movement_substate
@@ -364,6 +364,7 @@ class DisplayOnlyTrafficLightService:
             self._ui_prev_demand_any = False
             return
 
+        wai_demand = False
         if sub in ("green", "yellow") and self._stream_live and self._advice_enabled:
             wai = int(1 - ap)
 
@@ -381,11 +382,13 @@ class DisplayOnlyTrafficLightService:
 
             # Flash và peak chỉ phản ánh xe pha chờ → đồng bộ với Dừng ROI bên dưới
             if wai_demand:
-                if not self._ui_prev_demand_any or float(g_nom) > float(self._ui_flash_value) + 0.5:
+                if not self._ui_prev_demand_any or abs(float(g_nom) - float(self._ui_flash_value)) > 0.5:
                     self._ui_flash_until = float(now) + _FLASH_SEC
                     self._ui_flash_value = float(g_nom)
                 if float(g_nom) > float(self._ui_phase_peak_sec) + 0.5:
                     self._ui_phase_peak_sec = float(g_nom)
+            else:
+                self._ui_flash_until = 0.0  # xe rời ROI → clear flash ngay, không để trailing
 
             is_flashing = float(now) < float(self._ui_flash_until)
             peak = float(self._ui_phase_peak_sec)
@@ -400,16 +403,16 @@ class DisplayOnlyTrafficLightService:
 
                 if sub == "green":
                     if idx == wai:
-                        # Pha chờ: countdown 30s cố định; nháy gợi ý khi flash; badge = max gợi ý
+                        # Pha chờ: countdown cố định 30s; nháy giây gợi ý khi flash
                         p.advice_countdown = "green"
                         if is_flashing:
-                            p.green_time = float(self._ui_flash_value)
+                            p.green_time = float(g_nom)  # dùng g_nom hiện tại thay vì giá trị lúc trigger
                             p.advice_flash = True
                         else:
                             p.green_time = max(0.0, default_g - elapsed_g)
                         p.advice_peak_sec = peak
                     elif idx == ap:
-                        # Pha đang xanh: đếm ngược đỏ; badge = gợi ý đỏ tương ứng (G_wait + vàng)
+                        # Pha đang xanh: đếm ngược đỏ cố định; badge = gợi ý tương ứng
                         p.advice_countdown = "red"
                         p.red_time_hint = max(0.0, default_g - elapsed_g) + float(self._yellow_seconds)
                         if peak > 0.0:
@@ -421,10 +424,10 @@ class DisplayOnlyTrafficLightService:
                         p.advice_countdown = "red"
                         p.red_time_hint = y_rem
                     else:
-                        # Pha sắp xanh: giữ badge peak để thấy gợi ý sắp nhận
+                        # Pha sắp xanh: badge = 3s vàng (max của countdown vàng)
                         p.advice_countdown = "yellow"
                         p.green_time = y_rem
-                        p.advice_peak_sec = peak
+                        p.advice_peak_sec = float(self._yellow_seconds)
 
         self._ui_prev_movement_substate = sub
         self._ui_prev_demand_any = bool(wai_demand)
@@ -473,6 +476,11 @@ class DisplayOnlyTrafficLightService:
                                         self._pending_next_green = 1 - self._active_phase
                                         self._phase_started_at = now
                                         elapsed = 0.0
+                                        # Reset flash/peak vì wai đổi → pha chờ mới bắt đầu fresh
+                                        self._ui_flash_until = 0.0
+                                        self._ui_flash_value = 0.0
+                                        self._ui_phase_peak_sec = 0.0
+                                        self._ui_prev_demand_any = False
 
                                 # Timing cố định — gợi ý chỉ hiển thị advisory, không ảnh hưởng độ dài pha
                                 self._green_seconds = no_demand_g
@@ -513,7 +521,19 @@ class DisplayOnlyTrafficLightService:
             note = "Cần vẽ ROI cho cả 2 camera đã gán để bật gợi ý."
         self._state.lane_density_advice.note = note
 
-        q0, q1 = self._effective_queues_locked()
+        # Đọc obs một lần duy nhất — dùng cho cả q0/q1 (tính gợi ý) lẫn queue_length (hiển thị)
+        # để tránh race condition: stream worker update giữa 2 lần đọc → flash 26s nhưng hiện 1 xe
+        with self._obs_lock:
+            obs_snapshot = dict(self._obs_by_slot)
+        now_mono = time.monotonic()
+        qs: list[int] = []
+        for idx in range(2):
+            slot = self._phase_slot[idx] if idx < len(self._phase_slot) else "primary"
+            obs = obs_snapshot.get(slot)
+            stale = obs is None or (now_mono - float(obs.updated_at)) > 2.0
+            qs.append(0 if stale else int(obs.stopped_count))
+        q0, q1 = qs[0], qs[1]
+
         demand_here = bool(advice_ready) and self._has_demand_locked(q0, q1)
 
         if not advice_ready or not demand_here:
@@ -526,16 +546,12 @@ class DisplayOnlyTrafficLightService:
         self._phase_green_seconds[0] = float(geff_ui)
         self._phase_green_seconds[1] = float(geff_ui)
 
-        with self._obs_lock:
-            obs_snapshot = dict(self._obs_by_slot)
         for idx, p in enumerate(self._state.phases[:2]):
             p.phase_id = idx
             slot = self._phase_slot[idx] if idx < len(self._phase_slot) else "primary"
             obs = obs_snapshot.get(slot)
-            stale = True
-            if obs is not None:
-                stale = (time.monotonic() - float(obs.updated_at)) > 2.0
-            p.queue_length = 0 if (obs is None or stale) else int(obs.stopped_count)
+            stale = obs is None or (now_mono - float(obs.updated_at)) > 2.0
+            p.queue_length = 0 if stale else int(obs.stopped_count)
             p.approaching_count = 0
             p.avg_wait = 0.0
 
