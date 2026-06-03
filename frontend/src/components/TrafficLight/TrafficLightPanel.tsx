@@ -180,8 +180,12 @@ function TrafficLightVisual({
               : 'bg-emerald-500'
           : 'bg-slate-400';
 
-        const adviceNumCls =
-          adviceKind === 'green'
+        const isFlash = Boolean(p.advice_flash);
+
+        // Màu số đếm ngược: khi đang nháy gợi ý dùng cyan để dễ nhận biết
+        const adviceNumCls = isFlash
+          ? 'text-cyan-300'
+          : adviceKind === 'green'
             ? 'text-emerald-400'
             : adviceKind === 'yellow'
               ? 'text-amber-300'
@@ -230,7 +234,7 @@ function TrafficLightVisual({
                   }
                   aria-hidden
                 />
-                {showAdvice ? (
+                {showAdvice && badgeSuggestedSec > 0 && adviceKind !== 'yellow' ? (
                   <span
                     className={`text-[11px] font-black tabular-nums leading-none ${suggestedLabelCls}`}
                     title={badgeTitle}

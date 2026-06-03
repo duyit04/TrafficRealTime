@@ -190,6 +190,8 @@ export interface TLPhase {
   advice_countdown?: '' | 'green' | 'yellow' | 'red';
   /** Giây gợi ý cố định (nhãn cạnh chấm tròn, không đếm ngược) */
   advice_peak_sec?: number;
+  /** True trong khoảng nháy gợi ý (~1.5s) — hiển thị màu riêng */
+  advice_flash?: boolean;
   queue_length?: number;
 }
 

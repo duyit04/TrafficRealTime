@@ -83,6 +83,11 @@ class DisplayOnlyTrafficLightService:
         self._ui_prev_demand_any: bool = False
         self._ui_post_cycle_rolled: bool = False
 
+        # Flash advisory: nháy số giây gợi ý rồi về countdown cố định 30s
+        self._ui_flash_until: float = 0.0      # thời điểm hết flash (monotonic)
+        self._ui_flash_value: float = 0.0      # giá trị gợi ý hiện trong flash
+        self._ui_phase_peak_sec: float = 0.0   # giá trị gợi ý lớn nhất pha này (cho hình tròn)
+
         self._start_ticker()
         with self._state_lock:
             self._sync_state_locked()
@@ -244,19 +249,15 @@ class DisplayOnlyTrafficLightService:
         self._movement_substate = "green"
         self._phase_started_at = float(now)
         self._state.yellow_phase_id = None
-        advice_ok = self._advice_ready_locked()
-        demand_here = advice_ok and self._has_demand_locked(q0, q1)
-        if demand_here:
-            wix = int(1 - nh)
-            geff = self._coupled_green_duration(wix, nh, q0, q1)
-        else:
-            geff = float(
-                getattr(settings, "TLC_ADVICE_NO_DEMAND_SECONDS", 30.0) or 30.0
-            )
-        self._green_seconds = float(geff)
-        self._phase_green_seconds[0] = float(geff)
-        self._phase_green_seconds[1] = float(geff)
-        self._arm_ui_advice_cycle_locked(float(geff), int(nh), float(now))
+        no_demand_g = float(getattr(settings, "TLC_ADVICE_NO_DEMAND_SECONDS", 30.0) or 30.0)
+        self._green_seconds = no_demand_g
+        self._phase_green_seconds[0] = no_demand_g
+        self._phase_green_seconds[1] = no_demand_g
+        # Reset flash/peak cho pha mới
+        self._ui_flash_until = 0.0
+        self._ui_flash_value = 0.0
+        self._ui_phase_peak_sec = 0.0
+        self._ui_prev_demand_any = False
 
     def _coupled_green_duration(self, waiting_phase: int, serving_phase: int, q0: int, q1: int) -> float:
         """
@@ -321,6 +322,9 @@ class DisplayOnlyTrafficLightService:
         self._ui_prev_movement_substate = ""
         self._ui_prev_demand_any = False
         self._ui_post_cycle_rolled = False
+        self._ui_flash_until = 0.0
+        self._ui_flash_value = 0.0
+        self._ui_phase_peak_sec = 0.0
 
     def _arm_ui_advice_cycle_locked(self, g_sec: float, active_phase: int, now: float) -> None:
         self._ui_cycle_g_sec = float(max(0.0, g_sec))
@@ -338,15 +342,17 @@ class DisplayOnlyTrafficLightService:
         demand_here: bool,
     ) -> None:
         """
-        Một mốc thời gian từ lúc bắt đầu xanh (ui_cycle_anchor):
-        - Pha chờ: G → vàng (cuối chu kỳ gợi ý, không nhảy lại 3s khi đèn mô phỏng vàng)
-        - Pha phục vụ: luôn gợi ý R (red_time_hint)
+        Gợi ý advisory — không điều khiển timing thực:
+        - Countdown luôn là (default_g − elapsed) cố định 30s
+        - Khi xe vào ROI: nháy số giây gợi ý _FLASH_SEC giây rồi về countdown cố định
+          (elapsed tăng tự nhiên trong flash → tự trừ 1-2s khỏi countdown cố định)
+        - Hình tròn (advice_peak_sec): giá trị gợi ý lớn nhất pha này
         """
+        _FLASH_SEC = 1.5
         default_g = float(getattr(settings, "TLC_ADVICE_NO_DEMAND_SECONDS", 30.0) or 30.0)
         now = time.monotonic()
-        sub = str(self._movement_substate)
+        sub = self._movement_substate
         ap = int(self._active_phase)
-        prev_sub = str(self._ui_prev_movement_substate)
 
         if not advice_ready:
             for p in self._state.phases[:2]:
@@ -354,105 +360,74 @@ class DisplayOnlyTrafficLightService:
                 p.red_time_hint = 0.0
                 p.advice_countdown = ""
                 p.advice_peak_sec = default_g
+            self._ui_prev_movement_substate = sub
+            self._ui_prev_demand_any = False
             return
 
         if sub in ("green", "yellow") and self._stream_live and self._advice_enabled:
             wai = int(1 - ap)
+
+            # Chỉ dùng xe của pha đang chờ (đỏ) để tính gợi ý và trigger flash.
+            # demand_here (combined) có thể True khi chỉ pha xanh có xe → set _ui_prev_demand_any=True
+            # trước khi pha đỏ có xe → flash bị chặn. Dùng q_wai riêng để tránh lỗi này.
+            q_wai = int(q0 if wai == 0 else q1)
+            wai_demand = advice_ready and q_wai > 0
+
             g_nom = (
                 self._coupled_green_duration(wai, ap, q0, q1)
-                if demand_here
+                if wai_demand
                 else default_g
             )
 
-            # Cập nhật g_sec theo xe trong ROI:
-            # - Có xe: chỉ tăng (lấy max), không giảm khi bớt xe giữa pha
-            # - Hết xe (q=0): về lại default
-            if self._ui_cycle_armed and sub == "green" and self._ui_cycle_active_phase == ap:
-                if demand_here:
-                    if not self._ui_prev_demand_any:
-                        # Xe vừa xuất hiện: bắt đầu fresh từ giá trị xe, không so với 30s
-                        self._ui_cycle_g_sec = float(max(0.0, g_nom))
-                        self._ui_cycle_anchor_started_at = float(now)
-                        self._ui_post_cycle_rolled = False
-                    elif g_nom > float(self._ui_cycle_g_sec) + 0.5:
-                        # Thêm xe: chỉ tăng (lấy max)
-                        self._ui_cycle_g_sec = float(max(0.0, g_nom))
-                        self._ui_cycle_anchor_started_at = float(now)
-                        self._ui_post_cycle_rolled = False
-                else:
-                    if abs(float(self._ui_cycle_g_sec) - default_g) > 0.5:
-                        self._ui_cycle_g_sec = default_g
+            # Flash và peak chỉ phản ánh xe pha chờ → đồng bộ với Dừng ROI bên dưới
+            if wai_demand:
+                if not self._ui_prev_demand_any or float(g_nom) > float(self._ui_flash_value) + 0.5:
+                    self._ui_flash_until = float(now) + _FLASH_SEC
+                    self._ui_flash_value = float(g_nom)
+                if float(g_nom) > float(self._ui_phase_peak_sec) + 0.5:
+                    self._ui_phase_peak_sec = float(g_nom)
 
-            need_arm = (
-                not self._ui_cycle_armed
-                or (sub == "green" and prev_sub == "yellow")
-                or self._ui_cycle_active_phase != ap
-            )
-            if need_arm and sub == "green":
-                self._arm_ui_advice_cycle_locked(g_nom, ap, now)
+            is_flashing = float(now) < float(self._ui_flash_until)
+            peak = float(self._ui_phase_peak_sec)
+            elapsed_g = max(0.0, float(now) - float(self._phase_started_at))
 
-            if self._ui_cycle_armed:
-                g = float(self._ui_cycle_g_sec)
-                y = float(self._ui_cycle_yellow_sec)
-                srv = int(self._ui_cycle_active_phase)
-                wai = int(1 - srv)
-                total_r = g + y
+            for idx, p in enumerate(self._state.phases[:2]):
+                p.green_time = 0.0
+                p.red_time_hint = 0.0
+                p.advice_countdown = ""
+                p.advice_peak_sec = 0.0
+                p.advice_flash = False
 
-                # Một đồng hồ duy nhất — không reset khi mô phỏng sang vàng (tránh nhảy lại 3s vàng).
-                elapsed = max(
-                    0.0, float(now) - float(self._ui_cycle_anchor_started_at)
-                )
-
-                # Hết G+vàng gợi ý → bắt chu kỳ kế ngay (không kẹt 0/0).
-                if elapsed >= g + y - 1e-6 and not self._ui_post_cycle_rolled:
-                    nh = self._pick_next_green_after_all_red_locked(q0, q1)
-                    oth = int(1 - nh)
-                    g_roll = (
-                        self._coupled_green_duration(oth, nh, q0, q1)
-                        if demand_here
-                        else default_g
-                    )
-                    self._arm_ui_advice_cycle_locked(g_roll, int(nh), now)
-                    self._ui_post_cycle_rolled = True
-                    g = float(self._ui_cycle_g_sec)
-                    y = float(self._ui_cycle_yellow_sec)
-                    srv = int(self._ui_cycle_active_phase)
-                    wai = int(1 - srv)
-                    total_r = g + y
-                    elapsed = 0.0
-
-                y_el = max(0.0, float(now) - float(self._phase_started_at))
-                y_rem = max(0.0, float(self._yellow_seconds) - y_el)
-
-                for idx, p in enumerate(self._state.phases[:2]):
-                    p.green_time = 0.0
-                    p.red_time_hint = 0.0
-                    p.advice_countdown = ""
-
-                    if sub == "yellow":
-                        if int(idx) == ap:
-                            # Đỏ tiếp tục 3→0 (phần cuối của total_r)
-                            p.advice_countdown = "red"
-                            p.red_time_hint = y_rem
-                            # Dùng _green_seconds + yellow thay vì total_r (tránh sai khi roll-over đã fire)
-                            p.advice_peak_sec = float(self._green_seconds) + float(self._yellow_seconds)
-                        else:
-                            # Xanh hết 30s → chạy tiếp 3s vàng
-                            p.advice_countdown = "yellow"
-                            p.green_time = y_rem
-                            p.advice_peak_sec = float(self._yellow_seconds)
-                    elif int(idx) == srv:
-                        # Đỏ: total_r→0 (33→3 trong xanh, rồi 3→0 trong yellow)
-                        p.advice_countdown = "red"
-                        p.red_time_hint = float(max(0.0, total_r - elapsed))
-                        p.advice_peak_sec = float(total_r)
-                    elif int(idx) == wai:
-                        # Xanh: g→0 (30→0), về 0 đúng lúc yellow bắt đầu
+                if sub == "green":
+                    if idx == wai:
+                        # Pha chờ: countdown 30s cố định; nháy gợi ý khi flash; badge = max gợi ý
                         p.advice_countdown = "green"
-                        p.green_time = float(max(0.0, g - elapsed))
-                        p.advice_peak_sec = float(g)
+                        if is_flashing:
+                            p.green_time = float(self._ui_flash_value)
+                            p.advice_flash = True
+                        else:
+                            p.green_time = max(0.0, default_g - elapsed_g)
+                        p.advice_peak_sec = peak
+                    elif idx == ap:
+                        # Pha đang xanh: đếm ngược đỏ; badge = gợi ý đỏ tương ứng (G_wait + vàng)
+                        p.advice_countdown = "red"
+                        p.red_time_hint = max(0.0, default_g - elapsed_g) + float(self._yellow_seconds)
+                        if peak > 0.0:
+                            p.advice_peak_sec = peak + float(self._yellow_seconds)
+
+                elif sub == "yellow":
+                    y_rem = max(0.0, float(self._yellow_seconds) - elapsed_g)
+                    if idx == ap:
+                        p.advice_countdown = "red"
+                        p.red_time_hint = y_rem
+                    else:
+                        # Pha sắp xanh: giữ badge peak để thấy gợi ý sắp nhận
+                        p.advice_countdown = "yellow"
+                        p.green_time = y_rem
+                        p.advice_peak_sec = peak
+
         self._ui_prev_movement_substate = sub
-        self._ui_prev_demand_any = bool(demand_here)
+        self._ui_prev_demand_any = bool(wai_demand)
 
     def _apply_advice_display_colors_locked(self) -> None:
         """
@@ -494,24 +469,15 @@ class DisplayOnlyTrafficLightService:
                                 if demand_here:
                                     must = self._strict_row_phase_for_queues_locked(q0, q1)
                                     if must is not None and int(must) != int(self._active_phase):
-                                        # Chỉ reset timer khi pha thực sự chuyển, không reset khi số xe thay đổi
                                         self._active_phase = int(must)
                                         self._pending_next_green = 1 - self._active_phase
                                         self._phase_started_at = now
                                         elapsed = 0.0
 
-                                    srv = int(self._active_phase)
-                                    wai = int(1 - srv)
-                                    geff = self._coupled_green_duration(wai, srv, q0, q1)
-                                    self._phase_green_seconds[0] = geff
-                                    self._phase_green_seconds[1] = geff
-                                    elapsed_g = max(0.0, now - self._phase_started_at)
-                                    hi = float(settings.TLC_MAX_GREEN)
-                                    self._green_seconds = float(min(hi, max(elapsed_g, geff)))
-                                else:
-                                    self._green_seconds = no_demand_g
-                                    self._phase_green_seconds[0] = no_demand_g
-                                    self._phase_green_seconds[1] = no_demand_g
+                                # Timing cố định — gợi ý chỉ hiển thị advisory, không ảnh hưởng độ dài pha
+                                self._green_seconds = no_demand_g
+                                self._phase_green_seconds[0] = no_demand_g
+                                self._phase_green_seconds[1] = no_demand_g
 
                                 if elapsed >= self._green_seconds:
                                     self._movement_substate = "yellow"

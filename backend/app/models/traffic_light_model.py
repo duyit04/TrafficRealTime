@@ -117,6 +117,8 @@ class TrafficLightPhase(BaseModel):
     advice_countdown: str = ""
     # Giây gợi ý cố định (nhãn cạnh chấm tròn — không đếm ngược)
     advice_peak_sec: float = 0.0
+    # True trong khoảng nháy gợi ý (1-2s) — frontend dùng màu khác để dễ nhận biết
+    advice_flash: bool = False
     queue_length: int = 0               # stopped / waiting vehicles (for TLC decisions)
     approaching_count: int = 0        # moving vehicles in approach (extension heuristic)
     avg_wait: float = 0.0               # max observed wait on stopped tracks (s)
