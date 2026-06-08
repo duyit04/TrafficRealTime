@@ -198,6 +198,18 @@ async def websocket_companion(ws: WebSocket) -> None:
         ws_companion_manager.disconnect(ws)
 
 
+async def _h264_ws_hold(ws: WebSocket) -> None:
+    """
+    Keep an H264 WebSocket open. mpegts.js expects binary MPEG-TS only —
+    do not send text/JSON pings on this channel (causes TransmuxingController errors).
+    """
+    while True:
+        try:
+            await asyncio.wait_for(ws.receive(), timeout=30.0)
+        except asyncio.TimeoutError:
+            continue
+
+
 @router.websocket("/ws/stream-h264")
 async def websocket_stream_h264(ws: WebSocket) -> None:
     """
@@ -207,14 +219,7 @@ async def websocket_stream_h264(ws: WebSocket) -> None:
     mgr = ws_h264_manager
     await mgr.connect(ws)
     try:
-        while True:
-            try:
-                await asyncio.wait_for(ws.receive_text(), timeout=30.0)
-            except asyncio.TimeoutError:
-                try:
-                    await ws.send_text('{"ping":1}')
-                except Exception:
-                    break
+        await _h264_ws_hold(ws)
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -235,14 +240,7 @@ async def websocket_stream_h264_slot(ws: WebSocket, slot: str) -> None:
     mgr = get_h264_manager(slot)
     await mgr.connect(ws)
     try:
-        while True:
-            try:
-                await asyncio.wait_for(ws.receive_text(), timeout=30.0)
-            except asyncio.TimeoutError:
-                try:
-                    await ws.send_text('{"ping":1}')
-                except Exception:
-                    break
+        await _h264_ws_hold(ws)
     except WebSocketDisconnect:
         pass
     except Exception as e:

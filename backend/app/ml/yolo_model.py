@@ -20,6 +20,9 @@ import numpy as np
 from app.core.config import settings
 from app.core.logger import logger
 
+# After ByteTrack Kalman failure: fallback to predict() only (no track_id) for this many seconds.
+_TRACKER_BROKEN_COOLDOWN_S = 1.0
+
 
 def is_tracker_kalman_error(exc: BaseException) -> bool:
     """ByteTrack/BoT-SORT Kalman filter can throw when covariance goes singular."""
@@ -295,11 +298,12 @@ class YOLOModel:
                     if now2 - self._tracker_err_log_ts > 5.0:
                         self._tracker_err_log_ts = now2
                         logger.warning(
-                            "YOLOModel: tracker state error (%s), resetting — will use predict() for 3s",
+                            "YOLOModel: tracker state error (%s), resetting — will use predict() for %.1fs",
                             e,
+                            _TRACKER_BROKEN_COOLDOWN_S,
                         )
                     self.reset_tracker()
-                    self._tracker_broken_until = _time.monotonic() + 3.0
+                    self._tracker_broken_until = _time.monotonic() + _TRACKER_BROKEN_COOLDOWN_S
                     return self.predict(frame, conf)
                 else:
                     retry_imgsz = self._extract_engine_max_imgsz(e)
