@@ -28,6 +28,7 @@ from app.services.ffmpeg_rtsp_decode import (
     cuda_decoder_before_input,
     cuda_hwaccel_before_input,
     ffmpeg_cuda_required,
+    file_demuxer_flags,
     resolve_ffmpeg_bin,
     rtsp_capture_timeout_flags,
     rtsp_demuxer_flags,
@@ -35,8 +36,23 @@ from app.services.ffmpeg_rtsp_decode import (
 
 _PROBE_CACHE: dict[str, tuple[tuple[int, int], float]] = {}
 _CODEC_CACHE: dict[str, tuple[str | None, float]] = {}
+_FPS_CACHE: dict[str, tuple[float, float]] = {}
 _PROBE_CACHE_LOCK = threading.Lock()
 _PROBE_TTL_SEC = 120.0
+
+
+def _is_file_source(url: str) -> bool:
+    u = (url or "").strip()
+    if not u:
+        return False
+    lu = u.lower()
+    if lu.startswith("rtsp://") or lu.startswith("rtsps://"):
+        return False
+    if lu.startswith("file://"):
+        return True
+    if os.path.isfile(u):
+        return True
+    return os.path.isfile(os.path.abspath(u))
 
 _live_slots_in_use = 0
 _live_slots_lock = threading.Lock()
@@ -58,16 +74,17 @@ def _max_concurrent_thumb_ffmpeg() -> int:
         return 1
 
 
-def _probe_size_cached(url: str, ffprobe_bin: str) -> tuple[int, int] | None:
+def _probe_size_cached(url: str, ffprobe_bin: str, *, is_file: bool = False) -> tuple[int, int] | None:
+    cache_key = f"{'file' if is_file else 'rtsp'}:{url}"
     now = time.time()
     with _PROBE_CACHE_LOCK:
-        hit = _PROBE_CACHE.get(url)
+        hit = _PROBE_CACHE.get(cache_key)
         if hit and (now - hit[1]) < _PROBE_TTL_SEC:
             return hit[0]
-    size = _probe_size(url, ffprobe_bin)
+    size = _probe_size(url, ffprobe_bin, is_file=is_file)
     if size is not None:
         with _PROBE_CACHE_LOCK:
-            _PROBE_CACHE[url] = (size, now)
+            _PROBE_CACHE[cache_key] = (size, now)
     return size
 
 
@@ -85,27 +102,40 @@ def _resolve_ffprobe_bin(ffmpeg_bin: str) -> str:
     return ""
 
 
-def _probe_codec_cached(url: str, ffprobe_bin: str) -> str | None:
+def _probe_codec_cached(url: str, ffprobe_bin: str, *, is_file: bool = False) -> str | None:
+    cache_key = f"{'file' if is_file else 'rtsp'}:{url}"
     now = time.time()
     with _PROBE_CACHE_LOCK:
-        hit = _CODEC_CACHE.get(url)
+        hit = _CODEC_CACHE.get(cache_key)
         if hit and (now - hit[1]) < _PROBE_TTL_SEC:
             return hit[0]
-    codec = _probe_codec(url, ffprobe_bin)
+    codec = _probe_codec(url, ffprobe_bin, is_file=is_file)
     with _PROBE_CACHE_LOCK:
-        _CODEC_CACHE[url] = (codec, now)
+        _CODEC_CACHE[cache_key] = (codec, now)
     return codec
 
 
-def _probe_codec(url: str, ffprobe_bin: str) -> str | None:
+def _probe_fps_cached(url: str, ffprobe_bin: str, *, is_file: bool = False) -> float | None:
+    cache_key = f"{'file' if is_file else 'rtsp'}:{url}"
+    now = time.time()
+    with _PROBE_CACHE_LOCK:
+        hit = _FPS_CACHE.get(cache_key)
+        if hit and (now - hit[1]) < _PROBE_TTL_SEC:
+            return hit[0]
+    fps = _probe_fps(url, ffprobe_bin, is_file=is_file)
+    if fps is not None:
+        with _PROBE_CACHE_LOCK:
+            _FPS_CACHE[cache_key] = (fps, now)
+    return fps
+
+
+def _probe_codec(url: str, ffprobe_bin: str, *, is_file: bool = False) -> str | None:
     if not ffprobe_bin:
         return None
-    cmd = [
-        ffprobe_bin,
-        "-v",
-        "error",
-        "-rtsp_transport",
-        "tcp",
+    cmd = [ffprobe_bin, "-v", "error"]
+    if not is_file:
+        cmd.extend(["-rtsp_transport", "tcp"])
+    cmd += [
         "-select_streams",
         "v:0",
         "-show_entries",
@@ -123,15 +153,57 @@ def _probe_codec(url: str, ffprobe_bin: str) -> str | None:
     return None
 
 
-def _probe_size(url: str, ffprobe_bin: str) -> tuple[int, int] | None:
+def _parse_frame_rate(text: str) -> float | None:
+    raw = (text or "").strip().splitlines()[0].strip()
+    if not raw or raw in {"0/0", "N/A"}:
+        return None
+    if "/" in raw:
+        num_s, den_s = raw.split("/", 1)
+        try:
+            num = float(num_s)
+            den = float(den_s)
+            if den > 0:
+                fps = num / den
+                return fps if fps > 0 else None
+        except ValueError:
+            return None
+    try:
+        fps = float(raw)
+        return fps if fps > 0 else None
+    except ValueError:
+        return None
+
+
+def _probe_fps(url: str, ffprobe_bin: str, *, is_file: bool = False) -> float | None:
     if not ffprobe_bin:
         return None
-    cmd = [
-        ffprobe_bin,
-        "-v",
-        "error",
-        "-rtsp_transport",
-        "tcp",
+    cmd = [ffprobe_bin, "-v", "error"]
+    if not is_file:
+        cmd.extend(["-rtsp_transport", "tcp"])
+    cmd += [
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=r_frame_rate",
+        "-of",
+        "csv=p=0",
+        url,
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=12)
+        return _parse_frame_rate(out.decode("utf-8", errors="ignore"))
+    except Exception as e:
+        logger.debug("ffprobe fps failed: %s", e)
+    return None
+
+
+def _probe_size(url: str, ffprobe_bin: str, *, is_file: bool = False) -> tuple[int, int] | None:
+    if not ffprobe_bin:
+        return None
+    cmd = [ffprobe_bin, "-v", "error"]
+    if not is_file:
+        cmd.extend(["-rtsp_transport", "tcp"])
+    cmd += [
         "-select_streams",
         "v:0",
         "-show_entries",
@@ -189,8 +261,10 @@ class FFmpegRtspCapture:
     ) -> None:
         self._url = (url or "").strip()
         self._label = (label or "live").strip()
+        self._is_file = _is_file_source(self._url)
         self._use_live_slot = bool(use_live_slot)
         self._pipe_max_width = int(pipe_max_width) if pipe_max_width else None
+        self._fps = 25.0
         self._slot_acquired = False
         self._proc: Optional[subprocess.Popen] = None
         self._stderr_t: Optional[threading.Thread] = None
@@ -222,8 +296,11 @@ class FFmpegRtspCapture:
         vf_variant: str = "scale_cuda",
     ) -> list[str]:
         cmd: list[str] = [ffmpeg_bin]
-        cmd.extend(rtsp_demuxer_flags())
-        cmd.extend(rtsp_capture_timeout_flags())
+        if self._is_file:
+            cmd.extend(file_demuxer_flags())
+        else:
+            cmd.extend(rtsp_demuxer_flags())
+            cmd.extend(rtsp_capture_timeout_flags())
         if use_cuda:
             device_frames = vf_variant not in {"sysmem"}
             cmd.extend(cuda_hwaccel_before_input(device_frames=device_frames))
@@ -329,7 +406,11 @@ class FFmpegRtspCapture:
             time.sleep(0.05)
 
         if not _data_event.is_set():
-            self._last_error = "FFmpeg no data within 9s — RTSP timeout or bad URL"
+            self._last_error = (
+                "FFmpeg no data within 9s — file unreadable or codec unsupported"
+                if self._is_file
+                else "FFmpeg no data within 9s — RTSP timeout or bad URL"
+            )
             self._kill_proc(proc)
             self._stderr_t = None
             return False
@@ -402,11 +483,24 @@ class FFmpegRtspCapture:
         # Run ffprobe size + codec in parallel to halve probe time on first connect.
         import concurrent.futures as _cf
         ffprobe_bin = _resolve_ffprobe_bin(ffmpeg_bin)
-        with _cf.ThreadPoolExecutor(max_workers=2) as _ex:
-            _f_size = _ex.submit(_probe_size_cached, self._url, ffprobe_bin)
-            _f_codec = _ex.submit(_probe_codec_cached, self._url, ffprobe_bin)
+        with _cf.ThreadPoolExecutor(max_workers=3) as _ex:
+            _f_size = _ex.submit(
+                _probe_size_cached, self._url, ffprobe_bin, is_file=self._is_file
+            )
+            _f_codec = _ex.submit(
+                _probe_codec_cached, self._url, ffprobe_bin, is_file=self._is_file
+            )
+            _f_fps = (
+                _ex.submit(_probe_fps_cached, self._url, ffprobe_bin, is_file=True)
+                if self._is_file
+                else None
+            )
             size = _f_size.result()
             codec_name = _f_codec.result()
+            if _f_fps is not None:
+                probed_fps = _f_fps.result()
+                if probed_fps and probed_fps > 0:
+                    self._fps = float(probed_fps)
 
         if size is None:
             try:
@@ -641,3 +735,6 @@ class FFmpegRtspCapture:
 
     def set(self, prop: int, value: float) -> bool:
         return False
+
+    def get_fps(self) -> float:
+        return float(self._fps or 25.0)

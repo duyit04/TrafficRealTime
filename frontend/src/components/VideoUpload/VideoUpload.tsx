@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, type ReactNode } from 'react';
 import { mediaApi } from '../../services/api';
 import { H264LivePlayer } from '../VideoPlayer';
 
@@ -7,22 +7,37 @@ interface Props {
   onPlaybackStart: () => void;
   onPlaybackStop: () => void;
   onReloadStats?: () => void;
+  /** Gọi trước khi upload video mới — xoá ROI UI cũ */
+  onPrepareNewVideo?: () => void | Promise<void>;
+  /** ROI canvas overlay — same layer as RTSP live player */
+  roiOverlay?: ReactNode;
 }
 
-export function VideoUpload({ streamActive, onPlaybackStart, onPlaybackStop, onReloadStats }: Props) {
+export function VideoUpload({
+  streamActive,
+  onPlaybackStart,
+  onPlaybackStop,
+  onReloadStats,
+  onPrepareNewVideo,
+  roiOverlay,
+}: Props) {
   const [running, setRunning] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [fileName, setFileName] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const runningRef = useRef(false);
   const [streamReady, setStreamReady] = useState(false);
   const [videoEnded, setVideoEnded] = useState(false);
+
+  runningRef.current = running;
 
   const handleFile = async (file: File) => {
     setError(null);
     setFileName(file.name);
     setUploading(true);
     try {
+      await onPrepareNewVideo?.();
       await mediaApi.startVideo(file);
       setRunning(true);
       onPlaybackStart();
@@ -73,6 +88,16 @@ export function VideoUpload({ streamActive, onPlaybackStart, onPlaybackStop, onR
     return () => window.clearInterval(id);
   }, [running, streamReady, onReloadStats]);
 
+  // Unmount (e.g. switch to RTSP mode) — stop backend video worker
+  useEffect(() => {
+    return () => {
+      if (runningRef.current) {
+        mediaApi.stopVideo().catch(() => {});
+        onPlaybackStop();
+      }
+    };
+  }, [onPlaybackStop]);
+
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) handleFile(file);
@@ -109,6 +134,7 @@ export function VideoUpload({ streamActive, onPlaybackStart, onPlaybackStop, onR
           placeholderTitle="Chọn video"
           placeholderSubtitle="Bấm để chọn file video"
         />
+        {roiOverlay}
 
         {!running && uploading ? (
           <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 bg-slate-100/90 pointer-events-none">

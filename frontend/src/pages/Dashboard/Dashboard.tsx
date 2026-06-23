@@ -14,11 +14,17 @@ import { CounterPanel } from '../../components/CounterPanel';
 import { CameraWall } from '../../components/CameraWall/CameraWall';
 import { TwinSiblingPanel, getPreviewRefreshMs, getPreviewStaggerMs } from '../../components/TwinSiblingPanel';
 import { TrafficLightPanel } from '../../components/TrafficLight';
-import { modelApi, detectionApi, streamApi, trafficLightApi } from '../../services/api';
+import { modelApi, detectionApi, streamApi, trafficLightApi, mediaApi } from '../../services/api';
 import type { DeviceInfo } from '../../services/api';
 import { ImageDetect } from '../../components/ImageDetect/ImageDetect';
 import { VideoUpload } from '../../components/VideoUpload/VideoUpload';
 import type { ModelInfo, Settings, Toast } from '../../types/detection';
+import {
+  type AppMode,
+  type ModeProfile,
+  loadModeProfiles,
+  saveModeProfiles,
+} from '../../utils/modeSettings';
 
 // ── Camera presets (control room) ─────────────────────────────────────────────
 const CAMERA_PRESETS = [
@@ -51,7 +57,7 @@ export function Dashboard() {
     companionDetections, companionLinePosition, companionCongestion,
     statsBySlot,
     extraLive,
-    startStream, startCompanion, stopCompanion, stopStream, beginPlayback, endPlayback, reloadStats,
+    startStream, startCompanion, stopCompanion, stopStream, beginPlayback, endPlayback, reloadStats, resetSessionStats,
     streamActive: playbackActive,
     setRoi, clearRoi, setRoiSlot, clearRoiSlot, resetCount, updateSettings,
   } = useDetection();
@@ -60,15 +66,12 @@ export function Dashboard() {
   const [connecting, setConnecting]   = useState(false);
   const [streamOn, setStreamOn]       = useState(false);
   const [models, setModels]           = useState<ModelInfo[]>([]);
-  const [settings, setSettings]       = useState<Settings>({
-    conf_threshold: 0.35,
-    line_position: 0.55,
-    max_fps: 30,
-    skip_frames: 0,
-    tracker_type: 'bytetrack',
-    congestion_threshold: 10,
-    congestion_duration: 5,
-  });
+  const [appMode, setAppMode] = useState<AppMode>('rtsp');
+  const [modeProfiles, setModeProfiles] = useState<Record<AppMode, ModeProfile>>(loadModeProfiles);
+  const modeProfilesRef = useRef(modeProfiles);
+  modeProfilesRef.current = modeProfiles;
+  const settings = modeProfiles[appMode].settings;
+  const countingEnabled = modeProfiles[appMode].countingEnabled;
   const [toasts, setToasts]           = useState<Toast[]>([]);
   type RoiSlotKey = 'primary' | 'companion' | 2 | 3;
   type RoiSlotState = { active: boolean; points: RoiPoint[]; drawing: boolean };
@@ -85,7 +88,6 @@ export function Dashboard() {
   const roiCanvasExtra3Ref = useRef<HTMLCanvasElement>(null);
   const connectPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   useEffect(() => () => { if (connectPollRef.current !== null) clearInterval(connectPollRef.current); }, []);
-  const [countingEnabled, setCountingEnabled] = useState(true);
   const [deviceInfo, setDeviceInfo] = useState<DeviceInfo>({ cuda_available: false, device_name: null });
   /** Số màn preview RTSP thêm cạnh luồng chính (0 = chỉ một màn LIVE). */
   const [extraPreviewCount, setExtraPreviewCount] = useState(0);
@@ -100,8 +102,16 @@ export function Dashboard() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [cameraOpen, setCameraOpen] = useState(false);
   const [roiOpen, setRoiOpen] = useState(false);
-  type AppMode = 'rtsp' | 'image' | 'video';
-  const [appMode, setAppMode] = useState<AppMode>('rtsp');
+  const APP_MODE_LABELS: Record<AppMode, string> = {
+    rtsp: 'Camera RTSP',
+    image: 'Detect Ảnh',
+    video: 'Detect Video',
+  };
+  const [modeSwitching, setModeSwitching] = useState(false);
+  const [modeSwitchTarget, setModeSwitchTarget] = useState<AppMode | null>(null);
+  const [modeSwitchStopping, setModeSwitchStopping] = useState(false);
+  /** Tăng mỗi lần vào Detect Ảnh — buộc mount lại component sạch. */
+  const [imageSessionKey, setImageSessionKey] = useState(0);
   const trimmedStream = streamUrl.trim();
   const trafficPhaseRoadLabels = useMemo(
     (): [string, string] => phaseRoadTitlesFromPrimaryUrl(trimmedStream),
@@ -178,6 +188,14 @@ export function Dashboard() {
   /** Thống kê đếm xe — một panel cho mỗi camera đang live. */
   const cameraStatPanels = useMemo(() => {
     const panels: { key: string; label: string; stats: typeof statsForView }[] = [];
+    if (appMode === 'video' && (playbackActive || stats.stream_active)) {
+      panels.push({
+        key: 'video',
+        label: 'Video',
+        stats: statsBySlot.primary ?? statsForView,
+      });
+      return panels;
+    }
     if (streamOn) {
       panels.push({
         key: 'primary',
@@ -214,6 +232,9 @@ export function Dashboard() {
     }
     return panels;
   }, [
+    appMode,
+    playbackActive,
+    stats.stream_active,
     streamOn,
     companionStreamActive,
     isExtra2Live,
@@ -338,10 +359,38 @@ export function Dashboard() {
     modelApi.list().then(setModels).catch(() => {});
   }, []);
 
+  const applyModeSettingsToBackend = useCallback(async (profile: ModeProfile) => {
+    try {
+      await detectionApi.updateSettings(profile.settings);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const patchModeProfile = useCallback(
+    (mode: AppMode, patch: Partial<Settings> & { countingEnabled?: boolean }) => {
+      setModeProfiles((prev) => {
+        const cur = prev[mode];
+        const { countingEnabled: nextCounting, ...settingsPatch } = patch;
+        const nextProfile: ModeProfile = {
+          settings: { ...cur.settings, ...settingsPatch },
+          countingEnabled:
+            typeof nextCounting === 'boolean' ? nextCounting : cur.countingEnabled,
+        };
+        const next = { ...prev, [mode]: nextProfile };
+        saveModeProfiles(next);
+        return next;
+      });
+    },
+    [],
+  );
+
   // Load settings and device (GPU/CPU)
   // Reset toàn bộ backend state về mặc định khi trang load mới (F5 hoặc mở lần đầu)
   useEffect(() => {
-    detectionApi.getSettings().then(setSettings).catch(() => {});
+    const profiles = loadModeProfiles();
+    setModeProfiles(profiles);
+    void applyModeSettingsToBackend(profiles.rtsp);
     reloadModels();
     // Dừng stream nếu vẫn còn chạy (safety net cho trường hợp beforeunload bị bỏ qua)
     streamApi.stop().catch(() => {});
@@ -349,7 +398,7 @@ export function Dashboard() {
     detectionApi.clearRoi().catch(() => {});
     detectionApi.resetStats().catch(() => {});
     trafficLightApi.setAdviceEnabled(false).catch(() => {});
-  }, [reloadModels]);
+  }, [reloadModels, applyModeSettingsToBackend]);
 
   useEffect(() => {
     streamApi.getDevice().then(setDeviceInfo).catch(() => {});
@@ -479,10 +528,73 @@ export function Dashboard() {
     addToast(`ROI (Camera ${slot === 'primary' ? 1 : slot === 'companion' ? 2 : slot === 2 ? 3 : 4}) đã xoá`, 'info');
   }, [addToast, clearRoi, clearRoiSlot]);
 
+  const resetPrimaryRoi = useCallback(() => {
+    setRoiBySlot((prev) => ({
+      ...prev,
+      primary: { active: false, points: [], drawing: false },
+    }));
+  }, []);
+
+  /** Về màn RTSP trống — một camera, chưa chọn URL (sau khi đổi chế độ). */
+  const resetRtspSession = useCallback(() => {
+    if (connectPollRef.current !== null) {
+      clearInterval(connectPollRef.current);
+      connectPollRef.current = null;
+    }
+    setStreamUrl('');
+    setStreamOn(false);
+    setConnecting(false);
+    setExtraPreviewCount(0);
+    setExtraPreviewUrls([]);
+    setAssignExtraIndex(null);
+    setAssignPickedUrl('');
+    setTlSelectedUrls(['', '']);
+    setRoiBySlot({
+      primary: { active: false, points: [], drawing: false },
+      companion: { active: false, points: [], drawing: false },
+      2: { active: false, points: [], drawing: false },
+      3: { active: false, points: [], drawing: false },
+    });
+  }, []);
+
+  /** Về màn Detect Video trống — chưa chọn file (sau khi đổi chế độ). */
+  const resetVideoSession = useCallback(async () => {
+    try {
+      await mediaApi.stopVideo();
+    } catch {
+      // ignore
+    }
+    endPlayback();
+    resetPrimaryRoi();
+    try {
+      await clearRoi();
+    } catch {
+      // ignore
+    }
+  }, [endPlayback, resetPrimaryRoi, clearRoi]);
+
+  /** Về màn Detect Ảnh trống — chưa chọn file (sau khi đổi chế độ). */
+  const resetImageSession = useCallback(() => {
+    setImageSessionKey((k) => k + 1);
+  }, []);
+
+  const prepareNewVideo = useCallback(async () => {
+    resetPrimaryRoi();
+    try {
+      await clearRoi();
+    } catch {
+      // ignore — backend cũng xoá ROI khi start video mới
+    }
+  }, [resetPrimaryRoi, clearRoi]);
+
   const roiState = roiBySlot[String(roiTarget)] ?? { active: false, points: [], drawing: false };
 
   const roiActiveSlots = useMemo(() => {
     const slots: RoiSlotKey[] = [];
+    if (appMode === 'video' && playbackActive && stats.stream_active) {
+      slots.push('primary');
+      return slots;
+    }
     if (streamOn && trimmedStream) slots.push('primary');
     if (streamOn && companionActive) slots.push('companion');
     if (isExtra2Live) slots.push(2);
@@ -490,7 +602,7 @@ export function Dashboard() {
     // If nothing is live yet, still allow configuring Camera 1.
     if (slots.length === 0) slots.push('primary');
     return slots;
-  }, [streamOn, trimmedStream, companionActive, isExtra2Live, isExtra3Live]);
+  }, [appMode, playbackActive, stats.stream_active, streamOn, trimmedStream, companionActive, isExtra2Live, isExtra3Live]);
 
   useEffect(() => {
     // Keep roiTarget valid when camera slots change
@@ -527,11 +639,67 @@ export function Dashboard() {
     addToast('CSV da xuat', 'success');
   };
 
-  // Settings sliders
+  // Settings sliders — per app mode profile
   const handleSettingChange = (key: keyof Settings, value: number | string) => {
-    setSettings((s) => ({ ...s, [key]: value }));
+    patchModeProfile(appMode, { [key]: value });
     updateSettings({ [key]: value } as Partial<Settings>);
   };
+
+  const handleAppModeChange = useCallback(
+    async (next: AppMode) => {
+      if (next === appMode || modeSwitching) {
+        if (next === appMode) setSettingsOpen(false);
+        return;
+      }
+      const needsStop = streamOn || playbackActive || stats.stream_active;
+      setModeSwitchTarget(next);
+      setModeSwitchStopping(needsStop);
+      setModeSwitching(true);
+      try {
+        if (needsStop) {
+          try {
+            if (appMode === 'video') {
+              await mediaApi.stopVideo();
+            }
+            if (appMode === 'rtsp' || streamOn) {
+              await stopStream();
+            }
+          } catch {
+            // ignore — still switch mode
+          }
+          setStreamOn(false);
+          endPlayback();
+        }
+        // Mỗi chế độ có session đếm riêng — không giữ số liệu video khi sang RTSP (và ngược lại).
+        await resetSessionStats();
+        setAppMode(next);
+        if (next === 'rtsp') {
+          resetRtspSession();
+          try {
+            await clearRoi();
+            await clearRoiSlot('companion');
+            await clearRoiSlot(2);
+            await clearRoiSlot(3);
+          } catch {
+            // ignore
+          }
+        }
+        if (next === 'video') {
+          await resetVideoSession();
+        }
+        if (next === 'image') {
+          resetImageSession();
+        }
+        await applyModeSettingsToBackend(modeProfilesRef.current[next]);
+        setSettingsOpen(false);
+      } finally {
+        setModeSwitching(false);
+        setModeSwitchTarget(null);
+        setModeSwitchStopping(false);
+      }
+    },
+    [appMode, modeSwitching, streamOn, playbackActive, stats.stream_active, stopStream, endPlayback, resetSessionStats, resetRtspSession, resetVideoSession, resetImageSession, applyModeSettingsToBackend, clearRoi, clearRoiSlot],
+  );
 
   return (
     <div className="flex flex-col h-screen overflow-hidden bg-bg-base font-sans">
@@ -699,13 +867,37 @@ export function Dashboard() {
 
             {/* ── Main frame: image / video / camera grid ─────────────── */}
             {appMode === 'image' ? (
-              <ImageDetect />
+              <ImageDetect key={imageSessionKey} />
             ) : appMode === 'video' ? (
               <VideoUpload
                 streamActive={stats.stream_active}
                 onPlaybackStart={beginPlayback}
                 onPlaybackStop={endPlayback}
                 onReloadStats={reloadStats}
+                onPrepareNewVideo={prepareNewVideo}
+                roiOverlay={
+                  playbackActive && stats.stream_active ? (
+                    <RoiCanvasOverlay
+                      points={roiBySlot.primary.points}
+                      setPoints={(p) => setRoiBySlot((prev) => ({
+                        ...prev,
+                        primary: {
+                          ...prev.primary,
+                          points: typeof p === 'function' ? (p as (prev: RoiPoint[]) => RoiPoint[])(prev.primary.points) : p,
+                        },
+                      }))}
+                      isDrawing={roiBySlot.primary.drawing}
+                      setIsDrawing={(v) => setRoiBySlot((prev) => ({
+                        ...prev,
+                        primary: { ...prev.primary, drawing: v },
+                      }))}
+                      onApply={(pts) => void handleApplyRoiFor('primary', pts)}
+                      onClear={() => void handleClearRoiFor('primary')}
+                      active={roiBySlot.primary.active}
+                      canvasRefExternal={roiCanvasPrimaryRef}
+                    />
+                  ) : null
+                }
               />
             ) : (
             <div className={`gap-3 flex-1 min-h-0 min-w-0 grid ${previewGridClass} items-stretch`}>
@@ -922,6 +1114,16 @@ export function Dashboard() {
               </div>
             </div>
             <div className="flex flex-col gap-4">
+              {cameraStatPanels.length === 0 && appMode === 'video' ? (
+                <p className="text-xs text-slate-400 leading-relaxed px-1">
+                  Upload và phát video để xem thống kê đếm xe.
+                </p>
+              ) : null}
+              {cameraStatPanels.length === 0 && appMode === 'rtsp' ? (
+                <p className="text-xs text-slate-400 leading-relaxed px-1">
+                  Kết nối camera để xem thống kê đếm xe.
+                </p>
+              ) : null}
               {cameraStatPanels.map((panel, idx) => {
                 const isLast = idx === cameraStatPanels.length - 1;
                 return (
@@ -987,6 +1189,27 @@ export function Dashboard() {
         </main>
       </div>
 
+      {/* ── Mode switch loading ───────────────────────────────────────────── */}
+      {modeSwitching && modeSwitchTarget ? (
+        <div
+          className="fixed inset-0 z-[10000] flex flex-col items-center justify-center gap-3 bg-slate-900/65 backdrop-blur-sm"
+          role="status"
+          aria-live="polite"
+          aria-busy="true"
+        >
+          <svg className="h-11 w-11 text-white animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden>
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
+            <path className="opacity-90" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+          </svg>
+          <span className="text-sm font-semibold text-white tracking-wide">
+            Đang chuyển sang {APP_MODE_LABELS[modeSwitchTarget]}…
+          </span>
+          {modeSwitchStopping ? (
+            <span className="text-xs text-white/65">Đang dừng stream hiện tại, vui lòng chờ</span>
+          ) : null}
+        </div>
+      ) : null}
+
       {/* ── Toast Container ───────────────────────────────────────────────── */}
       <div className="fixed top-16 right-4 z-[9999] flex flex-col gap-2 pointer-events-none">
         {toasts.map((t) => (
@@ -1011,7 +1234,11 @@ export function Dashboard() {
                     <IconRoiFrame className="h-5 w-5 shrink-0 text-accent" aria-hidden />
                     <span className="text-sm font-extrabold text-slate-800 truncate">ROI</span>
                   </div>
-                  <div className="text-[11px] text-slate-500 truncate">Vẽ vùng quan tâm trên khung video để lọc/đếm.</div>
+                  <div className="text-[11px] text-slate-500 truncate">
+                    {appMode === 'video' && !stats.stream_active
+                      ? 'Phát video trước, sau đó bấm Draw và click trên khung video.'
+                      : 'Bấm Draw → đóng panel → click trên khung video để vẽ ROI.'}
+                  </div>
                 </div>
                 <button
                   type="button"
@@ -1061,11 +1288,14 @@ export function Dashboard() {
                     return { ...prev, [key]: { ...cur, points: nextPoints } };
                   })}
                   isDrawing={roiState.drawing}
-                  setIsDrawing={(v) => setRoiBySlot((prev) => {
-                    const key = String(roiTarget);
-                    const cur = prev[key] ?? { active: false, points: [], drawing: false };
-                    return { ...prev, [key]: { ...cur, drawing: v } };
-                  })}
+                  setIsDrawing={(v) => {
+                    setRoiBySlot((prev) => {
+                      const key = String(roiTarget);
+                      const cur = prev[key] ?? { active: false, points: [], drawing: false };
+                      return { ...prev, [key]: { ...cur, drawing: v } };
+                    });
+                    if (v) setRoiOpen(false);
+                  }}
                 />
               </div>
             </div>
@@ -1224,7 +1454,11 @@ export function Dashboard() {
                     <IconTune className="h-5 w-5 shrink-0 text-accent" aria-hidden />
                     <span className="text-sm font-extrabold text-slate-800 truncate">Cài đặt</span>
                   </div>
-                  <div className="text-[11px] text-slate-500 truncate">Chỉnh thông số nhận diện, đếm xe và cảnh báo kẹt xe.</div>
+                  <div className="text-[11px] text-slate-500 truncate">
+                    Cài đặt cho <span className="font-semibold text-accent">{APP_MODE_LABELS[appMode]}</span>
+                    {' — '}
+                    mỗi chế độ lưu riêng.
+                  </div>
                 </div>
                 <button
                   type="button"
@@ -1247,8 +1481,9 @@ export function Dashboard() {
                       <button
                         key={key}
                         type="button"
-                        onClick={() => { setAppMode(key); setSettingsOpen(false); }}
-                        className={`flex-1 p-2 rounded-lg border text-left transition-colors ${
+                        disabled={modeSwitching}
+                        onClick={() => { void handleAppModeChange(key); }}
+                        className={`flex-1 p-2 rounded-lg border text-left transition-colors disabled:opacity-50 disabled:pointer-events-none ${
                           appMode === key
                             ? 'border-accent bg-blue-50 text-accent'
                             : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300'
@@ -1271,7 +1506,7 @@ export function Dashboard() {
                   />
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className={`grid grid-cols-1 gap-4 ${appMode === 'image' ? '' : 'sm:grid-cols-2'}`}>
                   <div className="rounded-xl border border-slate-200 bg-white p-3">
                     <div className="text-[11px] font-bold text-slate-600 uppercase tracking-wide mb-2">Nhận diện</div>
                     <SliderField
@@ -1282,34 +1517,45 @@ export function Dashboard() {
                       onChange={(v) => handleSettingChange('conf_threshold', v)}
                       onCommit={(v) => addToast(`Confidence: ${v.toFixed(2)}`, 'info')}
                     />
-                    <SliderField
-                      label="Counting Line"
-                      value={settings.line_position}
-                      min={0.1} max={0.9} step={0.01}
-                      display={`${Math.round(settings.line_position * 100)}%`}
-                      onChange={(v) => handleSettingChange('line_position', v)}
-                      onCommit={(v) => addToast(`Counting Line: ${Math.round(v * 100)}%`, 'info')}
-                    />
-                    {roiBySlot.primary?.active && (
-                      <p className="text-[10px] text-amber-600 mt-0.5 mb-1">
-                        ROI đang bật — đường đếm tự động theo giữa ROI, slider không có tác dụng.
+                    {appMode !== 'image' ? (
+                      <>
+                        <SliderField
+                          label="Counting Line"
+                          value={settings.line_position}
+                          min={0.1} max={0.9} step={0.01}
+                          display={`${Math.round(settings.line_position * 100)}%`}
+                          onChange={(v) => handleSettingChange('line_position', v)}
+                          onCommit={(v) => addToast(`Counting Line: ${Math.round(v * 100)}%`, 'info')}
+                        />
+                        {roiBySlot.primary?.active && (
+                          <p className="text-[10px] text-amber-600 mt-0.5 mb-1">
+                            ROI đang bật — đường đếm tự động theo giữa ROI, slider không có tác dụng.
+                          </p>
+                        )}
+                      </>
+                    ) : (
+                      <p className="text-[10px] text-slate-400 mt-2">
+                        Detect Ảnh chỉ dùng Confidence khi upload từng ảnh.
                       </p>
                     )}
-                    <SliderField
-                      label="Inference Skip Frames"
-                      value={settings.skip_frames ?? 0}
-                      min={0}
-                      max={5}
-                      step={1}
-                      display={`${settings.skip_frames ?? 0}`}
-                      onChange={(v) => handleSettingChange('skip_frames', v)}
-                      onCommit={(v) => addToast(
-                        v === 0 ? 'Skip Frames: tắt (infer mỗi frame)' : `Skip Frames: ${v} (infer 1/${v + 1} frame)`,
-                        'info'
-                      )}
-                    />
+                    {appMode === 'rtsp' ? (
+                      <SliderField
+                        label="Inference Skip Frames"
+                        value={settings.skip_frames ?? 0}
+                        min={0}
+                        max={5}
+                        step={1}
+                        display={`${settings.skip_frames ?? 0}`}
+                        onChange={(v) => handleSettingChange('skip_frames', v)}
+                        onCommit={(v) => addToast(
+                          v === 0 ? 'Skip Frames: tắt (infer mỗi frame)' : `Skip Frames: ${v} (infer 1/${v + 1} frame)`,
+                          'info'
+                        )}
+                      />
+                    ) : null}
                   </div>
 
+                  {appMode !== 'image' ? (
                   <div className="rounded-xl border border-slate-200 bg-white p-3">
                     <div className="text-[11px] font-bold text-slate-600 uppercase tracking-wide mb-2">Đếm xe</div>
 
@@ -1324,8 +1570,7 @@ export function Dashboard() {
                         value={settings.tracker_type ?? 'bytetrack'}
                         onChange={(e) => {
                           const v = e.target.value;
-                          setSettings((s) => ({ ...s, tracker_type: v }));
-                          updateSettings({ tracker_type: v });
+                          handleSettingChange('tracker_type', v);
                           const names: Record<string, string> = { bytetrack: 'ByteTrack', sort: 'SORT', deepsort: 'DeepSORT' };
                           addToast(`Tracker: ${names[v] ?? v}`, 'success');
                         }}
@@ -1337,14 +1582,13 @@ export function Dashboard() {
                       </select>
                     </div>
 
-
                     <div className="flex items-center justify-between">
                       <span className="text-[11px] text-slate-500">Enable Counting</span>
                       <button
                         type="button"
                         onClick={() => {
                           const next = !countingEnabled;
-                          setCountingEnabled(next);
+                          patchModeProfile(appMode, { countingEnabled: next });
                           addToast(next ? 'Hiển thị số đếm xe' : 'Ẩn số đếm xe (backend vẫn đếm)', 'info');
                         }}
                         className={`relative inline-flex h-4 w-8 items-center rounded-full border transition-colors ${
@@ -1359,8 +1603,10 @@ export function Dashboard() {
                       </button>
                     </div>
                   </div>
+                  ) : null}
                 </div>
 
+                {appMode !== 'image' ? (
                 <div className="mt-4 rounded-xl border border-slate-200 bg-white p-3">
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-[11px] font-bold text-slate-600 uppercase tracking-wide">Cảnh báo kẹt xe</span>
@@ -1386,8 +1632,10 @@ export function Dashboard() {
                   </div>
                   <div className="flex flex-col gap-1 mt-2">
                     {[
-                      { cong: congestion, label: 'Camera 1' },
-                      { cong: companionStreamActive ? companionCongestion : null, label: 'Camera 2' },
+                      { cong: congestion, label: appMode === 'video' ? 'Video' : 'Camera 1' },
+                      ...(appMode === 'rtsp'
+                        ? [{ cong: companionStreamActive ? companionCongestion : null, label: 'Camera 2' }]
+                        : []),
                     ].map(({ cong, label }) =>
                       cong ? (
                         <div key={label} className={`px-3 py-2 rounded-lg text-xs font-semibold flex items-center justify-between gap-2 ${
@@ -1407,6 +1655,7 @@ export function Dashboard() {
                     )}
                   </div>
                 </div>
+                ) : null}
               </div>
             </div>
           </div>

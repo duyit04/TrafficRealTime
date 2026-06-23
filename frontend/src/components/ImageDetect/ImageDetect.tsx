@@ -14,25 +14,32 @@ function toDetections(
   }));
 }
 
-function containLayout(imgW: number, imgH: number, cw: number, ch: number) {
-  const imgRatio = imgW / imgH;
-  const canRatio = cw / ch;
+/** Map bbox coords using the image's actual painted rect (handles object-contain letterboxing). */
+function imagePaintLayout(img: HTMLImageElement) {
+  const nw = img.naturalWidth;
+  const nh = img.naturalHeight;
+  const ew = img.clientWidth;
+  const eh = img.clientHeight;
+  if (nw <= 0 || nh <= 0 || ew <= 0 || eh <= 0) return null;
+
+  const elRatio = ew / eh;
+  const imgRatio = nw / nh;
   let dw: number;
   let dh: number;
   let dx: number;
   let dy: number;
-  if (imgRatio > canRatio) {
-    dw = cw;
-    dh = cw / imgRatio;
+  if (imgRatio > elRatio) {
+    dw = ew;
+    dh = ew / imgRatio;
     dx = 0;
-    dy = (ch - dh) / 2;
+    dy = (eh - dh) / 2;
   } else {
-    dh = ch;
-    dw = ch * imgRatio;
-    dx = (cw - dw) / 2;
+    dh = eh;
+    dw = eh * imgRatio;
+    dx = (ew - dw) / 2;
     dy = 0;
   }
-  return { scaleX: dw / imgW, scaleY: dh / imgH, dx, dy };
+  return { scaleX: dw / nw, scaleY: dh / nh, dx, dy, cw: ew, ch: eh };
 }
 
 export function ImageDetect() {
@@ -44,17 +51,21 @@ export function ImageDetect() {
   const containerRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const detectSeqRef = useRef(0);
+
+  const openFilePicker = () => {
+    if (!loading) inputRef.current?.click();
+  };
 
   const redrawBoxes = useCallback(() => {
     const canvas = canvasRef.current;
     const img = imgRef.current;
-    const container = containerRef.current;
-    if (!canvas || !img || !container || !result?.detections.length) return;
+    if (!canvas || !img || !result?.detections.length) return;
     if (!img.complete || img.naturalWidth <= 0) return;
 
-    const cw = container.clientWidth;
-    const ch = container.clientHeight;
-    if (cw <= 0 || ch <= 0) return;
+    const layout = imagePaintLayout(img);
+    if (!layout) return;
+    const { scaleX, scaleY, dx, dy, cw, ch } = layout;
 
     const dpr = window.devicePixelRatio || 1;
     canvas.width = Math.round(cw * dpr);
@@ -66,8 +77,6 @@ export function ImageDetect() {
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cw, ch);
-
-    const { scaleX, scaleY, dx, dy } = containLayout(img.naturalWidth, img.naturalHeight, cw, ch);
     ctx.save();
     ctx.translate(dx, dy);
     drawDetections(ctx, toDetections(result.detections), scaleX, scaleY);
@@ -76,12 +85,21 @@ export function ImageDetect() {
 
   useEffect(() => {
     redrawBoxes();
-    const onResize = () => redrawBoxes();
-    window.addEventListener('resize', onResize);
-    return () => window.removeEventListener('resize', onResize);
+    const container = containerRef.current;
+    if (!container) return;
+    const ro = new ResizeObserver(() => redrawBoxes());
+    ro.observe(container);
+    return () => ro.disconnect();
   }, [redrawBoxes, preview, result?.image]);
 
+  useEffect(() => {
+    return () => {
+      if (preview) URL.revokeObjectURL(preview);
+    };
+  }, [preview]);
+
   const handleFile = async (file: File) => {
+    const seq = ++detectSeqRef.current;
     setError(null);
     setResult(null);
     if (preview) URL.revokeObjectURL(preview);
@@ -89,17 +107,20 @@ export function ImageDetect() {
     setLoading(true);
     try {
       const res = await mediaApi.detectImage(file);
+      if (seq !== detectSeqRef.current) return;
       setResult(res);
     } catch (e: any) {
+      if (seq !== detectSeqRef.current) return;
       setError(e.message || 'Không thể detect ảnh');
     } finally {
-      setLoading(false);
+      if (seq === detectSeqRef.current) setLoading(false);
     }
   };
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) handleFile(file);
+    if (file) void handleFile(file);
+    e.target.value = '';
   };
 
   const handleDrop = (e: React.DragEvent) => {
@@ -116,7 +137,7 @@ export function ImageDetect() {
       <div className="flex flex-col flex-1 min-w-0 gap-3 min-h-0">
         <div
           className="flex flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-300 bg-slate-50 hover:border-accent hover:bg-blue-50/30 transition-colors cursor-pointer min-h-[100px] p-4 shrink-0"
-          onClick={() => inputRef.current?.click()}
+          onClick={openFilePicker}
           onDrop={handleDrop}
           onDragOver={(e) => e.preventDefault()}
         >
@@ -129,7 +150,7 @@ export function ImageDetect() {
           />
           <span className="text-2xl mb-1">🖼️</span>
           <span className="text-sm font-semibold text-slate-600">Kéo thả hoặc click để chọn ảnh</span>
-          <span className="text-xs text-slate-400 mt-0.5">JPG, PNG, BMP…</span>
+          <span className="text-xs text-slate-400 mt-0.5">JPG, PNG, BMP, WebP…</span>
         </div>
 
         {loading ? (
@@ -151,24 +172,45 @@ export function ImageDetect() {
         {imageSrc ? (
           <div
             ref={containerRef}
-            className="relative flex-1 min-h-0 rounded-xl overflow-hidden border border-slate-200 bg-bg-base flex items-center justify-center"
+            role="button"
+            tabIndex={0}
+            title="Bấm để chọn ảnh khác"
+            className="relative flex-1 min-h-0 rounded-xl overflow-hidden border border-slate-200 bg-bg-base flex items-center justify-center cursor-pointer group"
+            onClick={openFilePicker}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openFilePicker(); } }}
           >
-            <img
-              ref={imgRef}
-              src={imageSrc}
-              alt="Kết quả nhận diện"
-              className="max-w-full max-h-full object-contain"
-              onLoad={redrawBoxes}
-            />
-            {result && result.detections.length > 0 ? (
-              <canvas
-                ref={canvasRef}
-                className="absolute inset-0 w-full h-full pointer-events-none"
+            <div className="relative w-full h-full min-h-0">
+              <img
+                ref={imgRef}
+                src={imageSrc}
+                alt="Kết quả nhận diện"
+                className="block w-full h-full object-contain"
+                onLoad={redrawBoxes}
               />
-            ) : null}
+              {result && result.detections.length > 0 ? (
+                <canvas
+                  ref={canvasRef}
+                  className="absolute inset-0 w-full h-full pointer-events-none"
+                />
+              ) : null}
+            </div>
             {result ? (
-              <div className="absolute top-2 left-2 px-2 py-0.5 rounded-full bg-black/60 text-white text-xs font-bold z-10">
+              <div className="absolute top-2 left-2 px-2 py-0.5 rounded-full bg-black/60 text-white text-xs font-bold z-10 pointer-events-none">
                 {result.count} đối tượng
+              </div>
+            ) : null}
+            {!loading ? (
+              <div className="absolute bottom-2 right-2 px-2 py-1 rounded-lg bg-black/50 text-white/90 text-[10px] font-medium opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+                Bấm để chọn ảnh khác
+              </div>
+            ) : null}
+            {loading ? (
+              <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-2 bg-slate-900/60 pointer-events-none">
+                <svg className="h-8 w-8 text-white animate-spin" viewBox="0 0 24 24" fill="none">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
+                  <path className="opacity-90" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                </svg>
+                <span className="text-xs font-semibold text-white">Đang nhận diện…</span>
               </div>
             ) : null}
           </div>

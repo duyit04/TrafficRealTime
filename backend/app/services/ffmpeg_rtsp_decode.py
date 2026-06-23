@@ -56,6 +56,11 @@ def rtsp_demuxer_flags(*, loglevel: str = "error") -> list[str]:
     ]
 
 
+def file_demuxer_flags(*, loglevel: str = "error") -> list[str]:
+    """Local file input — no RTSP demuxer options."""
+    return ["-hide_banner", "-loglevel", loglevel]
+
+
 def rtsp_capture_timeout_flags() -> list[str]:
     # WinGet FFmpeg: RTSP demuxer uses -timeout (µs), not -stimeout/-rw_timeout.
     return ["-timeout", "8000000"]

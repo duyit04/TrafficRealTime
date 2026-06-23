@@ -225,7 +225,7 @@ export function RoiCanvasOverlay({ points, setPoints, isDrawing, setIsDrawing, o
       className={`absolute inset-0 w-full h-full ${
         isDrawing ? 'cursor-crosshair' : 'pointer-events-none'
       }`}
-      style={{ zIndex: 10 }}
+      style={{ zIndex: isDrawing ? 35 : 10 }}
       aria-hidden
     />
   );

@@ -667,7 +667,7 @@ class StreamService:
         Avoids OpenCV VIDEO_ACCELERATION_ANY + CAP_PROP_HW_DEVICE (invalid combo on Windows builds).
         """
         if not is_rtsp:
-            return cv2.VideoCapture(url)
+            return self._open_video_file_capture(url)
 
         import os
         import sys
@@ -789,6 +789,52 @@ class StreamService:
         cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return cap
+
+    def _open_video_file_capture(self, path: str):
+        """Local video file: FFmpeg CUDA decode + downscale (same path as RTSP live)."""
+        from app.services.ffmpeg_rtsp_capture import FFmpegRtspCapture
+        from app.services.ffmpeg_rtsp_decode import cuda_decode_enabled, ffmpeg_cuda_required
+
+        pipe_max_w = int(self.max_width or 0) or None
+        cap_ff: FFmpegRtspCapture | None = None
+        try:
+            cap_ff = FFmpegRtspCapture(
+                path,
+                label="video_file",
+                use_live_slot=True,
+                pipe_max_width=pipe_max_w,
+            )
+            if cap_ff.isOpened():
+                logger.info(
+                    "StreamService: video file via FFmpeg BGR pipe [%s]",
+                    getattr(cap_ff, "decode_backend", ""),
+                )
+                return cap_ff
+        except Exception as e:
+            logger.warning("FFmpeg file capture failed: %s", e)
+
+        err = getattr(cap_ff, "_last_error", None) if cap_ff is not None else "init failed"
+        if cuda_decode_enabled() and ffmpeg_cuda_required():
+            logger.error(
+                "StreamService: [CUDA FAILED] video file — %s (no OpenCV CPU fallback)",
+                err,
+            )
+            return cap_ff if cap_ff is not None else cv2.VideoCapture()
+
+        logger.warning(
+            "StreamService: FFmpeg file capture unavailable (%s) — OpenCV CPU decode",
+            err,
+        )
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            self._last_error = err or f"Không thể mở file video: {path}"
+        return cap
+
+    @staticmethod
+    def _capture_fps(cap) -> float:
+        if hasattr(cap, "get_fps"):
+            return max(1.0, float(cap.get_fps() or 25.0))
+        return max(1.0, float(cap.get(cv2.CAP_PROP_FPS) or 25.0))
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -1961,6 +2007,11 @@ class StreamService:
     def _do_start_video_file(self, path: str) -> None:
         self.stop()
         self._reset_all()
+        # Mỗi video mới — xoá ROI cũ (polygon + counter) giống session RTSP mới.
+        try:
+            roi_service.clear("primary")
+        except Exception:
+            pass
         self._running = True
         self._source_mode = "file"
         self._thread = threading.Thread(target=self._video_file_worker, args=(path,), daemon=True)
@@ -1972,6 +2023,7 @@ class StreamService:
         import os
         from app.services.model_service import model_service as _model_service
 
+        cap = None
         try:
             tls = None
             try:
@@ -1980,15 +2032,15 @@ class StreamService:
             except Exception:
                 pass
 
-            cap = cv2.VideoCapture(path)
+            cap = self._open_video_file_capture(path)
             if not cap.isOpened():
-                self._last_error = f"Không thể mở file video: {path}"
+                self._last_error = self._last_error or f"Không thể mở file video: {path}"
                 self._stats.stream_error = self._last_error
                 logger.warning("StreamService: %s", self._last_error)
                 self._running = False
                 return
 
-            video_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            video_fps = self._capture_fps(cap)
             frame_interval = 1.0 / max(1.0, min(float(self.max_fps), video_fps))
             self._stats.stream_active = True
             fps_cnt = 0
@@ -2023,7 +2075,8 @@ class StreamService:
 
                 # Counting line + ROI filter (mirrors primary _worker logic)
                 frame_h = frame.shape[0]
-                if roi_service.active and roi_service.points:
+                _primary_roi_on = bool(roi_service.active and roi_service.points)
+                if _primary_roi_on:
                     active_tracks = [
                         t for t in tracks if roi_service.is_inside(t.cx, t.cy, slot="primary")
                     ]
@@ -2037,9 +2090,15 @@ class StreamService:
                     line_y = self._counting_line_y
                     self._stats.line_position = self.line_position
 
-                self._counter.update(active_tracks, line_y)
+                if not _primary_roi_on:
+                    self._counter.update(active_tracks, line_y)
+                else:
+                    self._roi_counter.update(active_tracks)
                 self._stats.total = self._counter.total
                 self._stats.classes = dict(self._counter.by_class)
+
+                self._stats.roi_active = _primary_roi_on
+                self._stats.roi_count = len(active_tracks) if _primary_roi_on else 0
 
                 # Congestion — video file mode (tracks always fresh per frame)
                 _vid_cong = self._congestion.update(len(active_tracks))
@@ -2106,7 +2165,10 @@ class StreamService:
                     "stream_active": _s.stream_active,
                     "model_loaded": _s.model_loaded,
                     "model_name": _s.model_name,
-                    "roi_active": roi_service.active_for("primary"),
+                    "roi_active": _s.roi_active,
+                    "roi_count": int(_s.roi_count),
+                    "roi_total": int(self._roi_counter.total),
+                    "roi_classes": dict(self._roi_counter.by_class),
                     "conf_threshold": _s.conf_threshold,
                     "line_position": _s.line_position,
                     "congestion": {
@@ -2143,10 +2205,11 @@ class StreamService:
             self._last_error = f"Video worker error: {e}"
             self._stats.stream_error = str(e)
         finally:
-            try:
-                cap.release()
-            except Exception:
-                pass
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
             # Delete temp upload file
             try:
                 if os.path.exists(path):
@@ -2173,7 +2236,10 @@ class StreamService:
                         "stream_active": False,
                         "model_loaded": bool(_s.model_loaded),
                         "model_name": str(_s.model_name or ""),
-                        "roi_active": roi_service.active_for("primary"),
+                        "roi_active": bool(_s.roi_active),
+                        "roi_count": int(_s.roi_count),
+                        "roi_total": int(self._roi_counter.total),
+                        "roi_classes": dict(self._roi_counter.by_class),
                         "conf_threshold": float(_s.conf_threshold),
                         "line_position": float(_s.line_position),
                         "congestion": {

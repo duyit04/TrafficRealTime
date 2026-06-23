@@ -296,6 +296,40 @@ export function useDetection() {
     setExtraLive({});
   }, []);
 
+  /** Xoá bộ đếm backend + state UI — dùng khi chuyển chế độ (video ↔ RTSP). */
+  const resetSessionStats = useCallback(async () => {
+    try {
+      await detectionApi.resetStats();
+      const s = await detectionApi.getStats();
+      setStats({
+        ...DEFAULT_STATS,
+        model_loaded: s.model_loaded,
+        model_name: s.model_name,
+        conf_threshold: s.conf_threshold,
+        line_position: s.line_position,
+        stream_active: false,
+      });
+    } catch {
+      setStats((prev) => ({
+        ...DEFAULT_STATS,
+        model_loaded: prev.model_loaded,
+        model_name: prev.model_name,
+        conf_threshold: prev.conf_threshold,
+        line_position: prev.line_position,
+      }));
+    }
+    setStatsBySlot({});
+    setDetections([]);
+    setCompanionDetections([]);
+    setCompanionFps(0);
+    setCompanionCongestion(null);
+    setCompanionRoiActive(false);
+    setCompanionRoiCount(0);
+    setExtraLive({});
+    lastDetectionsRef.current = { ts: 0, dets: [] };
+    lastCompanionDetsRef.current = { ts: 0, dets: [] };
+  }, []);
+
   const setRoi = useCallback(async (points: number[][]) => {
     await detectionApi.setRoi({ points, active: true });
   }, []);
@@ -373,6 +407,7 @@ export function useDetection() {
     beginPlayback,
     endPlayback,
     reloadStats,
+    resetSessionStats,
     setRoi,
     clearRoi,
     setRoiSlot,

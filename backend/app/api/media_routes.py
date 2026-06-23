@@ -19,8 +19,6 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from app.core.config import settings
 from app.core.logger import logger
 from app.ml.yolo_model import yolo_model
-from app.utils.frame_overlay import overlay_traffic_ui
-
 router = APIRouter(prefix="/api/v1/media", tags=["media"])
 
 _ALLOWED_VIDEO_EXT = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".ts", ".m4v"}
@@ -55,18 +53,8 @@ async def detect_image(file: UploadFile = File(...)):
         }
         for d in dets
     ]
-    overlay_dets = [
-        {
-            "bbox": {"x1": d["x1"], "y1": d["y1"], "x2": d["x2"], "y2": d["y2"]},
-            "class_name": d["class_name"],
-            "confidence": d["confidence"],
-            "track_id": None,
-        }
-        for d in api_dets
-    ]
-
-    vis = overlay_traffic_ui(frame, overlay_dets, line_y_px=0, show_line=False, in_place=False)
-    _, buf = cv2.imencode(".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    # Frontend draws boxes — return raw frame to avoid double annotation + scale mismatch.
+    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
     img_b64 = base64.b64encode(buf.tobytes()).decode()
 
     return {
